@@ -98,6 +98,48 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 
 	glog.Infof("RoundsManager: %v", c.roundsManagerAddr.Hex())
 
+	minterAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("Minter")))
+	if err != nil {
+		glog.Errorf("Error getting Minter address: %v", err)
+		return err
+	}
+
+	c.minterAddr = minterAddr
+
+	minter, err := contracts.NewMinter(minterAddr, c.backend)
+	if err != nil {
+		glog.Errorf("Error creating Minter binding: %v", err)
+		return err
+	}
+
+	// Client should never transact with the Minter directly so we don't include transact opts
+	c.MinterSession = &contracts.MinterSession{
+		Contract: minter,
+	}
+
+	glog.Infof("Minter: %v", c.minterAddr.Hex())
+
+	verifierAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("Verifier")))
+	if err != nil {
+		glog.Errorf("Error getting Verifier address: %v", err)
+		return err
+	}
+
+	c.verifierAddr = verifierAddr
+
+	verifier, err := contracts.NewLivepeerVerifier(verifierAddr, c.backend)
+	if err != nil {
+		glog.Errorf("Error creating LivepeerVerifier binding: %v", err)
+		return err
+	}
+
+	// Client should never transact with the Verifier directly so we don't include transact opts
+	c.LivepeerVerifierSession = &contracts.LivepeerVerifierSession{
+		Contract: verifier,
+	}
+
+	glog.Infof("Verifier: %v", c.verifierAddr.Hex())
+
 	faucetAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("LivepeerTokenFaucet")))
 	if err != nil {
 		glog.Errorf("Error getting LivepeerTokenFaucet address: %v", err)
