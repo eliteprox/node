@@ -12,7 +12,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		TransactOpts: *opts,
 	}
 
-	glog.Infof("Controller: %v", c.controllerAddr.Hex())
+	glog.V(common.SHORT).Infof("Controller: %v", c.controllerAddr.Hex())
 
 	tokenAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("LivepeerToken")))
 	if err != nil {
@@ -33,7 +33,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		TransactOpts: *opts,
 	}
 
-	glog.Infof("LivepeerToken: %v", c.tokenAddr.Hex())
+	glog.V(common.SHORT).Infof("LivepeerToken: %v", c.tokenAddr.Hex())
 
 	bondingManagerAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("BondingManager")))
 	if err != nil {
@@ -54,7 +54,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		TransactOpts: *opts,
 	}
 
-	glog.Infof("BondingManager: %v", c.bondingManagerAddr.Hex())
+	glog.V(common.SHORT).Infof("BondingManager: %v", c.bondingManagerAddr.Hex())
 
 	jobsManagerAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("JobsManager")))
 	if err != nil {
@@ -75,7 +75,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		TransactOpts: *opts,
 	}
 
-	glog.Infof("JobsManager: %v", c.jobsManagerAddr.Hex())
+	glog.V(common.SHORT).Infof("JobsManager: %v", c.jobsManagerAddr.Hex())
 
 	roundsManagerAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("RoundsManager")))
 	if err != nil {
@@ -96,7 +96,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		TransactOpts: *opts,
 	}
 
-	glog.Infof("RoundsManager: %v", c.roundsManagerAddr.Hex())
+	glog.V(common.SHORT).Infof("RoundsManager: %v", c.roundsManagerAddr.Hex())
 
 	minterAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("Minter")))
 	if err != nil {
@@ -117,7 +117,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		Contract: minter,
 	}
 
-	glog.Infof("Minter: %v", c.minterAddr.Hex())
+	glog.V(common.SHORT).Infof("Minter: %v", c.minterAddr.Hex())
 
 	verifierAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("Verifier")))
 	if err != nil {
@@ -138,7 +138,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		Contract: verifier,
 	}
 
-	glog.Infof("Verifier: %v", c.verifierAddr.Hex())
+	glog.V(common.SHORT).Infof("Verifier: %v", c.verifierAddr.Hex())
 
 	faucetAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("LivepeerTokenFaucet")))
 	if err != nil {
@@ -159,7 +159,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		TransactOpts: *opts,
 	}
 
-	glog.Infof("LivepeerTokenFaucet: %v", c.faucetAddr.Hex())
+	glog.V(common.SHORT).Infof("LivepeerTokenFaucet: %v", c.faucetAddr.Hex())
 
 	return nil
 }
