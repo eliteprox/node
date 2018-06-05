@@ -35,6 +35,27 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 
 	glog.V(common.SHORT).Infof("LivepeerToken: %v", c.tokenAddr.Hex())
 
+	serviceRegistryAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("ServiceRegistry")))
+	if err != nil {
+		glog.Errorf("Error getting ServiceRegistry address: %v", err)
+		return err
+	}
+
+	c.serviceRegistryAddr = serviceRegistryAddr
+
+	serviceRegistry, err := contracts.NewServiceRegistry(serviceRegistryAddr, c.backend)
+	if err != nil {
+		glog.Errorf("Error creating ServiceRegistry binding: %v", err)
+		return err
+	}
+
+	c.ServiceRegistrySession = &contracts.ServiceRegistrySession{
+		Contract:     serviceRegistry,
+		TransactOpts: *opts,
+	}
+
+	glog.V(common.SHORT).Infof("ServiceRegistry: %v", c.serviceRegistryAddr.Hex())
+
 	bondingManagerAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("BondingManager")))
 	if err != nil {
 		glog.Errorf("Error getting BondingManager address: %v", err)
