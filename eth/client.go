@@ -77,26 +77,26 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 
 	glog.V(common.SHORT).Infof("BondingManager: %v", c.bondingManagerAddr.Hex())
 
-	jobsManagerAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("JobsManager")))
+	brokerAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("TicketBroker")))
 	if err != nil {
-		glog.Errorf("Error getting JobsManager address: %v", err)
+		glog.Errorf("Error getting TicketBroker address: %v", err)
 		return err
 	}
 
-	c.jobsManagerAddr = jobsManagerAddr
+	c.ticketBrokerAddr = brokerAddr
 
-	jobsManager, err := contracts.NewJobsManager(jobsManagerAddr, c.backend)
+	broker, err := contracts.NewLivepeerETHTicketBroker(brokerAddr, c.backend)
 	if err != nil {
-		glog.Errorf("Error creating JobsManager binding: %v", err)
+		glog.Errorf("Error creating TicketBroker binding: %v", err)
 		return err
 	}
 
-	c.JobsManagerSession = &contracts.JobsManagerSession{
-		Contract:     jobsManager,
+	c.LivepeerETHTicketBrokerSession = &contracts.LivepeerETHTicketBrokerSession{
+		Contract:     broker,
 		TransactOpts: *opts,
 	}
 
-	glog.V(common.SHORT).Infof("JobsManager: %v", c.jobsManagerAddr.Hex())
+	glog.V(common.SHORT).Infof("TicketBroker: %v", c.ticketBrokerAddr.Hex())
 
 	roundsManagerAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("RoundsManager")))
 	if err != nil {
