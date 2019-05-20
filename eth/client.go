@@ -85,13 +85,13 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 
 	c.ticketBrokerAddr = brokerAddr
 
-	broker, err := contracts.NewLivepeerETHTicketBroker(brokerAddr, c.backend)
+	broker, err := contracts.NewTicketBroker(brokerAddr, c.backend)
 	if err != nil {
 		glog.Errorf("Error creating TicketBroker binding: %v", err)
 		return err
 	}
 
-	c.LivepeerETHTicketBrokerSession = &contracts.LivepeerETHTicketBrokerSession{
+	c.TicketBrokerSession = &contracts.TicketBrokerSession{
 		Contract:     broker,
 		TransactOpts: *opts,
 	}
