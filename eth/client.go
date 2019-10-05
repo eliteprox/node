@@ -140,27 +140,6 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 
 	glog.V(common.SHORT).Infof("Minter: %v", c.minterAddr.Hex())
 
-	verifierAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("Verifier")))
-	if err != nil {
-		glog.Errorf("Error getting Verifier address: %v", err)
-		return err
-	}
-
-	c.verifierAddr = verifierAddr
-
-	verifier, err := contracts.NewLivepeerVerifier(verifierAddr, c.backend)
-	if err != nil {
-		glog.Errorf("Error creating LivepeerVerifier binding: %v", err)
-		return err
-	}
-
-	// Client should never transact with the Verifier directly so we don't include transact opts
-	c.LivepeerVerifierSession = &contracts.LivepeerVerifierSession{
-		Contract: verifier,
-	}
-
-	glog.V(common.SHORT).Infof("Verifier: %v", c.verifierAddr.Hex())
-
 	faucetAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("LivepeerTokenFaucet")))
 	if err != nil {
 		glog.Errorf("Error getting LivepeerTokenFaucet address: %v", err)
