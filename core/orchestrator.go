@@ -1,9 +1,9 @@
 package core
 
-func (orch *orchestrator) isActive() (bool, error) {
+func (orch *orchestrator) isActive(addr ethcommon.Address) (bool, error) {
 	filter := &common.DBOrchFilter{
 		CurrentRound: orch.rm.LastInitializedRound(),
-		Addresses:    []ethcommon.Address{orch.Address()},
+		Addresses:    []ethcommon.Address{addr},
 	}
 	orchs, err := orch.node.Database.SelectOrchs(filter)
 	if err != nil {
