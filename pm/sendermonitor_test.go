@@ -152,31 +152,3 @@ func TestRedeemWinningTicket_InsufficientMaxFloat_QueueTicket(t *testing.T) {
 	err := sm.(*senderMonitor).redeemWinningTicket(signedT)
 	assert.EqualError(err, fmt.Sprintf("insufficient max float sender=%v faceValue=%v maxFloat=%v", addr.Hex(), signedT.FaceValue, new(big.Int).Sub(new(big.Int).Div(smgr.info[addr].Reserve.FundsRemaining, tm.transcoderPoolSize), smgr.claimedReserve[addr])))
 }
-
-func TestRedeemWinningTicket_AddFloatError(t *testing.T) {
-	claimant, b, smgr, tm := senderMonitorFixture()
-	addr := RandAddress()
-	smgr.info[addr] = &SenderInfo{
-		Deposit:       big.NewInt(500),
-		WithdrawRound: big.NewInt(0),
-		Reserve: &ReserveInfo{
-			FundsRemaining:        big.NewInt(5000),
-			ClaimedInCurrentRound: big.NewInt(0),
-		},
-	}
-
-	ts := newStubTicketStore()
-	smgr.claimedReserve[addr] = big.NewInt(100)
-	sm := NewSenderMonitor(claimant, b, smgr, tm, ts, 5*time.Minute, 3600)
-	sm.Start()
-	defer sm.Stop()
-
-	assert := assert.New(t)
-
-	signedT := defaultSignedTicket(addr, uint32(0))
-	sm.(*senderMonitor).ensureCache(addr)
-	sm.(*senderMonitor).senders[addr].pendingAmount = big.NewInt(-100)
-
-	err := sm.(*senderMonitor).redeemWinningTicket(signedT)
-	assert.EqualError(err, "cannot subtract from insufficient pendingAmount")
-}
