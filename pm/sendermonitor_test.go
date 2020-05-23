@@ -1,5 +1,5 @@
 func TestRedeemWinningTicket_SingleTicket_ZeroMaxFloat(t *testing.T) {
-	claimant, b, smgr, tm := senderMonitorFixture()
+	claimant, b, smgr, tm := localSenderMonitorFixture()
 	addr := RandAddress()
 	smgr.info[addr] = &SenderInfo{
 		Deposit:       big.NewInt(500),
@@ -20,12 +20,12 @@ func TestRedeemWinningTicket_SingleTicket_ZeroMaxFloat(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 
-	err := sm.(*senderMonitor).redeemWinningTicket(signedT)
-	assert.EqualError(err, "max float is zero")
+	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
+	assert.EqualError(err, "max float is 0")
 }
 
 func TestRedeemWinningTicket_SingleTicket_RedeemError(t *testing.T) {
-	claimant, b, smgr, tm := senderMonitorFixture()
+	claimant, b, smgr, tm := localSenderMonitorFixture()
 	addr := RandAddress()
 	smgr.info[addr] = &SenderInfo{
 		Deposit:       big.NewInt(500),
@@ -47,7 +47,7 @@ func TestRedeemWinningTicket_SingleTicket_RedeemError(t *testing.T) {
 	signedT := defaultSignedTicket(addr, uint32(0))
 
 	b.redeemShouldFail = true
-	err := sm.(*senderMonitor).redeemWinningTicket(signedT)
+	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
 	assert.EqualError(err, "stub broker redeem error")
 
 	used, err := b.IsUsedTicket(signedT.Ticket)
@@ -56,7 +56,7 @@ func TestRedeemWinningTicket_SingleTicket_RedeemError(t *testing.T) {
 }
 
 func TestRedeemWinningTicket_SingleTicket_CheckTxError(t *testing.T) {
-	claimant, b, smgr, tm := senderMonitorFixture()
+	claimant, b, smgr, tm := localSenderMonitorFixture()
 	addr := RandAddress()
 	smgr.info[addr] = &SenderInfo{
 		Deposit:       big.NewInt(500),
@@ -77,12 +77,12 @@ func TestRedeemWinningTicket_SingleTicket_CheckTxError(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 
-	err := sm.(*senderMonitor).redeemWinningTicket(signedT)
+	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
 	assert.EqualError(err, b.checkTxErr.Error())
 }
 
 func TestRedeemWinningTicket_SingleTicket(t *testing.T) {
-	claimant, b, smgr, tm := senderMonitorFixture()
+	claimant, b, smgr, tm := localSenderMonitorFixture()
 	addr := RandAddress()
 	smgr.info[addr] = &SenderInfo{
 		Deposit:       big.NewInt(500),
@@ -102,7 +102,7 @@ func TestRedeemWinningTicket_SingleTicket(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 
-	err := sm.(*senderMonitor).redeemWinningTicket(signedT)
+	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
 	assert.Nil(err)
 
 	ok, err := b.IsUsedTicket(signedT.Ticket)
@@ -111,7 +111,7 @@ func TestRedeemWinningTicket_SingleTicket(t *testing.T) {
 }
 
 func TestRedeemWinningTicket_MaxFloatError(t *testing.T) {
-	claimant, b, smgr, tm := senderMonitorFixture()
+	claimant, b, smgr, tm := localSenderMonitorFixture()
 	addr := RandAddress()
 
 	ts := newStubTicketStore()
@@ -123,12 +123,12 @@ func TestRedeemWinningTicket_MaxFloatError(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 	smgr.err = errors.New("maxfloat err")
-	err := sm.(*senderMonitor).redeemWinningTicket(signedT)
+	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
 	assert.EqualError(err, smgr.err.Error())
 }
 
 func TestRedeemWinningTicket_InsufficientMaxFloat_QueueTicket(t *testing.T) {
-	claimant, b, smgr, tm := senderMonitorFixture()
+	claimant, b, smgr, tm := localSenderMonitorFixture()
 	addr := RandAddress()
 	smgr.info[addr] = &SenderInfo{
 		Deposit:       big.NewInt(500),
@@ -149,6 +149,6 @@ func TestRedeemWinningTicket_InsufficientMaxFloat_QueueTicket(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 
-	err := sm.(*senderMonitor).redeemWinningTicket(signedT)
+	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
 	assert.EqualError(err, fmt.Sprintf("insufficient max float sender=%v faceValue=%v maxFloat=%v", addr.Hex(), signedT.FaceValue, new(big.Int).Sub(new(big.Int).Div(smgr.info[addr].Reserve.FundsRemaining, tm.transcoderPoolSize), smgr.claimedReserve[addr])))
 }
