@@ -20,7 +20,8 @@ func TestRedeemWinningTicket_SingleTicket_ZeroMaxFloat(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 
-	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
+	tx, err := sm.redeemWinningTicket(signedT)
+	assert.Nil(tx)
 	assert.EqualError(err, "max float is 0")
 }
 
@@ -47,9 +48,9 @@ func TestRedeemWinningTicket_SingleTicket_RedeemError(t *testing.T) {
 	signedT := defaultSignedTicket(addr, uint32(0))
 
 	b.redeemShouldFail = true
-	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
+	tx, err := sm.redeemWinningTicket(signedT)
 	assert.EqualError(err, "stub broker redeem error")
-
+	assert.Nil(tx)
 	used, err := b.IsUsedTicket(signedT.Ticket)
 	assert.NoError(err)
 	assert.False(used)
@@ -77,7 +78,8 @@ func TestRedeemWinningTicket_SingleTicket_CheckTxError(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 
-	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
+	tx, err := sm.redeemWinningTicket(signedT)
+	assert.Nil(tx)
 	assert.EqualError(err, b.checkTxErr.Error())
 }
 
@@ -102,8 +104,9 @@ func TestRedeemWinningTicket_SingleTicket(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 
-	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
+	tx, err := sm.redeemWinningTicket(signedT)
 	assert.Nil(err)
+	assert.NotNil(tx)
 
 	ok, err := b.IsUsedTicket(signedT.Ticket)
 	assert.Nil(err)
@@ -123,7 +126,8 @@ func TestRedeemWinningTicket_MaxFloatError(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 	smgr.err = errors.New("maxfloat err")
-	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
+	tx, err := sm.redeemWinningTicket(signedT)
+	assert.Nil(tx)
 	assert.EqualError(err, smgr.err.Error())
 }
 
@@ -149,6 +153,7 @@ func TestRedeemWinningTicket_InsufficientMaxFloat_QueueTicket(t *testing.T) {
 
 	signedT := defaultSignedTicket(addr, uint32(0))
 
-	err := sm.(*LocalSenderMonitor).redeemWinningTicket(signedT)
+	tx, err := sm.redeemWinningTicket(signedT)
+	assert.Nil(tx)
 	assert.EqualError(err, fmt.Sprintf("insufficient max float sender=%v faceValue=%v maxFloat=%v", addr.Hex(), signedT.FaceValue, new(big.Int).Sub(new(big.Int).Div(smgr.info[addr].Reserve.FundsRemaining, tm.transcoderPoolSize), smgr.claimedReserve[addr])))
 }
