@@ -1,24 +1,22 @@
 func (sm *LocalSenderMonitor) redeemWinningTicket(ticket *SignedTicket) (*types.Transaction, error) {
-	maxFloat, err := sm.MaxFloat(ticket.Ticket.Sender)
+	availableFunds, err := sm.availableFunds(ticket.Sender)
 	if err != nil {
 		return nil, err
 	}
 
-	// if max float is zero, there is no claimable reserve left or reserve is 0
-	if maxFloat.Cmp(big.NewInt(0)) <= 0 {
-		if err := sm.QueueTicket(ticket); err != nil {
-			return nil, err
-		}
-		return nil, errors.New("max float is 0")
+	ctx, cancel := context.WithTimeout(context.Background(), sm.cfg.RPCTimeout)
+	gasPrice, err := sm.cfg.SuggestGasPrice(ctx)
+	if err != nil {
+		cancel()
+		return nil, err
 	}
+	cancel()
 
-	// If max float is insufficient to cover the ticket face value, queue
-	// the ticket to be retried later
-	if maxFloat.Cmp(ticket.Ticket.FaceValue) < 0 {
-		if err := sm.QueueTicket(ticket); err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("insufficient max float sender=%v faceValue=%v maxFloat=%v", ticket.Ticket.Sender.Hex(), ticket.Ticket.FaceValue, maxFloat)
+	// We only submit a redemption if availableFunds covers the redemption tx cost
+	// Otherwise, we return an error so we can try the redemption later
+	txCost := new(big.Int).Mul(big.NewInt(int64(sm.cfg.RedeemGas)), gasPrice)
+	if availableFunds.Cmp(txCost) <= 0 {
+		return nil, errors.New("insufficient sender funds for redeem tx cost")
 	}
 
 	// Subtract the ticket face value from the sender's current max float
