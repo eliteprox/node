@@ -72,7 +72,7 @@ func (sm *LocalSenderMonitor) redeemWinningTicket(ticket *SignedTicket) (*types.
 		if monitor.Enabled {
 			monitor.TicketRedemptionError()
 		}
-		return nil, err
+		return nil, errCheckTx(err)
 	}
 
 	if monitor.Enabled {
