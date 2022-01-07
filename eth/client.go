@@ -1,7 +1,7 @@
 package eth
 
 func (c *client) setContracts(opts *bind.TransactOpts) error {
-	c.transactOpts = opts
+	c.setTransactOpts(*opts)
 
 	controller, err := contracts.NewController(c.controllerAddr, c.backend)
 	if err != nil {
@@ -9,9 +9,8 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		return err
 	}
 
-	c.ControllerSession = &contracts.ControllerSession{
-		Contract:     controller,
-		TransactOpts: *opts,
+	c.controllerSess = &contracts.ControllerSession{
+		Contract: controller,
 	}
 
 	glog.V(common.SHORT).Infof("Controller: %v", c.controllerAddr.Hex())
@@ -30,9 +29,8 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		return err
 	}
 
-	c.LivepeerTokenSession = &contracts.LivepeerTokenSession{
-		Contract:     token,
-		TransactOpts: *opts,
+	c.livepeerTokenSess = &contracts.LivepeerTokenSession{
+		Contract: token,
 	}
 
 	glog.V(common.SHORT).Infof("LivepeerToken: %v", c.tokenAddr.Hex())
@@ -51,9 +49,8 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		return err
 	}
 
-	c.ServiceRegistrySession = &contracts.ServiceRegistrySession{
-		Contract:     serviceRegistry,
-		TransactOpts: *opts,
+	c.serviceRegistrySess = &contracts.ServiceRegistrySession{
+		Contract: serviceRegistry,
 	}
 
 	glog.V(common.SHORT).Infof("ServiceRegistry: %v", c.serviceRegistryAddr.Hex())
@@ -72,9 +69,8 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		return err
 	}
 
-	c.BondingManagerSession = &contracts.BondingManagerSession{
-		Contract:     bondingManager,
-		TransactOpts: *opts,
+	c.bondingManagerSess = &contracts.BondingManagerSession{
+		Contract: bondingManager,
 	}
 
 	// for L1 contracts backwards-compatibility
@@ -84,9 +80,8 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		return err
 	}
 
-	c.l1BondingManagerSession = &contracts.L1BondingManagerSession{
-		Contract:     l1BondingManager,
-		TransactOpts: *opts,
+	c.l1BondingManagerSess = &contracts.L1BondingManagerSession{
+		Contract: l1BondingManager,
 	}
 
 	glog.V(common.SHORT).Infof("BondingManager: %v", c.bondingManagerAddr.Hex())
@@ -105,9 +100,8 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		return err
 	}
 
-	c.TicketBrokerSession = &contracts.TicketBrokerSession{
-		Contract:     broker,
-		TransactOpts: *opts,
+	c.ticketBrokerSess = &contracts.TicketBrokerSession{
+		Contract: broker,
 	}
 
 	glog.V(common.SHORT).Infof("TicketBroker: %v", c.ticketBrokerAddr.Hex())
@@ -126,9 +120,8 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		return err
 	}
 
-	c.RoundsManagerSession = &contracts.RoundsManagerSession{
-		Contract:     roundsManager,
-		TransactOpts: *opts,
+	c.roundsManagerSess = &contracts.RoundsManagerSession{
+		Contract: roundsManager,
 	}
 
 	glog.V(common.SHORT).Infof("RoundsManager: %v", c.roundsManagerAddr.Hex())
@@ -148,7 +141,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 	}
 
 	// Client should never transact with the Minter directly so we don't include transact opts
-	c.MinterSession = &contracts.MinterSession{
+	c.minterSess = &contracts.MinterSession{
 		Contract: minter,
 	}
 
@@ -168,9 +161,8 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		return err
 	}
 
-	c.LivepeerTokenFaucetSession = &contracts.LivepeerTokenFaucetSession{
-		Contract:     faucet,
-		TransactOpts: *opts,
+	c.livepeerTokenFaucetSess = &contracts.LivepeerTokenFaucetSession{
+		Contract: faucet,
 	}
 
 	glog.V(common.SHORT).Infof("LivepeerTokenFaucet: %v", c.faucetAddr.Hex())
