@@ -75,6 +75,18 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		TransactOpts: *opts,
 	}
 
+	// for L1 contracts backwards-compatibility
+	l1BondingManager, err := contracts.NewL1BondingManager(bondingManagerAddr, c.backend)
+	if err != nil {
+		glog.Errorf("Error creating L1BondingManager binding: %v", err)
+		return err
+	}
+
+	c.l1BondingManagerSession = &contracts.L1BondingManagerSession{
+		Contract:     l1BondingManager,
+		TransactOpts: *opts,
+	}
+
 	glog.V(common.SHORT).Infof("BondingManager: %v", c.bondingManagerAddr.Hex())
 
 	brokerAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("TicketBroker")))
