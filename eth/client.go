@@ -1,6 +1,8 @@
 package eth
 
 func (c *client) setContracts(opts *bind.TransactOpts) error {
+	c.transactOpts = opts
+
 	controller, err := contracts.NewController(c.controllerAddr, c.backend)
 	if err != nil {
 		glog.Errorf("Error creating Controller binding: %v", err)
