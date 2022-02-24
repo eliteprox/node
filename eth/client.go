@@ -8,10 +8,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating Controller binding: %v", err)
 		return err
 	}
-
-	c.controllerSess = &contracts.ControllerSession{
-		Contract: controller,
-	}
+	c.controller = controller
 
 	glog.V(common.SHORT).Infof("Controller: %v", c.controllerAddr.Hex())
 
@@ -28,10 +25,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating LivpeerToken binding: %v", err)
 		return err
 	}
-
-	c.livepeerTokenSess = &contracts.LivepeerTokenSession{
-		Contract: token,
-	}
+	c.livepeerToken = token
 
 	glog.V(common.SHORT).Infof("LivepeerToken: %v", c.tokenAddr.Hex())
 
@@ -48,10 +42,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating ServiceRegistry binding: %v", err)
 		return err
 	}
-
-	c.serviceRegistrySess = &contracts.ServiceRegistrySession{
-		Contract: serviceRegistry,
-	}
+	c.serviceRegistry = serviceRegistry
 
 	glog.V(common.SHORT).Infof("ServiceRegistry: %v", c.serviceRegistryAddr.Hex())
 
@@ -68,10 +59,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating BondingManager binding: %v", err)
 		return err
 	}
-
-	c.bondingManagerSess = &contracts.BondingManagerSession{
-		Contract: bondingManager,
-	}
+	c.bondingManager = bondingManager
 
 	// for L1 contracts backwards-compatibility
 	l1BondingManager, err := contracts.NewL1BondingManager(bondingManagerAddr, c.backend)
@@ -79,10 +67,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating L1BondingManager binding: %v", err)
 		return err
 	}
-
-	c.l1BondingManagerSess = &contracts.L1BondingManagerSession{
-		Contract: l1BondingManager,
-	}
+	c.l1BondingManager = l1BondingManager
 
 	glog.V(common.SHORT).Infof("BondingManager: %v", c.bondingManagerAddr.Hex())
 
@@ -99,10 +84,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating TicketBroker binding: %v", err)
 		return err
 	}
-
-	c.ticketBrokerSess = &contracts.TicketBrokerSession{
-		Contract: broker,
-	}
+	c.ticketBroker = broker
 
 	glog.V(common.SHORT).Infof("TicketBroker: %v", c.ticketBrokerAddr.Hex())
 
@@ -119,10 +101,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating RoundsManager binding: %v", err)
 		return err
 	}
-
-	c.roundsManagerSess = &contracts.RoundsManagerSession{
-		Contract: roundsManager,
-	}
+	c.roundsManager = roundsManager
 
 	glog.V(common.SHORT).Infof("RoundsManager: %v", c.roundsManagerAddr.Hex())
 
@@ -139,11 +118,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating Minter binding: %v", err)
 		return err
 	}
-
-	// Client should never transact with the Minter directly so we don't include transact opts
-	c.minterSess = &contracts.MinterSession{
-		Contract: minter,
-	}
+	c.minter = minter
 
 	glog.V(common.SHORT).Infof("Minter: %v", c.minterAddr.Hex())
 
@@ -160,10 +135,7 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 		glog.Errorf("Error creating LivepeerTokenFaucet binding: %v", err)
 		return err
 	}
-
-	c.livepeerTokenFaucetSess = &contracts.LivepeerTokenFaucetSession{
-		Contract: faucet,
-	}
+	c.livepeerTokenFaucet = faucet
 
 	glog.V(common.SHORT).Infof("LivepeerTokenFaucet: %v", c.faucetAddr.Hex())
 
