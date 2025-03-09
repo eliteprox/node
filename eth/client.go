@@ -139,6 +139,23 @@ func (c *client) setContracts(opts *bind.TransactOpts) error {
 
 	glog.V(common.SHORT).Infof("LivepeerTokenFaucet: %v", c.faucetAddr.Hex())
 
+	livepeerGovernorAddr, err := c.GetContract(crypto.Keccak256Hash([]byte("LivepeerGovernor")))
+	if err != nil {
+		glog.Errorf("Error getting Governor address: %v", err)
+		return err
+	}
+
+	c.livepeerGovernorAddr = livepeerGovernorAddr
+
+	governor, err := contracts.NewGovernor(livepeerGovernorAddr, c.backend)
+	if err != nil {
+		glog.Errorf("Error creating Governor binding: %v", err)
+		return err
+	}
+	c.livepeerGovernor = governor
+
+	glog.V(common.SHORT).Infof("LivepeerGovernor: %v", c.livepeerGovernorAddr.Hex())
+
 	return nil
 }
 
