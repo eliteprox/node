@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -91,6 +92,7 @@ func TestRealBinaryOffchainFlow(t *testing.T) {
 	}
 
 	testBinaryMigrations(t, install)
+	t.Run("discovery dump", func(t *testing.T) { testDiscoveryDumpBinary(t, install) })
 
 	runner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.NotEmpty(t, r.Header.Get("Livepeer-Session-Token"))
@@ -231,6 +233,161 @@ func testDiscoveryBinary(t *testing.T, install, orchestratorURL string) {
 		return entries[0].Address == "" && entries[1].Address == orchestratorURL && len(entries[1].Runners) > 0 &&
 			strings.HasPrefix(entries[1].Runners[0].URL, orchestratorURL+"/apps/")
 	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func testDiscoveryDumpBinary(t *testing.T, install string) {
+	t.Helper()
+	listen, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listen.Close()
+	metrics, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer metrics.Close()
+	started := make(chan error, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/inventory/discovery":
+			_, _ = io.WriteString(w, `[{"address":"https://orch.example","runners":[{"url":"https://orch.example/apps/runner/app","app":"test","observed_at":"2000-01-01T00:00:00Z"}]}]`)
+		case "/blocked/a/discovery", "/blocked/b/discovery":
+			_, _ = fmt.Fprintf(w, `[{"address":"https://orch.example","runners":[{"url":%q,"app":"test","observed_at":"2000-01-01T00:00:00Z","extension":%q}]}]`, "https://orch.example"+r.URL.Path, strings.Repeat("x", 900<<10))
+		case "/failed/discovery":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case "/cancel/discovery":
+			started <- nil
+			<-r.Context().Done()
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	for _, entry := range [][]string{{"livepeer-discovery"}, {"livepeer", "discovery"}} {
+		t.Run(entry[0], func(t *testing.T) {
+			for _, tc := range []struct {
+				name       string
+				sources    []string
+				flags      []string
+				entries    int
+				exit       int
+				diagnostic string
+				noOutput   bool
+			}{
+				{name: "inventory", sources: []string{"inventory"}, entries: 2},
+				{name: "partial failure", sources: []string{"inventory", "failed"}, entries: 2, diagnostic: "discovery refresh failed"},
+				{name: "total failure", sources: []string{"failed"}, exit: 2, diagnostic: "all discovery sources failed"},
+				{name: "conflicting flags", flags: []string{"--print-config"}, exit: 2, diagnostic: "mutually exclusive", noOutput: true},
+				{name: "broken stdout", exit: 2, diagnostic: "cannot write discovery inventory", noOutput: true},
+				{name: "blocked stdout", sources: []string{"blocked/a", "blocked/b"}, exit: 2, diagnostic: "cannot write discovery inventory", noOutput: true},
+				{name: "reader closes after cancellation", sources: []string{"blocked/a"}, exit: 2, diagnostic: "cannot write discovery inventory", noOutput: true},
+				{name: "cancellation", sources: []string{"cancel"}, exit: 2, diagnostic: "context canceled", noOutput: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+					defer cancel()
+					args := append([]string{}, entry[1:]...)
+					args = append(args, "--config=", "--dump", "--listen", listen.Addr().String(), "--metrics-listen", metrics.Addr().String(),
+						"--grants", strings.TrimPrefix(upstream.URL, "http://"))
+					for _, source := range tc.sources {
+						args = append(args, "--nodes", upstream.URL+"/"+source)
+					}
+					args = append(args, tc.flags...)
+					cmd := exec.CommandContext(ctx, filepath.Join(install, entry[0]), args...)
+					var out, logs bytes.Buffer
+					cmd.Stdout, cmd.Stderr = &out, &logs
+					var ready chan error
+					if tc.name == "cancellation" {
+						ready = started
+					}
+					var stdoutReader, stderrReader, stderrWriter *os.File
+					if tc.name == "broken stdout" || tc.name == "blocked stdout" || tc.name == "reader closes after cancellation" {
+						reader, writer, err := os.Pipe()
+						require.NoError(t, err)
+						defer reader.Close()
+						defer writer.Close()
+						cmd.Stdout = writer
+						stdoutReader = reader
+						if tc.name == "broken stdout" {
+							require.NoError(t, reader.Close())
+						} else {
+							ready = make(chan error, 1)
+							go func() {
+								var first [1]byte
+								_, err := reader.Read(first[:])
+								ready <- err
+							}()
+						}
+					}
+					if tc.name == "reader closes after cancellation" {
+						stderrReader, stderrWriter, err = os.Pipe()
+						require.NoError(t, err)
+						defer stderrReader.Close()
+						defer stderrWriter.Close()
+						require.NoError(t, stderrWriter.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
+						_, err := stderrWriter.Write(make([]byte, 1<<20))
+						require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+						require.NoError(t, stderrWriter.SetWriteDeadline(time.Time{}))
+						cmd.Stderr = stderrWriter
+					}
+					require.NoError(t, cmd.Start())
+					if stderrWriter != nil {
+						require.NoError(t, stderrWriter.Close())
+					}
+					done := make(chan error, 1)
+					go func() { done <- cmd.Wait() }()
+					if ready != nil {
+						select {
+						case err := <-ready:
+							require.NoError(t, err)
+							require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+						case <-ctx.Done():
+							t.Fatal("dump did not become ready for cancellation")
+						}
+					}
+					if stderrReader != nil {
+						// Delay the final error report until cancellation has returned
+						// from Root and the stdout reader has closed.
+						for i := range 2 {
+							select {
+							case err := <-done:
+								t.Fatalf("dump exited before stderr was drained: %v", err)
+							case <-time.After(100 * time.Millisecond):
+							}
+							if i == 0 {
+								require.NoError(t, stdoutReader.Close())
+							}
+						}
+						_, err := io.Copy(&logs, stderrReader)
+						require.NoError(t, err)
+					}
+					err := <-done
+					require.NoError(t, ctx.Err(), "dump must finish before its process deadline")
+					if tc.exit == 0 {
+						require.NoError(t, err, logs.String())
+					} else {
+						var exit *exec.ExitError
+						require.ErrorAs(t, err, &exit, logs.String())
+						require.Equal(t, tc.exit, exit.ExitCode(), logs.String())
+					}
+					if tc.diagnostic == "" {
+						require.Empty(t, logs.String())
+					} else {
+						require.Contains(t, logs.String(), tc.diagnostic)
+					}
+					if tc.noOutput {
+						require.Empty(t, out.String())
+						return
+					}
+					var entries []json.RawMessage
+					require.NoError(t, json.Unmarshal(out.Bytes(), &entries), out.String())
+					require.NotNil(t, entries)
+					require.Len(t, entries, tc.entries)
+					require.True(t, strings.HasSuffix(out.String(), "\n"))
+					require.Equal(t, 1, strings.Count(out.String(), "\n"))
+				})
+			}
+		})
+	}
 }
 
 func checkPythonSDK(t *testing.T, root, serviceURL, runnerURL string) {

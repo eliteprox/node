@@ -16,5 +16,6 @@ Flags:
       --max-failed-refreshes int    Consecutive failed refreshes before eviction (env: LIVEPEER_DISCOVERY_MAX_FAILED_REFRESHES) (default 6)
   -g, --grants strings              Private discovery IP[:port] or CIDR grants (env: LIVEPEER_DISCOVERY_GRANTS)
   -p, --print-config                Print TOML configuration
+      --dump                        Query discovery sources once, print JSON inventory, and exit
   -h, --help                        help for livepeer-discovery
   -v, --version                     version for livepeer-discovery

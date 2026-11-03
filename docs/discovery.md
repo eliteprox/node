@@ -14,6 +14,12 @@ livepeer discovery --config /etc/livepeer/discovery.toml
 [shared configuration](configuration.md) for environment variables, paths, and
 `--print-config`; the default directory is `~/.lpData/offchain/discovery`.
 
+Use `--dump` to query sources once and exit without listeners or refreshes. It writes a
+newline-terminated [discovery JSON array](http-api.md#discovery-http) to stdout; diagnostics
+go to stderr. Exit 0 includes empty or partial success, and `[]` when no requests are made
+(no sources or both advertising switches disabled). Otherwise, it exits 2, possibly with
+partial output. `--dump` is CLI-only and conflicts with `--print-config`.
+
 ## Sources and cache
 
 Each source is queried at `<base URL>/discovery`, retaining any deployment path.

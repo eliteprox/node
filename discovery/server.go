@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -105,17 +106,55 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Close() { s.collector.Close() }
 
 func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
-	body, err := json.Marshal(s.discoveryResponse())
+	body, err := s.discoveryBody(r.Context())
 	if err != nil {
 		http.Error(w, "cannot encode discovery inventory", http.StatusInternalServerError)
 		return
 	}
-	body = append(body, '\n')
-	if len(body) > discovery.MaxBody {
-		s.logger.WarnContext(r.Context(), "discovery response exceeds signer size limit", "response_bytes", len(body), "max_bytes", discovery.MaxBody)
-	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(body)
+}
+
+func (s *Server) discoveryBody(ctx context.Context) ([]byte, error) {
+	body, err := json.Marshal(s.discoveryResponse())
+	if err != nil {
+		return nil, fmt.Errorf("cannot encode discovery inventory: %w", err)
+	}
+	body = append(body, '\n')
+	if len(body) > discovery.MaxBody {
+		s.logger.WarnContext(ctx, "discovery response exceeds signer size limit", "response_bytes", len(body), "max_bytes", discovery.MaxBody)
+	}
+	return body, nil
+}
+
+// dump collects one complete inventory on a fresh server, then closes it.
+func (s *Server) dump(ctx context.Context, out io.Writer) error {
+	defer s.Close()
+	collect := len(s.urls) > 0 && (s.advertiseNodes || s.advertiseRunners)
+	if collect {
+		s.collector.Refresh(ctx, false)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	body, err := s.discoveryBody(ctx)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	n, err := out.Write(body)
+	if err == nil && n != len(body) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return fmt.Errorf("cannot write discovery inventory: %w", err)
+	}
+	if collect && !s.collector.Initialized() {
+		return errors.New("all discovery sources failed")
+	}
+	return nil
 }
 
 // Run refreshes immediately and periodically until ctx ends. Run it once and

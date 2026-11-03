@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -35,6 +36,7 @@ type Params struct {
 	MaxFailedRefreshes int                  `default:"6" min:"0" descr:"Consecutive failed refreshes before eviction"`
 	Grants             []string             `optional:"true" descr:"Private discovery IP[:port] or CIDR grants"`
 	PrintConfig        bool                 `optional:"true" boa:"noconfig,noenv" descr:"Print TOML configuration"`
+	Dump               bool                 `optional:"true" boa:"noconfig,noenv" descr:"Query discovery sources once, print JSON inventory, and exit"`
 }
 
 func Root(out, errOut io.Writer) *cobra.Command {
@@ -44,6 +46,9 @@ func Root(out, errOut io.Writer) *cobra.Command {
 		Params: params, RejectUnknown: true,
 		Args: cobra.NoArgs,
 		RunFuncE: func(p *Params, cmd *cobra.Command, _ []string) error {
+			if p.Dump && p.PrintConfig {
+				return boa.NewUserInputErrorf("--dump and --print-config are mutually exclusive")
+			}
 			if p.PrintConfig {
 				app, err := NewServer(*p, slog.Default())
 				if err != nil {
@@ -57,6 +62,19 @@ func Root(out, errOut io.Writer) *cobra.Command {
 					"RefreshInterval": &p.RefreshInterval, "MaxFailedRefreshes": &p.MaxFailedRefreshes,
 				})
 			}
+			if p.Dump {
+				ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+				defer stop()
+				app, err := NewServer(*p, slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil)))
+				if err != nil {
+					return boa.NewUserInputError(err)
+				}
+				inventoryOut := cmd.OutOrStdout()
+				if inventoryOut == os.Stdout {
+					inventoryOut = dumpStdout{ctx}
+				}
+				return app.dump(ctx, inventoryOut)
+			}
 			return Serve(cmd.Context(), *p, cmd.ErrOrStderr())
 		},
 	}, &params.ConfigFile).ToCobra()
@@ -66,6 +84,34 @@ func Root(out, errOut io.Writer) *cobra.Command {
 	cmd.SilenceErrors = true
 	cmd.InitDefaultCompletionCmd()
 	return cmd
+}
+
+// dumpStdout lets a signal abort a blocked CLI write. The process exits after
+// dump returns, so this must only wrap process-owned stdout.
+type dumpStdout struct{ ctx context.Context }
+
+func (w dumpStdout) Write(data []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		brokenPipe := make(chan os.Signal, 1)
+		signal.Notify(brokenPipe, syscall.SIGPIPE)
+		defer signal.Stop(brokenPipe)
+		n, err := os.Stdout.Write(data)
+		done <- result{n, err}
+	}()
+	select {
+	case <-w.ctx.Done():
+		return 0, w.ctx.Err()
+	case written := <-done:
+		if err := w.ctx.Err(); err != nil {
+			return written.n, err
+		}
+		return written.n, written.err
+	}
 }
 
 func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
