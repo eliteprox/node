@@ -471,3 +471,65 @@ func TestLiveChargeObservesOnlyDebitAttempts(t *testing.T) {
 	require.EqualValues(t, 1, test.MetricSum(t, e.metrics.Registry, "payment_operations_total", map[string]string{"operation": "charge", "outcome": "success"}))
 	require.EqualValues(t, 1, test.MetricSum(t, e.metrics.Registry, "payment_operations_total", map[string]string{"operation": "charge", "outcome": "insufficient_balance"}))
 }
+
+// Warm admission and refusal cases adapt Mike Zupper's PR #1
+// orchestrator/chainview_test.go at bbe126e5eddbf59f9cc9f94d3c37703215c26850.
+// Copyright (c) 2017 Livepeer; MIT notice in LICENSE.
+func TestPaymentsAndReadinessUseObservedRecipient(t *testing.T) {
+	e, _, key, _ := newRecipientTestEngine(t)
+	f := test.NewChainRPC(t)
+	f.Update(func(s *test.ChainState) { s.Recipient = e.recipient })
+	rpc, err := eth.OpenRPC(f.URL)
+	require.NoError(t, err)
+	t.Cleanup(rpc.Close)
+	contracts, err := eth.NewContracts(rpc, f.Controller)
+	require.NoError(t, err)
+	chain := eth.PaymentChain{Contracts: contracts}
+	chain.Observer = eth.NewPaymentObserver(chain, true, e.recipient)
+	e.chain = pm.EthereumChain{Client: chain}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { chain.Observer.Run(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("recipient observation did not stop")
+		}
+	})
+	require.Eventually(t, func() bool {
+		_, err := chain.Snapshot(t.Context())
+		return err == nil
+	}, time.Second, time.Millisecond)
+	registry := NewRegistry("", "https://orch.example", time.Second, time.Minute)
+	ready := &paidReadiness{storage: true, completed: time.Now(), workerCompleted: time.Now(), observer: chain.Observer}
+	f.Reset()
+	info := issueRecipientParams(t, e, key)
+	require.NoError(t, receiveRecipientPayment(t, e, key, info, 1))
+	require.True(t, ready.ready(registry), "current local activity overrides an older unavailable dependency check")
+	require.Zero(t, f.Stats().Calls["BondingManager.isActiveTranscoder"], "warm challenge, receipt, and readiness activity must be local")
+	before, err := e.Balance("session")
+	require.NoError(t, err)
+	beforeNonces := e.nonceCount
+	ready.chain, ready.active = true, true // Simulate the preceding periodic check.
+	f.Update(func(s *test.ChainState) {
+		s.Parent, s.Hash = s.Hash, ethcommon.HexToHash("0xfeed")
+		s.Number++
+		s.L1Block++
+		s.Timestamp = uint64(time.Now().Unix())
+		s.Fail = "BondingManager.isActiveTranscoder"
+	})
+	require.Eventually(t, func() bool {
+		snapshot, err := chain.Snapshot(t.Context())
+		return err == nil && snapshot.Block.Int64() == 51
+	}, 7*time.Second, 10*time.Millisecond)
+	f.Reset()
+	require.False(t, ready.ready(registry), "readiness must refuse between periodic checks")
+	require.Error(t, receiveRecipientPayment(t, e, key, info, 2))
+	after, err := e.Balance("session")
+	require.NoError(t, err)
+	require.Equal(t, before.RatString(), after.RatString())
+	require.Equal(t, beforeNonces, e.nonceCount, "unavailable activity must not consume replay guards")
+	require.Zero(t, f.Stats().Calls["BondingManager.isActiveTranscoder"], "unknown state must refuse without a request-triggered retry")
+}

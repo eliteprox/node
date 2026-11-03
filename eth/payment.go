@@ -30,8 +30,17 @@ func (c PaymentChain) IsActive(ctx context.Context, recipient ethcommon.Address)
 }
 
 func (c PaymentChain) IsActiveAt(ctx context.Context, recipient ethcommon.Address, snapshot ChainSnapshot) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if err := snapshot.Validate(); err != nil {
 		return false, err
+	}
+	if c.Observer != nil || snapshot.observer != nil {
+		if snapshot.observer != c.Observer || c.Contracts != c.Observer.chain.Contracts || recipient == (ethcommon.Address{}) || recipient != c.Observer.recipient {
+			return false, ErrObservationUnavailable
+		}
+		return snapshot.recipientActive, snapshot.recipientErr
 	}
 	if snapshot.blockReference == nil {
 		return false, errors.New("canonical snapshot required")
@@ -40,15 +49,15 @@ func (c PaymentChain) IsActiveAt(ctx context.Context, recipient ethcommon.Addres
 	if err != nil {
 		return false, err
 	}
+	return c.activeAt(ctx, address, recipient, snapshot)
+}
+
+func (c PaymentChain) activeAt(ctx context.Context, address, recipient ethcommon.Address, snapshot ChainSnapshot) (bool, error) {
 	bonding, err := contracts.NewBondingManagerCaller(address, c.Contracts.callerAt(snapshot.blockReference))
 	if err != nil {
 		return false, err
 	}
-	active, err := bonding.IsActiveTranscoder(&bind.CallOpts{Context: ctx}, recipient)
-	if err == nil {
-		err = snapshot.Validate()
-	}
-	return active, err
+	return bonding.IsActiveTranscoder(&bind.CallOpts{Context: ctx}, recipient)
 }
 
 // Receipt reports a submitted redemption without retrying or resubmitting it.
@@ -81,16 +90,18 @@ func (c PaymentChain) Receipt(ctx context.Context, hash ethcommon.Hash) (confirm
 }
 
 type ChainSnapshot struct {
-	Block          *big.Int // Protocol L1 block, including on Arbitrum.
-	Round          *big.Int // Last initialized round.
-	RoundHash      ethcommon.Hash
-	CurrentRound   *big.Int // Protocol round; may exceed the initialized Round.
-	blockReference map[string]any
-	addresses      paymentContracts
-	observer       *PaymentObserver
-	generation     uint64
-	observedAt     time.Time
-	blockTime      time.Time
+	Block           *big.Int // Protocol L1 block, including on Arbitrum.
+	Round           *big.Int // Last initialized round.
+	RoundHash       ethcommon.Hash
+	CurrentRound    *big.Int // Protocol round; may exceed the initialized Round.
+	blockReference  map[string]any
+	addresses       paymentContracts
+	observer        *PaymentObserver
+	generation      uint64
+	observedAt      time.Time
+	blockTime       time.Time
+	recipientActive bool
+	recipientErr    error
 }
 
 func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {

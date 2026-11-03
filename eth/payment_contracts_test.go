@@ -20,6 +20,7 @@ func TestObserverConfirmedPaymentContracts(t *testing.T) {
 	}{{"RoundsManager", 5}, {"TicketBroker", 5}, {"BondingManager", 5}, {"RoundsManager", 9}} {
 		t.Run(tc.contract+big.NewInt(int64(tc.round)).String(), func(t *testing.T) {
 			f, o, now := newTestObserver(t)
+			o.recipient = common.HexToAddress("0x3000")
 			require.NoError(t, o.refresh(t.Context()))
 			before, err := o.Snapshot(t.Context())
 			require.NoError(t, err)
@@ -68,6 +69,7 @@ func TestObserverConfirmedPaymentContracts(t *testing.T) {
 				}
 			}
 			require.Zero(t, f.Stats().Calls["Controller.getContract"], "warm payment reads retain confirmed addresses")
+			require.Zero(t, f.Stats().Calls["BondingManager.isActiveTranscoder"], "replacement activity belongs to the supplied observation")
 		})
 	}
 }
@@ -121,7 +123,7 @@ func TestObserverRegistryScopeAndFinalizedReads(t *testing.T) {
 	require.NoError(t, err)
 	f.Reset()
 	_, err = (PaymentChain{Contracts: other}).IsActiveAt(t.Context(), common.HexToAddress("0x3000"), s)
-	require.ErrorContains(t, err, "another contract client")
+	require.ErrorIs(t, err, ErrObservationUnavailable)
 	require.Zero(t, f.Stats().RoundTrips)
 	advanceObserver(f, *now)
 	f.Update(func(state *test.ChainState) {
