@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/require"
@@ -39,7 +38,7 @@ type ChainState struct {
 	ChainID                                    uint64
 	Hash, Parent, RoundHash                    common.Hash
 	Round, CurrentRound                        uint64
-	Recipient                                  common.Address
+	Payer, Recipient                           common.Address
 	Activation, Deactivation                   uint64
 	OmitL1, OmitTimestamp                      bool
 	Fail                                       string
@@ -83,6 +82,8 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		"blockHashForRound(uint256)": "RoundsManager.blockHashForRound", "isActiveTranscoder(address)": "BondingManager.isActiveTranscoder",
 		"getSenderInfo(address)": "TicketBroker.getSenderInfo", "claimableReserve(address,address)": "TicketBroker.claimableReserve",
 		"usedTickets(bytes32)": "TicketBroker.usedTickets",
+		"description()":        "PriceFeed.description",
+		"redeemWinningTicket((address,address,uint256,uint256,uint256,bytes32,bytes),bytes,uint256)": "TicketBroker.redeemWinningTicket",
 	} {
 		methods[hex.EncodeToString(crypto.Keccak256([]byte(signature))[:4])] = name
 	}
@@ -116,7 +117,7 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		fail := func() {
 			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32000}})
 		}
-		if state.Fail == name {
+		if state.Fail == name || state.Fail == request.Method {
 			fail()
 			return
 		}
@@ -124,40 +125,30 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		switch request.Method {
 		case "eth_getLogs":
 			var query struct {
-				BlockHash          common.Hash
-				FromBlock, ToBlock string
-				Address            []common.Address
+				BlockHash common.Hash
+				Address   []common.Address
 			}
 			require.NoError(t, json.Unmarshal(request.Params[0], &query))
-			from, to := uint64(0), state.Number
-			if query.BlockHash == (common.Hash{}) {
-				var err error
-				from, err = hexutil.DecodeUint64(query.FromBlock)
-				require.NoError(t, err)
-				to, err = hexutil.DecodeUint64(query.ToBlock)
-				require.NoError(t, err)
-			} else if _, ok := c.stateAt(query.BlockHash.Hex()); !ok {
+			logs := []types.Log{}
+			c.mu.Lock()
+			frame, ok := c.history[query.BlockHash]
+			if !ok {
+				c.mu.Unlock()
 				fail()
 				return
 			}
-			logs := []types.Log{}
-			c.mu.Lock()
 			c.stats.LogAddresses = query.Address
-			for _, frame := range c.history {
-				for _, log := range frame.Logs {
-					matches := query.BlockHash == log.BlockHash
-					if query.BlockHash == (common.Hash{}) {
-						matches = log.BlockNumber >= from && log.BlockNumber <= to
-					}
-					if matches && slices.Contains(query.Address, log.Address) {
-						logs = append(logs, log)
-					}
+			for _, log := range frame.Logs {
+				if log.BlockHash == query.BlockHash && slices.Contains(query.Address, log.Address) {
+					logs = append(logs, log)
 				}
 			}
 			c.mu.Unlock()
 			result = logs
 		case "eth_chainId":
 			result = quantity(state.ChainID)
+		case "eth_getBalance":
+			result = "0x1"
 		case "eth_getBlockByNumber":
 			var ref string
 			require.NoError(t, json.Unmarshal(request.Params[0], &ref))
@@ -180,14 +171,18 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 			}
 			result = header
 		case "eth_call":
-			var ref map[string]any
-			require.NoError(t, json.Unmarshal(request.Params[1], &ref))
-			require.Equal(t, true, ref["requireCanonical"])
-			var ok bool
-			state, ok = c.stateAt(ref["blockHash"].(string))
-			if !ok {
-				fail()
-				return
+			directRead := (name == "Controller.getContract" || name == "TicketBroker.usedTickets") && string(request.Params[1]) == `"latest"`
+			simulation := name == "TicketBroker.redeemWinningTicket" && string(request.Params[1]) == `"pending"`
+			if !directRead && !simulation {
+				var ref map[string]any
+				require.NoError(t, json.Unmarshal(request.Params[1], &ref), "%s block reference %s", name, request.Params[1])
+				require.Equal(t, true, ref["requireCanonical"])
+				var ok bool
+				state, ok = c.stateAt(ref["blockHash"].(string))
+				if !ok {
+					fail()
+					return
+				}
 			}
 			switch name {
 			case "Controller.getContract":
@@ -199,6 +194,7 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 			case "RoundsManager.currentRound":
 				result = "0x" + word(quantity(state.CurrentRound)[2:])
 			case "RoundsManager.blockHashForRound":
+				require.Equal(t, word(quantity(state.Round)[2:]), call.Input[10:])
 				result = state.RoundHash.Hex()
 			case "BondingManager.isActiveTranscoder":
 				if state.Recipient != (common.Address{}) {
@@ -209,15 +205,23 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 					result = "0x" + word("1")
 				}
 			case "TicketBroker.getSenderInfo":
+				if state.Payer != (common.Address{}) {
+					require.Equal(t, word(hex.EncodeToString(state.Payer.Bytes())), call.Input[10:])
+				}
 				if state.FailPayer != (common.Address{}) && common.HexToAddress(call.Input[10:74]) == state.FailPayer {
 					fail()
 					return
 				}
 				result = "0x" + word(quantity(state.Deposit)[2:]) + word(quantity(state.WithdrawRound)[2:]) + word(quantity(state.Reserve)[2:]) + word("0")
 			case "TicketBroker.claimableReserve":
+				if state.Payer != (common.Address{}) {
+					require.Equal(t, word(hex.EncodeToString(state.Payer.Bytes()))+word(hex.EncodeToString(state.Recipient.Bytes())), call.Input[10:])
+				}
 				result = "0x" + word(quantity(state.Claimable)[2:])
 			case "TicketBroker.usedTickets":
 				result = "0x" + word("0")
+			case "TicketBroker.redeemWinningTicket":
+				result = "0x"
 			default:
 				t.Errorf("unexpected payment contract call")
 			}

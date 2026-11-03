@@ -14,6 +14,7 @@ import (
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/livepeer/node/eth"
+	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/internal/test"
 	"github.com/livepeer/node/orchestrator"
 	"github.com/livepeer/node/pm"
@@ -161,37 +162,79 @@ func TestRecipientReservesWinningLiabilityAcrossConcurrentSessions(t *testing.T)
 
 // Adapted from BlueClawNetwork/livepeer-node signer/payment_test.go,
 // 285eda984d7cce4e3030ef0510d63ae142534dd7, by Mike Zupper (MIT; see LICENSE).
-func TestPaidRequestDirectRPCBudget(t *testing.T) {
-	s, _ := testService(t)
-	defer s.Close()
-	rpc := test.NewChainRPC(t)
-	client, err := eth.OpenRPC(rpc.URL)
-	require.NoError(t, err)
-	defer client.Close()
-	contracts, err := eth.NewContracts(client, rpc.Controller)
-	require.NoError(t, err)
-	// Explicitly use the direct adapter: cached configurations can do less work.
-	direct := pm.EthereumChain{Client: eth.PaymentChain{Contracts: contracts}}
-	s.SetPaymentChain(direct)
+type paidPath struct {
+	service   *Service
+	engine    *orchestrator.PaymentEngine
+	rpc       *test.ChainRPC
+	recipient ethcommon.Address
+	metrics   *observability.Metrics
+	stop      func()
+}
+
+func newPaidPath(t *testing.T, observed bool) *paidPath {
+	t.Helper()
+	key, _, _ := testSignerKey(t)
+	p := &paidPath{service: newService(key), rpc: test.NewChainRPC(t), recipient: ethcommon.HexToAddress("0x1234"), metrics: observability.New("orchestrator")}
+	t.Cleanup(func() { _ = p.service.Close() })
+	ctx, cancel := context.WithCancel(t.Context())
+	var observers sync.WaitGroup
+	p.stop = func() { cancel(); observers.Wait() }
+	t.Cleanup(p.stop)
+	newChain := func(metrics *observability.Metrics, recipient ethcommon.Address) eth.PaymentChain {
+		client, err := eth.OpenRPC(p.rpc.URL)
+		require.NoError(t, err)
+		t.Cleanup(func() { p.stop(); client.Close() })
+		client.SetObserver(metrics.RPC)
+		contracts, err := eth.NewContracts(client, p.rpc.Controller)
+		require.NoError(t, err)
+		chain := eth.PaymentChain{Contracts: contracts}
+		if observed {
+			o := eth.NewPaymentObserver(chain, true, recipient)
+			chain.Observer = o
+			metrics.PaymentObserver(o, nil)
+			observers.Go(func() { o.Run(ctx) })
+			require.Eventually(t, func() bool { return o.Status().Healthy }, 5*time.Second, time.Millisecond)
+		}
+		return chain
+	}
+	direct := newChain(p.metrics, p.recipient)
+	p.service.SetPaymentChain(newChain(p.service.metrics, ethcommon.Address{}))
 	store, err := orchestrator.OpenRedeemerDB(filepath.Join(t.TempDir(), "payments.sqlite"))
 	require.NoError(t, err)
-	defer store.Close()
-	recipient := ethcommon.HexToAddress("0x1234")
+	t.Cleanup(func() { _ = store.Close() })
 	maximum := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
-	engine, err := orchestrator.NewPaymentEngine(store, direct, recipient, big.NewInt(1e12), new(big.Int).Quo(maximum, big.NewInt(1e5)))
+	p.engine, err = orchestrator.NewPaymentEngine(store, direct, p.recipient, big.NewInt(1e12), new(big.Int).Quo(maximum, big.NewInt(1e5)))
 	require.NoError(t, err)
-	_, err = engine.MakeChallenge(t.Context(), "runner", "manifest", s.key.Address(), 9, "fixed", "https://orch.example")
-	require.NoError(t, err)
-	info, err := engine.ChallengeInfo("manifest")
-	require.NoError(t, err)
-	require.Equal(t, 6, rpc.Stats().RoundTrips, "challenge: snapshot (4) + activity (2)")
+	return p
+}
 
-	response := postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
+func (p *paidPath) challenge(t *testing.T, ctx context.Context, manifest string) wire.OrchestratorInfo {
+	t.Helper()
+	_, err := p.engine.MakeChallenge(ctx, "runner", manifest, p.service.key.Address(), 9, "fixed", "https://orch.example")
+	require.NoError(t, err)
+	info, err := p.engine.ChallengeInfo(manifest)
+	require.NoError(t, err)
+	return info
+}
+
+func (p *paidPath) sign(t *testing.T, info wire.OrchestratorInfo) paymentResponse {
+	t.Helper()
+	response := postPayment(t, p.service, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
 	require.Equal(t, 200, response.Code, response.Body.String())
 	var signed paymentResponse
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &signed))
+	return signed
+}
+
+func TestPaidRequestDirectRPCBudget(t *testing.T) {
+	p := newPaidPath(t, false)
+	s, engine, rpc, recipient := p.service, p.engine, p.rpc, p.recipient
+	info := p.challenge(t, t.Context(), "manifest")
+	require.Equal(t, 6, rpc.Stats().RoundTrips, "challenge: snapshot (4) + activity (2)")
+
+	signed := p.sign(t, info)
 	require.Equal(t, 13, rpc.Stats().RoundTrips, "signer adds one funds observation (7)")
-	_, _, err = engine.Receive(t.Context(), "runner", "manifest", signed.Payment, signed.SegCreds)
+	_, _, err := engine.Receive(t.Context(), "runner", "manifest", signed.Payment, signed.SegCreds)
 	require.NoError(t, err)
 	stats := rpc.Stats()
 	require.Equal(t, 22, stats.RoundTrips, "receipt adds funds (7) + activity (2); baseline was 29")
@@ -203,11 +246,8 @@ func TestPaidRequestDirectRPCBudget(t *testing.T) {
 
 	// A signer's retained observation cannot prove that the recipient is behind
 	// expiry. The recipient must still enforce its own clock at the boundary.
-	_, err = engine.MakeChallenge(t.Context(), "runner", "divergent", s.key.Address(), 9, "fixed", "https://orch.example")
-	require.NoError(t, err)
-	info, err = engine.ChallengeInfo("divergent")
-	require.NoError(t, err)
-	older, err := direct.PayerFunds(t.Context(), s.key.Address(), recipient)
+	info = p.challenge(t, t.Context(), "divergent")
+	older, err := s.paymentChain.PayerFunds(t.Context(), s.key.Address(), recipient)
 	require.NoError(t, err)
 	s.SetPaymentChain(payerChainFunc(func(context.Context, ethcommon.Address, ethcommon.Address) (pm.PayerFunds, error) { return older, nil }))
 	rpc.Update(func(state *test.ChainState) {
@@ -215,41 +255,29 @@ func TestPaidRequestDirectRPCBudget(t *testing.T) {
 		state.Number++
 		state.Hash = ethcommon.HexToHash("0xeeee")
 	})
-	response = postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
-	require.Equal(t, 200, response.Code, response.Body.String())
-	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &signed))
+	signed = p.sign(t, info)
 	_, _, err = engine.Receive(t.Context(), "runner", "divergent", signed.Payment, signed.SegCreds)
 	require.ErrorIs(t, err, orchestrator.ErrInvalidPayment)
+}
 
-	const manifest = "invalidated-signing"
-	_, err = engine.MakeChallenge(t.Context(), "runner", manifest, s.key.Address(), 9, "fixed", "https://orch.example")
+func TestPaidRequestCachedRPCBudget(t *testing.T) {
+	p := newPaidPath(t, true)
+	before := p.rpc.Stats().RoundTrips
+	p.request(t, t.Context(), "cold")
+	require.Equal(t, 4, p.rpc.Stats().RoundTrips-before, "one cold pair read in each process")
+	require.EqualValues(t, 4, test.MetricSum(t, p.metrics.Registry, "rpc_work_total", map[string]string{"work": "foreground", "kind": "transport"})+test.MetricSum(t, p.service.metrics.Registry, "rpc_work_total", map[string]string{"work": "foreground", "kind": "transport"}))
+	before = p.rpc.Stats().RoundTrips
+	p.request(t, t.Context(), "warm")
+	require.Equal(t, before, p.rpc.Stats().RoundTrips, "new manifests for a known payer read memory")
+}
+
+// Adapted from Mike Zupper's BlueClawNetwork/livepeer-node signer/payment_test.go,
+// a4fe74293a04937c5c5514b1a3706718a502eba0 (MIT; see LICENSE).
+func (p *paidPath) request(t *testing.T, ctx context.Context, manifest string) {
+	t.Helper()
+	ctx = eth.WithRPCWork(ctx, "foreground")
+	info := p.challenge(t, ctx, manifest)
+	signed := p.sign(t, info)
+	_, _, err := p.engine.Receive(ctx, "runner", manifest, signed.Payment, signed.SegCreds)
 	require.NoError(t, err)
-	info, err = engine.ChallengeInfo(manifest)
-	require.NoError(t, err)
-	for _, during := range []bool{false, true} {
-		observer := eth.NewPaymentObserver(direct.Client, false, ethcommon.Address{})
-		ctx, cancel := context.WithCancel(t.Context())
-		done := make(chan struct{})
-		go func() { observer.Run(ctx); close(done) }()
-		stop := func() { cancel(); <-done }
-		defer stop()
-		require.Eventually(t, func() bool { _, err := observer.Snapshot(ctx); return err == nil }, time.Second, time.Millisecond)
-		observed := direct
-		observed.Client.Observer = observer
-		s.SetPaymentChain(observed)
-		draft, err := s.preparePayment(t.Context(), "fixed", manifest, info, paymentState{}, -1, time.Now())
-		require.NoError(t, err)
-		key := &failingPaymentSigner{TicketSigner: s.key}
-		if during {
-			key.before = stop
-		} else {
-			stop()
-		}
-		payment, err := draft.Sign(t.Context(), key, s.metrics)
-		require.ErrorIs(t, err, eth.ErrObservationUnavailable)
-		require.Empty(t, payment)
-		if !during {
-			require.Zero(t, key.calls.Load(), "invalidated observations must not produce signatures")
-		}
-	}
 }

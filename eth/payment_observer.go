@@ -22,6 +22,7 @@ var ErrObservationUnavailable = errors.New("chain observation unavailable")
 // PaymentObserver publishes complete canonical observations. Gaps and reorgs
 // rebuild state at the new hash instead of replaying uncertain event history.
 type PaymentObserver struct {
+	OnRefresh         func(time.Duration, error) // Install before Run; called serially.
 	chain             PaymentChain
 	interval, maxAge  time.Duration
 	now               func() time.Time
@@ -30,7 +31,6 @@ type PaymentObserver struct {
 	header            *miniHeader
 	generation        uint64
 	requireL1         bool
-	invalid, stopped  bool
 	contact, progress time.Time
 	l1Progress        time.Time
 	l1HighWater       *big.Int
@@ -48,23 +48,27 @@ func NewPaymentObserver(chain PaymentChain, requireL1 bool, recipient common.Add
 
 // Run has one service-owned caller. Every RPC inherits the service lifetime.
 func (o *PaymentObserver) Run(ctx context.Context) {
+	ctx = WithRPCWork(ctx, "background")
 	o.mu.Lock()
 	lifecycle, cancelReads := context.WithCancel(ctx)
 	o.lifecycle = lifecycle
 	o.mu.Unlock()
 	defer func() {
-		cancelReads()
 		o.mu.Lock()
-		o.stopped = true
+		cancelReads()
 		o.mu.Unlock()
 		o.payerReads.Wait()
 	}()
 	ticker := time.NewTicker(o.interval)
 	defer ticker.Stop()
 	for {
+		start := time.Now()
 		read, cancel := context.WithTimeout(ctx, o.maxAge)
-		_ = o.refresh(read)
+		err := o.refresh(read)
 		cancel()
+		if o.OnRefresh != nil {
+			o.OnRefresh(time.Since(start), err)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -78,6 +82,7 @@ func (o *PaymentObserver) Run(ctx context.Context) {
 type ObserverStatus struct {
 	ObservedAt, ContactAt, HeadProgressAt, L1ProgressAt time.Time
 	Healthy, RecipientActive                            bool
+	RecipientTracked, RecipientFailed                   bool
 	PayerEntries, PayerReads, PayerFailures             int
 }
 
@@ -85,9 +90,12 @@ func (o *PaymentObserver) Status() ObserverStatus {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	healthy := o.validate(o.current) == nil
-	status := ObserverStatus{ObservedAt: o.current.observedAt, ContactAt: o.contact, HeadProgressAt: o.progress, L1ProgressAt: o.l1Progress, Healthy: healthy, RecipientActive: healthy && o.recipient != (common.Address{}) && o.current.recipientErr == nil && o.current.recipientActive, PayerEntries: len(o.payers), PayerReads: o.activeReads}
+	status := ObserverStatus{
+		ObservedAt: o.current.observedAt, ContactAt: o.contact, HeadProgressAt: o.progress, L1ProgressAt: o.l1Progress,
+		RecipientActive: healthy && o.recipient != (common.Address{}) && o.current.recipientErr == nil && o.current.recipientActive, PayerEntries: len(o.payers), PayerReads: o.activeReads, Healthy: healthy, RecipientTracked: o.recipient != (common.Address{}), RecipientFailed: o.current.recipientErr != nil,
+	}
 	for _, entry := range o.payers {
-		if !entry.valid && entry.failure != nil {
+		if !entry.valid && entry.failure != nil && entry.failedAt == o.current.BlockHash && entry.failedGeneration == o.current.generation {
 			status.PayerFailures++
 		}
 	}
@@ -132,7 +140,7 @@ func (s ChainSnapshot) Validate() error {
 }
 
 func (o *PaymentObserver) validate(s ChainSnapshot) error {
-	if o.stopped || o.invalid || (o.lifecycle != nil && o.lifecycle.Err() != nil) || s.generation != o.generation || o.expired(s, o.l1Progress) {
+	if (o.lifecycle != nil && o.lifecycle.Err() != nil) || s.generation != o.generation || o.expired(s, o.l1Progress) {
 		return ErrObservationUnavailable
 	}
 	return nil
@@ -161,7 +169,6 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 	if prior != nil {
 		distance := new(big.Int).Sub((*big.Int)(head.Number), (*big.Int)(prior.Number))
 		if distance.Sign() < 0 {
-			o.invalid = true
 			o.generation++
 			o.mu.Unlock()
 			return ErrObservationUnavailable
@@ -169,7 +176,6 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 		gap = head.Hash != prior.Hash && distance.Cmp(big.NewInt(1)) > 0
 		continuous = distance.Cmp(big.NewInt(1)) == 0 && head.ParentHash == prior.Hash
 		if head.Hash != prior.Hash && !gap && (distance.Sign() == 0 || head.ParentHash != prior.Hash) {
-			o.invalid = true
 			o.generation++
 		}
 	}
@@ -187,7 +193,7 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 	if prior != nil && head.Hash == prior.Hash {
 		// A lagging backend may return N, N-1, then N again. Restore the
 		// immutable observation without renewing any freshness deadline.
-		o.current.generation, o.invalid = o.generation, false
+		o.current.generation = o.generation
 		err := o.validate(o.current)
 		o.mu.Unlock()
 		return err
@@ -199,10 +205,7 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 		anchor, err := o.chain.Contracts.RPC.header(ctx, hexutil.EncodeBig((*big.Int)(prior.Number)))
 		continuous = err == nil && anchor.Hash == prior.Hash && anchor.Number != nil && (*big.Int)(anchor.Number).Cmp((*big.Int)(prior.Number)) == 0
 		if !continuous {
-			o.mu.Lock()
-			o.invalid = true
-			o.generation++
-			o.mu.Unlock()
+			o.invalidate()
 		}
 	}
 	s, err := o.chain.snapshotAt(ctx, head, true)
@@ -243,7 +246,7 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 		l1Progress, highWater = at, s.Block
 	}
 	s.observer, s.generation, s.observedAt, s.blockTime = o, o.generation, at, blockTime
-	if o.stopped || o.expired(s, l1Progress) {
+	if (o.lifecycle != nil && o.lifecycle.Err() != nil) || o.expired(s, l1Progress) {
 		return ErrObservationUnavailable
 	}
 	for key, entry := range o.payers {
@@ -252,7 +255,7 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 			entry.valid, entry.failure = false, nil
 		}
 	}
-	o.current, o.header, o.invalid = s, head, false
+	o.current, o.header = s, head
 	o.progress, o.l1Progress, o.l1HighWater = progress, l1Progress, highWater
 	o.requireL1 = o.requireL1 || head.L1BlockNumber != nil
 	return nil

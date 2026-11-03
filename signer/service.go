@@ -345,6 +345,7 @@ func checkMaxPrice(req paymentRequest, price wire.PriceInfo) error {
 
 func (s *Service) generate(w http.ResponseWriter, r *http.Request) {
 	paymentType, outcome := "unknown", "rejected"
+	start := time.Now()
 	defer func() {
 		if outcome != "success" && errors.Is(r.Context().Err(), context.Canceled) {
 			outcome = "client_cancelled"
@@ -352,6 +353,9 @@ func (s *Service) generate(w http.ResponseWriter, r *http.Request) {
 			outcome = "error"
 		}
 		s.metrics.Add("signer_payments_total", 1, observability.Labels{"type": paymentType, "outcome": outcome})
+		// Adapted from Mike Zupper's BlueClawNetwork/livepeer-node signer/service.go,
+		// commit 2c2ce3cf8a51f5464ce4961bbb6c2e640f348ae0 (MIT; see LICENSE).
+		s.metrics.Observe("signer_payment_duration_seconds", time.Since(start).Seconds(), observability.Labels{"type": paymentType})
 	}()
 	// MaxBytesReader needs net/http's original writer to close oversized requests.
 	body, err := io.ReadAll(http.MaxBytesReader(httpsnoop.Unwrap(w), r.Body, 1<<20))

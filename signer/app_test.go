@@ -2,7 +2,6 @@ package signer
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,13 +13,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/j0sh/boa/pkg/boa"
 	"github.com/livepeer/node/internal/test"
 	"github.com/spf13/cobra"
@@ -284,70 +281,32 @@ func TestSignerReadiness(t *testing.T) {
 			}
 			key, keyFile, passwordPath := testSignerKey(t)
 			p.KeystoreFile, p.KeystorePasswordFile = keyFile, passwordPath
-			var failure, collateralReads atomic.Int32
-			failure.Store(tc.failure)
+			rpc := test.NewChainRPC(t)
+			rpc.Update(func(s *test.ChainState) {
+				s.ChainID, s.Payer = 1, key.Address()
+				s.Deposit, s.Reserve = 1000, 1000
+				switch tc.failure {
+				case 1:
+					s.Fail = "eth_call"
+				case 2:
+					s.Deposit = 0
+				case 3:
+					s.Reserve = 0
+				case 4:
+					s.WithdrawRound = 6
+				}
+				if !fixedRate {
+					s.Fail = "PriceFeed.description"
+				}
+			})
 			webhookCalled := make(chan struct{}, 1)
-			rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/list" {
-					webhookCalled <- struct{}{}
-					_, _ = io.WriteString(w, "[]")
-					return
-				}
-				var req struct {
-					Method string
-					Params []json.RawMessage
-				}
-				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-				var result any
-				switch req.Method {
-				case "eth_chainId":
-					result = "0x1"
-				case "eth_getBlockByNumber":
-					if failure.Load() != 1 {
-						result = map[string]string{"number": "0x32", "hash": ethcommon.HexToHash("0x1234").Hex(), "timestamp": fmt.Sprintf("0x%x", time.Now().Unix())}
-					}
-				case "eth_call":
-					if failure.Load() == 1 {
-						_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "error": map[string]any{"code": -32000}})
-						return
-					}
-					var call struct {
-						Data string `json:"input"`
-					}
-					require.NoError(t, json.Unmarshal(req.Params[0], &call))
-					selector := func(sig string) bool {
-						return strings.HasPrefix(call.Data, "0x"+hex.EncodeToString(crypto.Keccak256([]byte(sig))[:4]))
-					}
-					switch {
-					case selector("getContract(bytes32)"):
-						result = fmt.Sprintf("0x%064x", 1)
-					case selector("lastInitializedRound()"), selector("currentRound()"):
-						result = fmt.Sprintf("0x%064x", 5)
-					case selector("blockHashForRound(uint256)"):
-						result = ethcommon.HexToHash("0x1234").Hex()
-					case selector("getSenderInfo(address)"):
-						collateralReads.Add(1)
-						deposit, reserve, withdraw := 1000, 1000, 0
-						switch failure.Load() {
-						case 2:
-							deposit = 0
-						case 3:
-							reserve = 0
-						case 4:
-							withdraw = 6
-						}
-						result = fmt.Sprintf("0x%064x%064x%064x%064x", deposit, withdraw, reserve, 0)
-					case selector("description()"):
-						result = "0x" // The oracle is unavailable during startup.
-					default:
-						t.Errorf("unexpected RPC call: %s", call.Data)
-					}
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": result})
+			webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				webhookCalled <- struct{}{}
+				_, _ = io.WriteString(w, "[]")
 			}))
-			defer rpc.Close()
-			p.RPCURL = testURL(t, rpc.URL)
-			p.OrchestratorWebhook = testURL(t, rpc.URL+"/list")
+			defer webhook.Close()
+			p.RPCURL, p.Controller = testURL(t, rpc.URL), rpc.Controller
+			p.OrchestratorWebhook = testURL(t, webhook.URL)
 			p.OrchestratorWebhookRefreshInterval = time.Hour
 			p.DiscoveryGrants = []string{"127.0.0.1"}
 			free := func() boa.HTTPBind {
@@ -381,7 +340,7 @@ func TestSignerReadiness(t *testing.T) {
 					t.Error("signer did not stop")
 				}
 			})
-			client := &http.Client{Timeout: time.Second}
+			client := &http.Client{Timeout: time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
 			select {
 			case <-webhookCalled:
 			case <-time.After(3 * time.Second):
@@ -396,15 +355,17 @@ func TestSignerReadiness(t *testing.T) {
 				return response.StatusCode
 			}
 			if !fixedRate || tc.failure != 0 {
-				require.Eventually(t, func() bool { return get("/readyz") == 503 && (tc.failure == 1 || collateralReads.Load() > 0) }, 3*time.Second, 10*time.Millisecond)
+				require.Eventually(t, func() bool {
+					return get("/readyz") == 503 && (tc.failure == 1 || rpc.Stats().Calls["TicketBroker.getSenderInfo"] > 0)
+				}, 3*time.Second, 10*time.Millisecond)
 				require.Equal(t, 200, get("/healthz"))
 				return
 			}
 			require.Eventually(t, func() bool { return get("/readyz") == 200 }, 3*time.Second, 10*time.Millisecond)
-			failure.Store(1)
+			rpc.Update(func(s *test.ChainState) { s.Fail = "eth_call" })
 			require.Equal(t, 200, get("/readyz"), "warm readiness retains a fresh observation during an RPC outage")
 			require.Equal(t, 200, get("/healthz"))
-			failure.Store(0)
+			rpc.Update(func(s *test.ChainState) { s.Fail = "" })
 			_, err := outbox.enqueue(t.Context(), testEvent())
 			require.NoError(t, err)
 			require.Equal(t, 503, get("/readyz"), "a full outbox must make the signer unready")

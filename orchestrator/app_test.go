@@ -56,6 +56,7 @@ func freeTCPPort(t *testing.T) int {
 func TestPaidHTTPStartup(t *testing.T) {
 	for _, separate := range []bool{false, true} {
 		t.Run(fmt.Sprintf("separate-wallet=%t", separate), func(t *testing.T) {
+			client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 			mainPort, metricsPort := freeTCPPort(t), freeTCPPort(t)
 			address := fmt.Sprintf("http://127.0.0.1:%d", mainPort)
 			p := paymentKeystoreParams(t, "http://127.0.0.1:1")
@@ -71,50 +72,23 @@ func TestPaidHTTPStartup(t *testing.T) {
 			var requests atomic.Int32
 			dependencies := make(chan struct{})
 			releaseDependencies := sync.OnceFunc(func() { close(dependencies) })
-			rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var req struct {
-					Method string
-					ID     json.RawMessage
-					Params []json.RawMessage
-				}
-				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-				if req.Method != "eth_chainId" {
-					select {
-					case <-dependencies:
-					case <-r.Context().Done():
-						return
+			rpc := test.NewChainRPC(t)
+			rpc.Update(func(s *test.ChainState) {
+				s.ChainID, s.Round, s.CurrentRound = 1, 1, 1
+				s.Recipient, s.Fail = recipient, "eth_estimateGas"
+				s.Before = func(ctx context.Context, method string) {
+					if method != "eth_chainId" {
+						select {
+						case <-dependencies:
+						case <-ctx.Done():
+							return
+						}
 					}
+					requests.Add(1)
 				}
-				requests.Add(1)
-				var result any = "0x1"
-				switch req.Method {
-				case "eth_chainId", "eth_getBalance", "eth_gasPrice", "eth_maxPriorityFeePerGas":
-				case "eth_getTransactionCount":
-					result = "0x0"
-				case "eth_estimateGas":
-					_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32000, "message": "ticket estimation unavailable"}})
-					return
-				case "eth_getBlockByNumber":
-					result = map[string]string{"number": "0x32", "hash": ethcommon.HexToHash("0xabcd").Hex(), "timestamp": fmt.Sprintf("0x%x", time.Now().Unix())}
-				case "eth_call":
-					// Reuse the 32-byte encoding of 1 for calls returning an address, round, hash, or bool.
-					result = fmt.Sprintf("0x%064x", 1)
-					var call struct{ Input string }
-					require.NoError(t, json.Unmarshal(req.Params[0], &call))
-					if strings.HasPrefix(call.Input, fmt.Sprintf("0x%x", crypto.Keccak256([]byte("isActiveTranscoder(address)"))[:4])) {
-						require.True(t, strings.HasSuffix(call.Input, fmt.Sprintf("%064x", recipient.Bytes())), "observe the configured ticket recipient, including a separate wallet")
-					}
-					if strings.HasPrefix(call.Input, fmt.Sprintf("0x%x", crypto.Keccak256([]byte("usedTickets(bytes32)"))[:4])) {
-						result = fmt.Sprintf("0x%064x", 0)
-					}
-				default:
-					t.Errorf("unexpected RPC %s", req.Method)
-				}
-				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result}))
-			}))
-			defer rpc.Close()
+			})
 			defer releaseDependencies()
-			p.RPCURL = mustURL(t, rpc.URL)
+			p.RPCURL, p.Controller = mustURL(t, rpc.URL), &rpc.Controller
 			require.NoError(t, p.Listen.UnmarshalText(fmt.Appendf(nil, "unsafe@0.0.0.0:%d", mainPort)))
 			require.NoError(t, p.MetricsListen.UnmarshalText(fmt.Appendf(nil, "unsafe@0.0.0.0:%d", metricsPort)))
 			metricsURL := fmt.Sprintf("http://127.0.0.1:%d", metricsPort)
@@ -134,7 +108,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 				}
 			})
 			require.Eventually(t, func() bool {
-				response, err := http.Get(address + "/external/discovery")
+				response, err := client.Get(address + "/external/discovery")
 				if err != nil {
 					return false
 				}
@@ -143,7 +117,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 			}, 5*time.Second, 20*time.Millisecond)
 			require.EqualValues(t, 1, requests.Load())
 			require.FileExists(t, p.RedeemerDB)
-			response, err := http.Get(metricsURL + "/readyz")
+			response, err := client.Get(metricsURL + "/readyz")
 			require.NoError(t, err)
 			response.Body.Close()
 			require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
@@ -156,7 +130,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 				require.NoError(t, store.StoreWinningTicket(&pm.SignedTicket{Ticket: &pm.Ticket{PayerAddress: recipient, Recipient: recipient, FaceValue: big.NewInt(1000), WinProb: big.NewInt(100), TicketNonce: 1, RecipientRandHash: crypto.Keccak256Hash([]byte("failed ticket")), CreationRound: 1, ParamsExpirationBlock: big.NewInt(0)}, Sig: make([]byte, 65), RecipientRand: big.NewInt(1)}))
 			}
 			releaseDependencies()
-			response, err = http.Get(address + "/external/discovery")
+			response, err = client.Get(address + "/external/discovery")
 			require.NoError(t, err)
 			defer response.Body.Close()
 			var entries []discoveryEntry
@@ -168,7 +142,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 			require.NoError(t, err)
 			request.Header.Set("Livepeer-Payer-Address", payer.Address().Hex())
 			require.Eventually(t, func() bool {
-				response, err = http.DefaultClient.Do(request)
+				response, err = client.Do(request)
 				if err != nil {
 					return false
 				}
@@ -189,19 +163,20 @@ func TestPaidHTTPStartup(t *testing.T) {
 			require.Equal(t, recipient.Bytes(), info.Address)
 			require.Equal(t, recipient.Bytes(), info.TicketParams.Recipient)
 			require.Eventually(t, func() bool {
-				ready, err := http.Get(metricsURL + "/readyz")
+				ready, err := client.Get(metricsURL + "/readyz")
 				if err != nil {
 					return false
 				}
 				defer ready.Body.Close()
 				return ready.StatusCode == http.StatusOK
 			}, 7*time.Second, 20*time.Millisecond, "paid readiness must become healthy after the first dependency and worker observations")
-			response, err = http.Get(metricsURL + "/metrics")
+			response, err = client.Get(metricsURL + "/metrics")
 			require.NoError(t, err)
 			metrics, err := io.ReadAll(response.Body)
 			response.Body.Close()
 			require.NoError(t, err)
 			require.Equal(t, separate, strings.Contains(string(metrics), "livepeer_redemption_errors_total{"), "readiness must include completion of the first worker pass, including ticket failure")
+			require.Equal(t, separate, rpc.Stats().Calls["eth_estimateGas"] > 0, "the queued ticket reaches the injected estimation failure")
 
 		})
 	}

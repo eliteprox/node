@@ -48,12 +48,12 @@ func TestRPCTransportPolicy(t *testing.T) {
 			require.NoError(t, err)
 			defer rpc.Close()
 			observed := 0
-			rpc.SetObserver(func(method string, elapsed time.Duration, observedErr error) {
+			rpc.SetObserver(func(o RPCObservation) {
 				observed++
-				require.Equal(t, "eth_chainId", method)
-				require.GreaterOrEqual(t, elapsed, time.Duration(0))
-				require.Error(t, observedErr)
-				require.NotContains(t, observedErr.Error(), "secret-")
+				require.Equal(t, "eth_chainId", o.Method)
+				require.GreaterOrEqual(t, o.Elapsed, time.Duration(0))
+				require.Error(t, o.Err)
+				require.NotContains(t, o.Err.Error(), "secret-")
 			})
 			_, err = rpc.ChainID(t.Context())
 			require.Equal(t, 1, observed)

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -28,13 +29,30 @@ const maxRPCResponse = 1 << 20
 type RPC struct {
 	ethereum  *ethclient.Client
 	http      *http.Client
-	observer  func(string, time.Duration, error)
+	observer  func(RPCObservation)
 	requireL1 bool // Set by the startup chain-ID check, before concurrent use.
+}
+
+// RPCObservation contains fixed labels and redacted errors, never RPC payloads.
+type RPCObservation struct {
+	Method, Work, Contract, Function string
+	Elapsed                          time.Duration
+	Err                              error
+}
+
+type rpcWorkKey struct{}
+
+// WithRPCWork distinguishes request-induced work from scheduled chain work.
+func WithRPCWork(ctx context.Context, work string) context.Context {
+	if work != "foreground" && work != "background" {
+		work = "other"
+	}
+	return context.WithValue(ctx, rpcWorkKey{}, work)
 }
 
 // SetObserver installs a hook before the client is used. Observations contain
 // allowlisted methods and redacted errors, never RPC payloads or URLs.
-func (r *RPC) SetObserver(observer func(string, time.Duration, error)) { r.observer = observer }
+func (r *RPC) SetObserver(observer func(RPCObservation)) { r.observer = observer }
 
 func OpenRPC(endpoint string) (*RPC, error) {
 	u, err := destination.ParseURL(endpoint)
@@ -82,16 +100,24 @@ func (t boundedRPCTransport) RoundTrip(request *http.Request) (response *http.Re
 	observer := t.rpc.observer
 	var observed error
 	if observer != nil {
-		start, method := time.Now(), "unknown"
+		start := time.Now()
+		o := RPCObservation{Method: "unknown", Work: "other"}
+		if work, ok := request.Context().Value(rpcWorkKey{}).(string); ok {
+			o.Work = work
+		}
 		if request.GetBody != nil {
 			if body, err := request.GetBody(); err == nil {
 				var envelope struct {
-					Method string `json:"method"`
+					Method string            `json:"method"`
+					Params []json.RawMessage `json:"params"`
 				}
 				if json.NewDecoder(body).Decode(&envelope) == nil {
 					switch envelope.Method {
-					case "eth_chainId", "eth_call", "eth_getCode", "eth_blockNumber", "eth_getBalance", "eth_getTransactionCount", "eth_getTransactionReceipt", "eth_getTransactionByHash", "eth_getBlockByNumber", "eth_estimateGas", "eth_sendRawTransaction", "eth_maxPriorityFeePerGas", "eth_gasPrice":
-						method = envelope.Method
+					case "eth_chainId", "eth_call", "eth_getCode", "eth_getLogs", "eth_blockNumber", "eth_getBalance", "eth_getTransactionCount", "eth_getTransactionReceipt", "eth_getTransactionByHash", "eth_getBlockByNumber", "eth_estimateGas", "eth_sendRawTransaction", "eth_maxPriorityFeePerGas", "eth_gasPrice":
+						o.Method = envelope.Method
+					}
+					if o.Method == "eth_call" {
+						o.Contract, o.Function = contractCallLabel(envelope.Params)
 					}
 				}
 				_ = body.Close()
@@ -101,7 +127,8 @@ func (t boundedRPCTransport) RoundTrip(request *http.Request) (response *http.Re
 			if err != nil {
 				observed = err
 			}
-			observer(method, time.Since(start), safeRPCError(observed))
+			o.Elapsed, o.Err = time.Since(start), safeRPCError(observed)
+			observer(o)
 		}()
 	}
 	response, err = t.RoundTripper.RoundTrip(request)
@@ -128,6 +155,43 @@ func (t boundedRPCTransport) RoundTrip(request *http.Request) (response *http.Re
 	}
 	response.Body = io.NopCloser(bytes.NewReader(data))
 	return response, nil
+}
+
+// Adapted from BlueClawNetwork/livepeer-node eth/rpc.go, commit
+// 2c2ce3cf8a51f5464ce4961bbb6c2e640f348ae0, by Mike Zupper (MIT; see LICENSE).
+var contractCallLabels = sync.OnceValue(func() map[[4]byte][2]string {
+	labels := map[[4]byte][2]string{}
+	for binding, functions := range map[string][]string{
+		"controller": {"getContract"}, "roundsManager": {"lastInitializedRound", "currentRound", "blockHashForRound"},
+		"bondingManager": {"isActiveTranscoder"}, "ticketBroker": {"getSenderInfo", "claimableReserve", "usedTickets", "redeemWinningTicket"},
+		"priceFeed": {"description", "decimals", "latestRoundData"},
+	} {
+		parsed, err := bindingMetadata[binding].GetAbi()
+		if err != nil {
+			continue
+		}
+		for _, function := range functions {
+			if method, ok := parsed.Methods[function]; ok {
+				labels[[4]byte(method.ID)] = [2]string{binding, function}
+			}
+		}
+	}
+	return labels
+})
+
+func contractCallLabel(params []json.RawMessage) (string, string) {
+	var call struct{ Input, Data hexutil.Bytes }
+	if len(params) > 0 && json.Unmarshal(params[0], &call) == nil {
+		if len(call.Input) == 0 {
+			call.Input = call.Data
+		}
+		if len(call.Input) >= 4 {
+			if label, ok := contractCallLabels()[[4]byte(call.Input[:4])]; ok {
+				return label[0], label[1]
+			}
+		}
+	}
+	return "unknown", "unknown"
 }
 
 func (t boundedRPCTransport) CloseIdleConnections() {

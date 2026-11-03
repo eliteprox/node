@@ -379,7 +379,9 @@ func TestPaymentParamsValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			info := original
 			tc.change(&info)
+			before := test.MetricSum(t, s.metrics.Registry, "signer_payment_duration_seconds", nil)
 			w := postPayment(t, s, map[string]any{"orchestrator": base64.StdEncoding.EncodeToString(wire.EncodeOrchestratorInfo(info)), "type": "fixed"})
+			require.Equal(t, before+1, test.MetricSum(t, s.metrics.Registry, "signer_payment_duration_seconds", nil))
 			if tc.status == 200 {
 				require.Equal(t, 200, w.Code, w.Body.String())
 				var response paymentResponse
@@ -422,6 +424,32 @@ func (s *failingPaymentSigner) SignMessage(message []byte) ([]byte, error) {
 		return nil, errors.New("key /private/keys/signer.json: private-signing-detail")
 	}
 	return s.TicketSigner.SignMessage(message)
+}
+
+func TestPaidRequestInvalidatedSigning(t *testing.T) {
+	for _, during := range []bool{false, true} {
+		t.Run(fmt.Sprint(during), func(t *testing.T) {
+			p := newPaidPath(t, true)
+			s := p.service
+			info := p.challenge(t, t.Context(), "invalidated-signing")
+			draft, err := s.preparePayment(t.Context(), "fixed", "invalidated-signing", info, paymentState{}, -1, time.Now())
+			require.NoError(t, err)
+			key := &failingPaymentSigner{TicketSigner: s.key}
+			if during {
+				key.before = p.stop
+			} else {
+				p.stop()
+			}
+			payment, err := draft.Sign(t.Context(), key, s.metrics)
+			require.ErrorIs(t, err, eth.ErrObservationUnavailable)
+			require.Empty(t, payment)
+			if during {
+				require.Positive(t, key.calls.Load(), "invalidate inside signing")
+			} else {
+				require.Zero(t, key.calls.Load(), "invalidated observations must not produce signatures")
+			}
+		})
+	}
 }
 
 func TestPaymentFailureStatuses(t *testing.T) {

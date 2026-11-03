@@ -70,7 +70,7 @@ func TestPayerCacheWarmCopiesAndEntryFailure(t *testing.T) {
 	info.Snapshot.Number.SetInt64(0)
 	before := f.Stats()
 	for range 20 {
-		info, err := c.SenderInfo(t.Context(), payer, recipient)
+		info, err := c.PayerFunds(t.Context(), payer, recipient)
 		require.NoError(t, err)
 		require.Positive(t, info.Deposit.Sign())
 		require.Positive(t, info.Snapshot.Number.Sign())
@@ -80,29 +80,36 @@ func TestPayerCacheWarmCopiesAndEntryFailure(t *testing.T) {
 	}
 	require.Equal(t, before, f.Stats())
 	foreign := PaymentChain{Contracts: &Contracts{}, Observer: o}
-	_, err := foreign.SenderInfo(t.Context(), payer, recipient)
+	_, err := foreign.PayerFunds(t.Context(), payer, recipient)
 	require.ErrorContains(t, err, "another contract client")
 	require.Equal(t, before, f.Stats())
-	total, err := c.SenderInfo(t.Context(), payer, common.Address{})
+	total, err := c.PayerFunds(t.Context(), payer, common.Address{})
 	require.NoError(t, err)
 	require.Equal(t, int64(50), total.Reserve.Int64())
 	bad := common.HexToAddress("0xbad")
 	f.Update(func(s *test.ChainState) { s.FailPayer = bad })
-	_, err = c.SenderInfo(t.Context(), bad, recipient)
+	_, err = c.PayerFunds(t.Context(), bad, recipient)
 	require.Error(t, err)
+	require.Equal(t, 1, o.Status().PayerFailures)
 	before = f.Stats()
-	_, err = c.SenderInfo(t.Context(), bad, recipient)
+	_, err = c.PayerFunds(t.Context(), bad, recipient)
 	require.Error(t, err)
-	_, err = c.SenderInfo(t.Context(), payer, recipient)
+	_, err = c.PayerFunds(t.Context(), payer, recipient)
 	require.NoError(t, err)
 	require.Equal(t, before, f.Stats(), "one failing entry cannot cause repeated or unrelated reads")
 	*now = now.Add(o.maxAge)
-	_, err = c.SenderInfo(t.Context(), payer, recipient)
+	_, err = c.PayerFunds(t.Context(), payer, recipient)
 	require.ErrorIs(t, err, ErrObservationUnavailable)
+	advanceObserver(f, *now)
+	require.NoError(t, o.refresh(t.Context()))
+	require.Zero(t, o.Status().PayerFailures, "a new head makes the old failure retryable")
+	_, err = c.PayerFunds(t.Context(), bad, recipient)
+	require.Error(t, err)
+	require.Equal(t, 1, o.Status().PayerFailures, "a failed retry belongs to the new head")
 	f.Update(func(s *test.ChainState) { s.FailPayer = common.Address{} })
 	advanceObserver(f, *now)
 	require.NoError(t, o.refresh(t.Context()))
-	_, err = c.SenderInfo(t.Context(), bad, recipient)
+	_, err = c.PayerFunds(t.Context(), bad, recipient)
 	require.NoError(t, err)
 }
 
@@ -291,6 +298,7 @@ func TestPayerColdReadRecoversAtSameHead(t *testing.T) {
 			if timing == "rpc-after" {
 				release()
 			}
+			require.Zero(t, o.Status().PayerFailures, "a restored head must not count an old-generation failure")
 			_, err := o.senderInfo(t.Context(), payer, common.Address{})
 			require.NoError(t, err, "a failure from an old epoch must not poison a restored-head payer")
 		})
@@ -434,12 +442,21 @@ func TestPayerReorgDuringLogsRejectsCandidate(t *testing.T) {
 			})
 			client := o.chain.Contracts.RPC.http
 			next := client.Transport
-			client.Transport = reorgLogTransport{next, func() {
-				f.Update(func(s *test.ChainState) {
-					s.Hash, s.Deposit, s.Fail = common.HexToHash("0x201"), 0, ""
-					s.Logs = []types.Log{{Address: s.Contracts["TicketBroker"], BlockHash: s.Hash, BlockNumber: s.Number, Topics: []common.Hash{o.chain.Contracts.abis["ticketBroker"].Events["Withdrawal"].ID, common.BytesToHash(payer.Bytes())}}}
-				})
-			}}
+			client.Transport = payerHistoryRoute(func(r *http.Request) (*http.Response, error) {
+				request, err := readPayerHistoryCall(r)
+				if err != nil {
+					return nil, err
+				}
+				response, err := next.RoundTrip(r)
+				if request.Method == "eth_getLogs" {
+					// Hash filters may still return retained orphan logs after a reorg.
+					f.Update(func(s *test.ChainState) {
+						s.Hash, s.Deposit, s.Fail = common.HexToHash("0x201"), 0, ""
+						s.Logs = []types.Log{{Address: s.Contracts["TicketBroker"], BlockHash: s.Hash, BlockNumber: s.Number, Topics: []common.Hash{o.chain.Contracts.abis["ticketBroker"].Events["Withdrawal"].ID, common.BytesToHash(payer.Bytes())}}}
+					})
+				}
+				return response, err
+			})
 			require.ErrorIs(t, o.refresh(t.Context()), ErrObservationUnavailable)
 			require.Equal(t, old.BlockHash, o.current.BlockHash, "orphaned candidates publish no state")
 			require.ErrorIs(t, old.Validate(), ErrObservationUnavailable)
@@ -457,24 +474,6 @@ func TestPayerReorgDuringLogsRejectsCandidate(t *testing.T) {
 			require.Equal(t, before, f.Stats(), "warm reads remain local after recovery")
 		})
 	}
-}
-
-type reorgLogTransport struct {
-	http.RoundTripper
-	reorg func()
-}
-
-func (tr reorgLogTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	request, err := readPayerHistoryCall(r)
-	if err != nil {
-		return nil, err
-	}
-	response, err := tr.RoundTripper.RoundTrip(r)
-	if request.Method == "eth_getLogs" {
-		// Hash filters may still return retained orphan logs after a reorg.
-		tr.reorg()
-	}
-	return response, err
 }
 
 type payerHistoryRoute func(*http.Request) (*http.Response, error)
@@ -655,34 +654,20 @@ func TestPayerHistoryCostAndFreshness(t *testing.T) {
 }
 
 func TestPayerMalformedBloom(t *testing.T) {
-	for _, intermediate := range []bool{false, true} {
-		t.Run(fmt.Sprint(intermediate), func(t *testing.T) {
-			f, o, now := newTestObserver(t)
-			payer := common.HexToAddress("0x11")
-			held := warmPayer(t, o, payer, common.Address{})
-			advanceObserver(f, *now)
-			f.Update(func(s *test.ChainState) {
-				payerHistoryBloom(s, "malformed")
-				s.Deposit = 0
-			})
-			if intermediate {
-				advanceObserver(f, *now)
-				f.Update(func(s *test.ChainState) { payerHistoryBloom(s, "empty") })
-				require.NoError(t, o.refresh(t.Context()))
-				require.ErrorIs(t, held.Snapshot.Validate(), ErrObservationUnavailable)
-				funds, err := o.senderInfo(t.Context(), payer, common.Address{})
-				require.NoError(t, err)
-				require.Zero(t, funds.Deposit.Sign(), "malformed history forces exact funds recovery")
-			} else {
-				require.Error(t, o.refresh(t.Context()))
-				require.Equal(t, held.Snapshot.BlockHash, o.current.BlockHash, "malformed candidate cannot publish")
-			}
-		})
-	}
+	f, o, now := newTestObserver(t)
+	payer := common.HexToAddress("0x11")
+	held := warmPayer(t, o, payer, common.Address{})
+	advanceObserver(f, *now)
+	f.Update(func(s *test.ChainState) {
+		payerHistoryBloom(s, "malformed")
+		s.Deposit = 0
+	})
+	require.Error(t, o.refresh(t.Context()))
+	require.Equal(t, held.Snapshot.BlockHash, o.current.BlockHash, "malformed candidate cannot publish")
 }
 
 func TestPayerIncompleteHistoryResets(t *testing.T) {
-	for _, mode := range []string{"parent-height", "parent-hash", "log-height", "log-hash"} {
+	for _, mode := range []string{"parent-height", "parent-hash", "parent-bloom", "log-height", "log-hash"} {
 		t.Run(mode, func(t *testing.T) {
 			f, o, now := newTestObserver(t)
 			payer := common.HexToAddress("0x11")
@@ -691,18 +676,23 @@ func TestPayerIncompleteHistoryResets(t *testing.T) {
 			advanceObserver(f, *now)
 			parent := f.State()
 			advanceObserver(f, *now)
+			f.Update(func(s *test.ChainState) { s.Deposit = 0 })
 			head := f.State()
 			method, ref := "eth_getLogs", ""
 			var result any
-			if mode == "parent-height" || mode == "parent-hash" {
+			if mode == "parent-height" || mode == "parent-hash" || mode == "parent-bloom" {
 				method, ref = "eth_getBlockByNumber", hexutil.EncodeUint64(parent.Number)
 				height, hash := parent.Number, parent.Hash
-				if mode == "parent-height" {
+				bloom := parent.LogsBloom
+				switch mode {
+				case "parent-height":
 					height++
-				} else {
+				case "parent-hash":
 					hash = anchor.Hash
+				case "parent-bloom":
+					bloom = "0x01"
 				}
-				result = map[string]any{"number": hexutil.EncodeUint64(height), "hash": hash, "parentHash": parent.Parent}
+				result = map[string]any{"number": hexutil.EncodeUint64(height), "hash": hash, "parentHash": parent.Parent, "logsBloom": bloom}
 			} else {
 				log := types.Log{Address: head.Contracts["TicketBroker"], BlockHash: head.Hash, BlockNumber: head.Number, Topics: []common.Hash{o.chain.Contracts.abis["ticketBroker"].Events["DepositFunded"].ID, common.HexToHash("0x12")}}
 				if mode == "log-height" {
@@ -712,8 +702,6 @@ func TestPayerIncompleteHistoryResets(t *testing.T) {
 				}
 				result = []types.Log{log}
 			}
-			payload, err := json.Marshal(result)
-			require.NoError(t, err)
 			client := o.chain.Contracts.RPC.http
 			next := client.Transport
 			client.Transport = payerHistoryRoute(func(r *http.Request) (*http.Response, error) {
@@ -733,7 +721,7 @@ func TestPayerIncompleteHistoryResets(t *testing.T) {
 						return next.RoundTrip(r)
 					}
 				}
-				data, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": json.RawMessage(payload)})
+				data, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
 				if err != nil {
 					return nil, err
 				}
@@ -742,8 +730,10 @@ func TestPayerIncompleteHistoryResets(t *testing.T) {
 			require.NoError(t, o.refresh(t.Context()))
 			require.ErrorIs(t, held.Snapshot.Validate(), ErrObservationUnavailable)
 			before := f.Stats().Calls["TicketBroker.getSenderInfo"]
-			_, err = o.senderInfo(t.Context(), payer, common.Address{})
+			funds, err := o.senderInfo(t.Context(), payer, common.Address{})
 			require.NoError(t, err)
+			require.Zero(t, funds.Deposit.Sign(), "malformed history forces exact funds recovery")
+			require.Equal(t, head.Hash, funds.Snapshot.BlockHash)
 			require.Equal(t, before+1, f.Stats().Calls["TicketBroker.getSenderInfo"], "incomplete proof must reset even an unaffected payer")
 		})
 	}

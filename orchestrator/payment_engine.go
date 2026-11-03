@@ -89,6 +89,7 @@ func (e *PaymentEngine) MakeChallenge(ctx context.Context, appID, manifest strin
 func (e *PaymentEngine) makeAppChallenge(ctx context.Context, appID, manifest string, payer ethcommon.Address, price int64, unit, service string, registration *appLifetime) (challenge Challenge, result error) {
 	labels := e.paymentLabels(appID, manifest)
 	defer func() { e.recordPayment("challenge", result, labels) }()
+	defer e.observeDuration("challenge", time.Now(), labels)
 	return e.makeChallenge(ctx, appID, manifest, payer, price, unit, service, registration)
 }
 
@@ -167,6 +168,7 @@ func (e *PaymentEngine) ChallengeForManifest(appID, manifest, service string) (C
 func (e *PaymentEngine) RefreshChallenge(ctx context.Context, manifest string, payer ethcommon.Address, service string) (challenge Challenge, result error) {
 	labels := e.paymentLabels("", manifest)
 	defer func() { e.recordPayment("refresh", result, labels) }()
+	defer e.observeDuration("refresh", time.Now(), labels)
 	e.mu.Lock()
 	current := e.sessions[manifest]
 	if current == nil {
@@ -223,6 +225,7 @@ func decodeHeaders(paymentHeader, segmentHeader string) (wire.Payment, wire.SegD
 func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHeader, segmentHeader string) (payerResult ethcommon.Address, credit *big.Rat, result error) {
 	labels := e.paymentLabels(appID, manifest)
 	defer func() { e.recordPayment("receive", result, labels) }()
+	defer e.observeDuration("receive", time.Now(), labels)
 	payment, segment, err := decodeHeaders(paymentHeader, segmentHeader)
 	if err != nil {
 		return ethcommon.Address{}, nil, err

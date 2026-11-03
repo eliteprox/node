@@ -33,20 +33,38 @@ type snapshotReader struct {
 
 func (c snapshotReader) Snapshot(ctx context.Context) (pm.ChainSnapshot, error) { return c.read(ctx) }
 
-func TestPaidReadinessUsesCurrentPublication(t *testing.T) {
+func newObservedPaymentChain(t *testing.T, recipient common.Address) (*test.ChainRPC, eth.PaymentChain, func()) {
+	t.Helper()
 	f := test.NewChainRPC(t)
+	f.Update(func(s *test.ChainState) { s.Recipient = recipient })
 	rpc, err := eth.OpenRPC(f.URL)
 	require.NoError(t, err)
-	defer rpc.Close()
+	t.Cleanup(rpc.Close)
 	contracts, err := eth.NewContracts(rpc, f.Controller)
 	require.NoError(t, err)
-	o := eth.NewPaymentObserver(eth.PaymentChain{Contracts: contracts}, true, common.HexToAddress("0x1234"))
+	chain := eth.PaymentChain{Contracts: contracts}
+	chain.Observer = eth.NewPaymentObserver(chain, true, recipient)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
-	go func() { o.Run(ctx); close(done) }()
-	defer func() { cancel(); <-done }()
-	var snapshot eth.ChainSnapshot
-	require.Eventually(t, func() bool { snapshot, err = o.Snapshot(ctx); return err == nil }, time.Second, time.Millisecond)
+	go func() { chain.Observer.Run(ctx); close(done) }()
+	stop := func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("payment observer did not stop")
+		}
+	}
+	t.Cleanup(stop)
+	require.Eventually(t, func() bool { _, err := chain.Snapshot(t.Context()); return err == nil }, time.Second, time.Millisecond)
+	return f, chain, stop
+}
+
+func TestPaidReadinessUsesCurrentPublication(t *testing.T) {
+	f, chain, stop := newObservedPaymentChain(t, common.HexToAddress("0x1234"))
+	o := chain.Observer
+	snapshot, err := chain.Snapshot(t.Context())
+	require.NoError(t, err)
 	p := &paidReadiness{chain: true, active: true, storage: true, completed: time.Now(), workerCompleted: time.Now(), observer: o, snapshot: snapshot}
 	registry := NewRegistry("", "http://localhost", time.Second, time.Minute)
 	f.Update(func(s *test.ChainState) {
@@ -57,7 +75,7 @@ func TestPaidReadinessUsesCurrentPublication(t *testing.T) {
 	require.Eventually(t, func() bool { return o.Status().ObservedAt.After(snapshot.ObservedAt()) }, 7*time.Second, 10*time.Millisecond)
 	require.ErrorIs(t, snapshot.Validate(), eth.ErrObservationUnavailable)
 	require.True(t, p.ready(registry), "an older heartbeat must not conceal a healthy completed backfill")
-	_, store, ticket, chain, _ := newRecoveryTest(t, 15)
+	_, store, ticket, direct, _ := newRecoveryTest(t, 15)
 	store.readiness = p
 	stats, err := store.redemptionStats(t.Context())
 	require.NoError(t, err)
@@ -83,15 +101,14 @@ func TestPaidReadinessUsesCurrentPublication(t *testing.T) {
 		e.mu.Unlock()
 		t.Fatal("pruner did not capture snapshot")
 	}
-	cancel()
-	<-done
+	stop()
 	e.mu.Unlock()
 	require.ErrorIs(t, <-pruned, eth.ErrObservationUnavailable)
 	require.Equal(t, snapshot.Block, e.lastSeenBlock)
 	require.Len(t, e.ticketNonces, 1)
 	require.Equal(t, 1, e.nonceCount)
-	chain.Observer = o
-	p.check(t.Context(), store, chain, &PaymentEngine{recipient: ticket.Recipient}, observability.New("orchestrator"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	direct.Observer = o
+	p.check(t.Context(), store, direct, &PaymentEngine{recipient: ticket.Recipient}, observability.New("orchestrator"), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.True(t, p.storage, "chain unavailability must not mark healthy storage unavailable")
 	require.False(t, p.ready(registry))
 }

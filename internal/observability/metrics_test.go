@@ -1,18 +1,124 @@
 package observability_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/internal/test"
 	"github.com/stretchr/testify/require"
 )
+
+func TestObserverMetricsAreLocalAndLogTransitions(t *testing.T) {
+	f := test.NewChainRPC(t)
+	rpc, err := eth.OpenRPC(f.URL)
+	require.NoError(t, err)
+	defer rpc.Close()
+	contracts, err := eth.NewContracts(rpc, f.Controller)
+	require.NoError(t, err)
+	o := eth.NewPaymentObserver(eth.PaymentChain{Contracts: contracts}, true, common.HexToAddress("0x1234"))
+	m := observability.New("test")
+	rpc.SetObserver(m.RPC)
+	f.Update(func(s *test.ChainState) { s.Fail = "BondingManager.isActiveTranscoder" })
+	var logs bytes.Buffer
+	m.PaymentObserver(o, slog.New(slog.NewTextHandler(&logs, nil)))
+	require.Empty(t, test.MetricSamples(t, m.Registry, "chain_view_age_seconds", nil))
+	stopped := make(chan struct{})
+	hook := o.OnRefresh
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() { defer close(stopped); o.Run(ctx) }()
+	require.Eventually(t, func() bool {
+		return test.MetricSum(t, m.Registry, "chain_view_refresh_duration_seconds", nil) == 1
+	}, 5*time.Second, time.Millisecond)
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "chain_view_healthy", nil))
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "chain_view_refresh_duration_seconds", nil))
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "chain_view_refreshes_total", map[string]string{"outcome": "partial"}))
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "chain_view_failed_entries", map[string]string{"kind": "recipient"}))
+	require.EqualValues(t, f.Stats().RoundTrips, test.MetricSum(t, m.Registry, "rpc_work_total", map[string]string{"work": "background", "kind": "transport"}))
+	f.Update(func(s *test.ChainState) { s.FailPayer = common.HexToAddress("0xbad") })
+	_, err = (eth.PaymentChain{Contracts: contracts, Observer: o}).PayerFunds(eth.WithRPCWork(t.Context(), "foreground"), common.HexToAddress("0xbad"), common.Address{})
+	require.Error(t, err)
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "chain_view_failed_entries", map[string]string{"kind": "payer"}))
+	before := f.Stats()
+	for range 3 {
+		require.NotEmpty(t, test.MetricSamples(t, m.Registry, "chain_view_age_seconds", nil))
+	}
+	require.Equal(t, before, f.Stats(), "scraping must not perform chain reads")
+	cancel()
+	<-stopped
+	hook(time.Millisecond, errors.New("private-provider-detail"))
+	length := logs.Len()
+	hook(time.Millisecond, errors.New("private-provider-detail"))
+	require.Equal(t, length, logs.Len(), "unchanged failure must not log again")
+	require.NotContains(t, logs.String(), "private-")
+	require.EqualValues(t, 2, test.MetricSum(t, m.Registry, "chain_view_refreshes_total", map[string]string{"outcome": "error"}))
+}
+
+func TestRPCAccountingPreservesAggregateLabels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct{ ID json.RawMessage }
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32000, "message": "private-provider-text"}})
+	}))
+	defer server.Close()
+	rpc, err := eth.OpenRPC(server.URL)
+	require.NoError(t, err)
+	defer rpc.Close()
+	m := observability.New("test")
+	rpc.SetObserver(m.RPC)
+	contracts, err := eth.NewContracts(rpc, common.Address{})
+	require.NoError(t, err)
+	for _, tc := range []struct{ work, contract, function string }{
+		{"foreground", "ticketBroker", "usedTickets"},
+		{"background", "roundsManager", "currentRound"},
+		{"unbounded-private-value", "roundsManager", "roundLength"},
+	} {
+		ctx := eth.WithRPCWork(t.Context(), tc.work)
+		var args []any
+		if tc.function == "usedTickets" {
+			args = []any{common.Hash{}}
+		}
+		_, err := contracts.CallAt(ctx, "latest", tc.contract, common.Address{}, tc.function, args...)
+		require.Error(t, err)
+	}
+	require.EqualValues(t, 3, test.MetricSum(t, m.Registry, "rpc_requests_total", map[string]string{"method": "eth_call", "outcome": "error"}))
+	for _, work := range []string{"foreground", "background", "other"} {
+		for _, kind := range []string{"transport", "contract_call"} {
+			require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "rpc_work_total", map[string]string{"work": work, "kind": kind}))
+		}
+	}
+	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "rpc_contract_calls_total", map[string]string{"contract": "unknown", "function": "unknown"}))
+	families, err := m.Registry.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		for _, sample := range family.Metric {
+			var names []string
+			for _, label := range sample.Label {
+				names = append(names, label.GetName())
+			}
+			switch family.GetName() {
+			case "livepeer_rpc_requests_total":
+				require.ElementsMatch(t, []string{"component", "method", "outcome"}, names)
+			case "livepeer_rpc_request_duration_seconds":
+				require.ElementsMatch(t, []string{"component", "method"}, names)
+			}
+		}
+		require.NotContains(t, family.String(), "private-")
+	}
+}
 
 // ResponseRecorder commits informational responses; a real server permits a
 // later final response. Preserve that behavior in this controlled writer.
