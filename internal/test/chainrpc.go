@@ -39,6 +39,13 @@ type ChainState struct {
 	OmitL1, OmitTimestamp      bool
 	Fail                       string
 	Before                     func(context.Context, string)
+	Contracts                  map[string]common.Address
+	Results                    map[ChainCall]string
+}
+
+type ChainCall struct {
+	To       common.Address
+	Function string
 }
 
 type ChainRPCStats struct {
@@ -50,18 +57,21 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 	t.Helper()
 	c := &ChainRPC{Controller: common.HexToAddress("0xc001"), stats: ChainRPCStats{Calls: map[string]int{}}}
 	c.state = ChainState{Number: 0x100000, L1Block: 50, Timestamp: uint64(time.Now().Unix()), Hash: common.HexToHash("0xabcd"), RoundHash: common.HexToHash("0x1234"), Round: 5, CurrentRound: 5}
-	c.history = map[common.Hash]ChainState{c.state.Hash: c.state}
 	word := func(value string) string { return strings.Repeat("0", 64-len(value)) + value }
-	addresses := map[string]string{}
+	contractNames := map[string]string{}
+	c.state.Contracts = map[string]common.Address{}
 	for name, address := range map[string]string{"RoundsManager": "a1", "BondingManager": "a2", "TicketBroker": "a3"} {
-		addresses[hex.EncodeToString(crypto.Keccak256([]byte(name)))] = word(address)
+		contractNames[hex.EncodeToString(crypto.Keccak256([]byte(name)))] = name
+		c.state.Contracts[name] = common.HexToAddress(address)
 	}
+	c.history = map[common.Hash]ChainState{c.state.Hash: c.state}
 	methods := map[string]string{}
 	for signature, name := range map[string]string{
 		"getContract(bytes32)": "Controller.getContract", "lastInitializedRound()": "RoundsManager.lastInitializedRound",
 		"currentRound()":             "RoundsManager.currentRound",
 		"blockHashForRound(uint256)": "RoundsManager.blockHashForRound", "isActiveTranscoder(address)": "BondingManager.isActiveTranscoder",
 		"getSenderInfo(address)": "TicketBroker.getSenderInfo", "claimableReserve(address,address)": "TicketBroker.claimableReserve",
+		"usedTickets(bytes32)": "TicketBroker.usedTickets",
 	} {
 		methods[hex.EncodeToString(crypto.Keccak256([]byte(signature))[:4])] = name
 	}
@@ -73,7 +83,10 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		}
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
 		name := request.Method
-		var call struct{ Input string }
+		var call struct {
+			Input string
+			To    common.Address
+		}
 		if name == "eth_call" {
 			require.Len(t, request.Params, 2)
 			require.NoError(t, json.Unmarshal(request.Params[0], &call))
@@ -103,7 +116,7 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		case "eth_getBlockByNumber":
 			var ref string
 			require.NoError(t, json.Unmarshal(request.Params[0], &ref))
-			if ref != "latest" {
+			if ref != "latest" && ref != "finalized" {
 				var ok bool
 				state, ok = c.stateAt(ref)
 				if !ok {
@@ -130,8 +143,9 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 			}
 			switch name {
 			case "Controller.getContract":
-				require.Contains(t, addresses, call.Input[10:])
-				result = "0x" + addresses[call.Input[10:]]
+				require.Equal(t, c.Controller, call.To)
+				require.Contains(t, contractNames, call.Input[10:])
+				result = "0x" + word(state.Contracts[contractNames[call.Input[10:]]].Hex()[2:])
 			case "RoundsManager.lastInitializedRound":
 				result = "0x" + word(quantity(state.Round)[2:])
 			case "RoundsManager.currentRound":
@@ -144,8 +158,13 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 				result = "0x" + word("de0b6b3a7640000") + word("0") + word("de0b6b3a7640000") + word("0")
 			case "TicketBroker.claimableReserve":
 				result = "0x" + word("de0b6b3a7640000")
+			case "TicketBroker.usedTickets":
+				result = "0x" + word("0")
 			default:
 				t.Errorf("unexpected payment contract call")
+			}
+			if override, ok := state.Results[ChainCall{call.To, name}]; ok {
+				result = override
 			}
 		default:
 			t.Errorf("unexpected payment RPC method %q", request.Method)
@@ -160,12 +179,16 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 func (c *ChainRPC) State() ChainState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.state
+	s := c.state
+	s.Contracts, s.Results = maps.Clone(s.Contracts), maps.Clone(s.Results)
+	return s
 }
 
 func (c *ChainRPC) Update(update func(*ChainState)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.state.Contracts = maps.Clone(c.state.Contracts)
+	c.state.Results = maps.Clone(c.state.Results)
 	update(&c.state)
 	for h, state := range c.history {
 		if state.Number >= c.state.Number {
