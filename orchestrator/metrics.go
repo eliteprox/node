@@ -125,12 +125,16 @@ type paidReadiness struct {
 	chain, active, storage bool
 	snapshot               eth.ChainSnapshot
 	interval               time.Duration
+	observer               *eth.PaymentObserver
 }
 
 func (p *paidReadiness) ready(registry *Registry) bool {
 	p.mu.Lock()
 	limit := max(time.Minute, 3*p.interval)
 	ok := p.chain && p.active && p.storage && !p.completed.IsZero() && time.Since(p.completed) <= limit && !p.workerCompleted.IsZero() && time.Since(p.workerCompleted) <= limit
+	if p.observer != nil {
+		ok = ok && p.observer.Status().Healthy
+	}
 	p.mu.Unlock()
 	registry.mu.Lock()
 	fresh := registry.rateUntil.IsZero() || time.Now().Before(registry.rateUntil)
@@ -139,14 +143,14 @@ func (p *paidReadiness) ready(registry *Registry) bool {
 }
 
 func (p *paidReadiness) check(ctx context.Context, store *RedeemerDB, chain eth.PaymentChain, engine *PaymentEngine, metrics *observability.Metrics, logger *slog.Logger) {
+	dbCtx, cancel := context.WithTimeout(ctx, time.Second)
+	storageErr := store.checkStorage(dbCtx)
+	cancel()
 	snapshot, chainErr := chain.Snapshot(ctx)
 	active := false
 	if chainErr == nil {
 		active, chainErr = chain.IsActiveAt(ctx, engine.recipient, snapshot)
 	}
-	dbCtx, cancel := context.WithTimeout(ctx, time.Second)
-	storageErr := store.checkStorage(dbCtx)
-	cancel()
 	p.mu.Lock()
 	changed := p.completed.IsZero() || p.chain != (chainErr == nil) || p.active != active || p.storage != (storageErr == nil)
 	p.completed, p.chain, p.active, p.storage = time.Now(), chainErr == nil, active, storageErr == nil
@@ -163,7 +167,7 @@ func (p *paidReadiness) check(ctx context.Context, store *RedeemerDB, chain eth.
 		if snapshot.Round != nil {
 			metrics.Gauge("chain_snapshot_round", nil).Set(float64(snapshot.Round.Int64()))
 		}
-		metrics.Gauge("chain_snapshot_last_success_timestamp_seconds", nil).Set(float64(time.Now().Unix()))
+		metrics.Gauge("chain_snapshot_last_success_timestamp_seconds", nil).Set(float64(snapshot.ObservedAt().Unix()))
 	}
 	if balance, err := chain.Contracts.RPC.BalanceAt(ctx, p.account, nil); err == nil {
 		metrics.Gauge("redeemer_gas_balance_eth", nil).Set(observability.ETH(new(big.Rat).SetInt(balance)))

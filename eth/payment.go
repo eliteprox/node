@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -15,7 +16,10 @@ import (
 
 // PaymentChain adapts the retained Livepeer contracts to pm's narrow chain
 // interface. Ethereum contract reads and redemption stay in eth.
-type PaymentChain struct{ Contracts *Contracts }
+type PaymentChain struct {
+	Contracts *Contracts
+	Observer  *PaymentObserver // Nil for direct transaction/redemption reads.
+}
 
 func (c PaymentChain) IsActive(ctx context.Context, recipient ethcommon.Address) (bool, error) {
 	snapshot, err := c.Snapshot(ctx)
@@ -26,6 +30,9 @@ func (c PaymentChain) IsActive(ctx context.Context, recipient ethcommon.Address)
 }
 
 func (c PaymentChain) IsActiveAt(ctx context.Context, recipient ethcommon.Address, snapshot ChainSnapshot) (bool, error) {
+	if err := snapshot.Validate(); err != nil {
+		return false, err
+	}
 	if snapshot.blockReference == nil {
 		return false, errors.New("canonical snapshot required")
 	}
@@ -37,7 +44,11 @@ func (c PaymentChain) IsActiveAt(ctx context.Context, recipient ethcommon.Addres
 	if err != nil {
 		return false, err
 	}
-	return bonding.IsActiveTranscoder(&bind.CallOpts{Context: ctx}, recipient)
+	active, err := bonding.IsActiveTranscoder(&bind.CallOpts{Context: ctx}, recipient)
+	if err == nil {
+		err = snapshot.Validate()
+	}
+	return active, err
 }
 
 // Receipt reports a submitted redemption without retrying or resubmitting it.
@@ -73,14 +84,29 @@ type ChainSnapshot struct {
 	Block          *big.Int // Protocol L1 block, including on Arbitrum.
 	Round          *big.Int // Last initialized round.
 	RoundHash      ethcommon.Hash
+	CurrentRound   *big.Int // Protocol round; may exceed the initialized Round.
 	blockReference map[string]any
+	observer       *PaymentObserver
+	generation     uint64
+	observedAt     time.Time
+	blockTime      time.Time
 }
 
 func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
+	if c.Observer != nil {
+		return c.Observer.Snapshot(ctx)
+	}
+	at := time.Now()
 	header, err := c.Contracts.RPC.header(ctx, "latest")
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
+	snapshot, err := c.snapshotAt(ctx, header, false)
+	snapshot.observedAt = at
+	return snapshot, err
+}
+
+func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader, currentRound bool) (ChainSnapshot, error) {
 	if header.Hash == (ethcommon.Hash{}) || header.Number == nil {
 		return ChainSnapshot{}, errors.New("invalid chain header")
 	}
@@ -114,7 +140,17 @@ func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
 	if hash == ([32]byte{}) {
 		return ChainSnapshot{}, errors.New("invalid round block hash")
 	}
-	return ChainSnapshot{Block: block, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref}, nil
+	snapshot := ChainSnapshot{Block: block, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref}
+	if currentRound {
+		snapshot.CurrentRound, err = rounds.CurrentRound(opts)
+		if err != nil {
+			return ChainSnapshot{}, err
+		}
+		if snapshot.CurrentRound.Cmp(round) < 0 {
+			return ChainSnapshot{}, errors.New("current round precedes initialized round")
+		}
+	}
+	return snapshot, nil
 }
 
 // SenderInfo is a coherent view of a sender's collateral and the amount of
@@ -153,7 +189,7 @@ func (c PaymentChain) SenderInfo(ctx context.Context, sender, recipient ethcommo
 			return SenderInfo{}, err
 		}
 	}
-	return SenderInfo{Snapshot: snapshot, Deposit: info.Sender.Deposit, Reserve: reserve, WithdrawRound: info.Sender.WithdrawRound}, nil
+	return SenderInfo{Snapshot: snapshot, Deposit: info.Sender.Deposit, Reserve: reserve, WithdrawRound: info.Sender.WithdrawRound}, snapshot.Validate()
 }
 
 // The redemption tuple follows Yondon Fu's go-livepeer/eth/client_ticketbroker.go

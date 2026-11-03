@@ -73,7 +73,7 @@ func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats
 	var block, round *big.Int
 	if s.readiness != nil {
 		s.readiness.mu.Lock()
-		if time.Since(s.readiness.completed) <= max(time.Minute, 3*s.readiness.interval) && s.readiness.chain {
+		if time.Since(s.readiness.completed) <= max(time.Minute, 3*s.readiness.interval) && s.readiness.chain && s.readiness.snapshot.Validate() == nil {
 			block, round = s.readiness.snapshot.Block, s.readiness.snapshot.Round
 		}
 		s.readiness.mu.Unlock()

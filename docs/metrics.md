@@ -169,8 +169,12 @@ Other useful starting conditions:
 
 `/healthz` checks liveness. Paid orchestrator `/readyz` requires writable payment
 storage, chain access, an active recipient, valid pricing, and worker completion.
-Checks run at heartbeat cadence even with empty queues. Dependency observations
-and worker completion expire after `max(60 seconds, 3 × HeartbeatInterval)`;
+Checks run at heartbeat cadence even with empty queues. Payment chain metadata
+refreshes every five seconds. An observation is refused at thirty seconds old,
+if the head timestamp is stale, or after thirty seconds without protocol L1
+progress. A successful RPC response with an unchanged head does not renew its
+age. One provider cannot prove absolute L1 lag. Other dependency checks and
+worker completion expire after `max(60 seconds, 3 × HeartbeatInterval)`;
 queue stalls and individual ticket errors remain separate signals.
 Off-chain orchestrator/discovery readiness reports listener health.
 Signer readiness requires chain access, positive deposit/total reserve, no

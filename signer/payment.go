@@ -22,11 +22,12 @@ const paramsExpiryBuffer = int64(1)
 // draftPayment fixes the payment and accounting inputs before authorization.
 // Only State's authorization fields are updated by authorizePayment.
 type draftPayment struct {
-	batch   *pm.TicketBatch
-	payment wire.Payment
-	segment wire.SegData
-	State   paymentState
-	Usage   paymentUsage
+	batch    *pm.TicketBatch
+	payment  wire.Payment
+	segment  wire.SegData
+	State    paymentState
+	Usage    paymentUsage
+	snapshot pm.ChainSnapshot
 }
 
 type signedPayment struct {
@@ -150,13 +151,16 @@ func (s *Service) preparePayment(ctx context.Context, paymentType, manifest stri
 	state.Balance = remaining.RatString()
 	state.LastUpdate = now
 	state.SequenceNumber = uint64(oldSequence + 1)
-	return draftPayment{batch: batch, payment: message, segment: segment, State: state,
+	return draftPayment{batch: batch, payment: message, segment: segment, State: state, snapshot: funds.Snapshot,
 		Usage: paymentUsage{Fee: fee, Balance: remaining, PreviousTime: previous, BillableSecs: billableSecs, NumTickets: count}}, nil
 }
 
 // Sign adds signatures to the exact payment prepared before authorization.
-// It does not observe the clock or chain, or recalculate any payment values.
+// It validates the retained observation locally without another chain read.
 func (p draftPayment) Sign(ctx context.Context, signer pm.TicketSigner, metrics *observability.Metrics) (signedPayment, error) {
+	if err := p.snapshot.Validate(); err != nil {
+		return signedPayment{}, errors.Join(errPaymentService, err)
+	}
 	message := p.payment
 	message.PayerParams = make([]wire.TicketPayerParams, 0, len(p.batch.PayerParams))
 	for _, ticket := range p.batch.Tickets() {
@@ -178,6 +182,9 @@ func (p draftPayment) Sign(ctx context.Context, signer pm.TicketSigner, metrics 
 	}
 	segment := p.segment
 	segment.Signature = sig
+	if err := p.snapshot.Validate(); err != nil {
+		return signedPayment{}, errors.Join(errPaymentService, err)
+	}
 	return signedPayment{Payment: base64.StdEncoding.EncodeToString(wire.EncodePayment(message)), SegCreds: base64.StdEncoding.EncodeToString(wire.EncodeSegData(segment))}, nil
 }
 

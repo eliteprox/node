@@ -410,9 +410,14 @@ type failingPaymentSigner struct {
 	pm.TicketSigner
 	failAt int
 	calls  atomic.Int32
+	before func()
 }
 
 func (s *failingPaymentSigner) SignMessage(message []byte) ([]byte, error) {
+	if s.before != nil {
+		s.before()
+		s.before = nil
+	}
 	if int(s.calls.Add(1)) == s.failAt {
 		return nil, errors.New("key /private/keys/signer.json: private-signing-detail")
 	}

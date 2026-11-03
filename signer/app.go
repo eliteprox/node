@@ -185,7 +185,10 @@ func serve(parent context.Context, p Params) error {
 	if err != nil {
 		return fmt.Errorf("initialize signer contract bindings: %w", err)
 	}
-	service.SetPaymentChain(pm.EthereumChain{Client: eth.PaymentChain{Contracts: contracts}})
+	chain := eth.PaymentChain{Contracts: contracts}
+	observer := eth.NewPaymentObserver(chain, p.Network == nodeconfig.Mainnet)
+	chain.Observer = observer
+	service.SetPaymentChain(pm.EthereumChain{Client: chain})
 	policy, _ := newPricePolicy(p.MaxHourlyPrice, p.MaxFixedPrice)
 	policy.metrics = service.metrics
 	if p.WeiPerUSD == nil {
@@ -255,6 +258,7 @@ func serve(parent context.Context, p Params) error {
 	metricsServer := &http.Server{BaseContext: srv.BaseContext, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10, MaxHeaderValueCount: 128}
 	errCh := make(chan error, 2)
 	var workers sync.WaitGroup
+	workers.Go(func() { observer.Run(ctx) })
 	// Keep delivery alive until in-flight HTTP handlers have finished enqueuing.
 	publisherCtx, publisherStop := context.WithCancel(context.Background())
 	defer publisherStop()
