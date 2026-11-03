@@ -100,7 +100,7 @@ func (s *Service) preparePayment(ctx context.Context, paymentType, manifest stri
 	}
 	// Precheck one ticket before generating the batch.
 	// Observation/funding failures here are client errors.
-	funds, err := s.observePayer(ctx, &params, "precheck")
+	funds, err := s.observePayer(ctx, &params)
 	if err == nil {
 		err = s.checkTicketParams(ctx, &params, 1, funds, "precheck")
 	}
@@ -121,9 +121,7 @@ func (s *Service) preparePayment(ctx context.Context, paymentType, manifest stri
 		slog.With("component", "signer", "event", "payment", "operation", "payment").WarnContext(ctx, "signer ticket batch rejected", "outcome", "error", "error_kind", observability.ErrorKind(err))
 		return draftPayment{}, invalid("invalid ticket batch")
 	}
-	// Recheck the full batch before authorization, on the precheck's observation:
-	// only the ticket count differs. A funding failure here is an internal generation
-	// failure; invalid exposure remains a client error.
+	// Recheck full-batch exposure on the same observation before authorization.
 	if err := s.checkTicketParams(ctx, &params, count, funds, "generation"); err != nil {
 		return draftPayment{}, err
 	}
@@ -183,7 +181,7 @@ func (p draftPayment) Sign(ctx context.Context, signer pm.TicketSigner, metrics 
 	return signedPayment{Payment: base64.StdEncoding.EncodeToString(wire.EncodePayment(message)), SegCreds: base64.StdEncoding.EncodeToString(wire.EncodeSegData(segment))}, nil
 }
 
-func (s *Service) observePayer(ctx context.Context, ticketParams *pm.TicketParams, phase string) (pm.PayerFunds, error) {
+func (s *Service) observePayer(ctx context.Context, ticketParams *pm.TicketParams) (pm.PayerFunds, error) {
 	if ticketParams == nil {
 		return pm.PayerFunds{}, invalid("ticketParams is nil")
 	}
@@ -191,25 +189,25 @@ func (s *Service) observePayer(ctx context.Context, ticketParams *pm.TicketParam
 		return pm.PayerFunds{}, invalid("ticketParams expiration block is 0")
 	}
 	if s.paymentChain == nil {
-		slog.With("component", "signer", "event", "payment", "operation", "payment").ErrorContext(ctx, "signer payer chain is not configured", "phase", phase)
+		slog.With("component", "signer", "event", "payment", "operation", "payment").ErrorContext(ctx, "signer payer chain is not configured", "phase", "precheck")
 		return pm.PayerFunds{}, errors.Join(pm.ErrPayerUnavailable, errPaymentService)
 	}
 	funds, err := s.paymentChain.PayerFunds(ctx, s.key.Address(), ticketParams.Recipient)
 	if err != nil {
-		slog.With("component", "signer", "event", "payment", "operation", "payment").ErrorContext(ctx, "signer payer chain observation failed", "phase", phase, "outcome", "error", "error_kind", observability.ErrorKind(err))
+		slog.With("component", "signer", "event", "payment", "operation", "payment").ErrorContext(ctx, "signer payer chain observation failed", "phase", "precheck", "outcome", "error", "error_kind", observability.ErrorKind(err))
 		return pm.PayerFunds{}, errors.Join(pm.ErrPayerUnavailable, errPaymentService)
 	}
 	if funds.Snapshot.Block == nil {
-		slog.With("component", "signer", "event", "payment", "operation", "payment").ErrorContext(ctx, "signer payer chain observation has no L1 block", "phase", phase)
+		slog.With("component", "signer", "event", "payment", "operation", "payment").ErrorContext(ctx, "signer payer chain observation has no L1 block", "phase", "precheck")
 		return pm.PayerFunds{}, errors.Join(pm.ErrPayerUnavailable, errPaymentService)
 	}
 	s.observeFunds(funds, false)
 	return funds, nil
 }
 
-// Adapted from go-livepeer/pm/sender.go's validateTicketParams, by Yondon Fu,
-// Nico Vergauwen and Rafał Leszko. Supplied creation-round metadata is retained;
-// refresh is governed by parameter expiry on the L1 clock, not the current round.
+// Adapted from livepeer/go-livepeer pm/sender.go (63df25b4ce, 2cc84ee216,
+// 4b6ede31f0), by Yondon Fu, Nico Vergauwen and Rafał Leszko (MIT; see LICENSE).
+// Supplied creation-round metadata is retained; refresh uses the L1 clock.
 func (s *Service) checkTicketParams(ctx context.Context, ticketParams *pm.TicketParams, numTickets int, funds pm.PayerFunds, phase string) error {
 	latestL1Block := funds.Snapshot.Block
 	currentBuffer := new(big.Int).Sub(ticketParams.ExpirationBlock, latestL1Block).Int64()

@@ -423,80 +423,67 @@ func TestPaymentFailureStatuses(t *testing.T) {
 	s, original := testService(t)
 	logs := captureSignerLogs(t)
 	key := s.key
-	for _, phase := range []struct {
-		name           string
-		failOn, status int
-	}{{"precheck", 1, 400}} {
-		for _, cause := range []string{"deposit", "reserve", "withdrawal", "chain observation"} {
-			t.Run(phase.name+"/"+cause, func(t *testing.T) {
-				logs.Reset()
-				calls := 0
-				s.SetPaymentChain(payerChainFunc(func(ctx context.Context, payer, recipient ethcommon.Address) (pm.PayerFunds, error) {
-					calls++
-					funds, err := (fundedPayer{}).PayerFunds(ctx, payer, recipient)
-					if calls == phase.failOn {
-						switch cause {
-						case "deposit":
-							funds.Deposit = new(big.Int)
-						case "reserve":
-							funds.Reserve = new(big.Int)
-						case "withdrawal":
-							funds.WithdrawRound = new(big.Int).Add(funds.Snapshot.Round, big.NewInt(1))
-						case "chain observation":
-							err = errors.New("RPC https://rpc.internal/?token=private-rpc-detail failed")
-						}
-					}
-					return funds, err
-				}))
-				outcome := "rejected"
-				if cause == "chain observation" {
-					outcome = "error"
-				}
-				before := test.MetricSum(t, s.metrics.Registry, "signer_payments_total", map[string]string{"outcome": outcome})
-				response := postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(original), "type": "fixed"})
-				requirePaymentFailure(t, response, phase.status)
-				require.Equal(t, before+1, test.MetricSum(t, s.metrics.Registry, "signer_payments_total", map[string]string{"outcome": outcome}))
-				require.NotContains(t, response.Body.String(), "rpc.internal")
-				require.NotContains(t, response.Body.String(), "private-rpc-detail")
-				require.Contains(t, logs.String(), `"phase":"`+phase.name+`"`)
-				if cause == "chain observation" {
-					require.NotContains(t, logs.String(), "private-rpc-detail")
-				}
-			})
-		}
-	}
-	// A request observes funds once, so the batch recheck cannot see a new funding
-	// failure over HTTP. Its handling stays distinct: not a client error, so 500.
-	for _, cause := range []string{"deposit", "reserve", "withdrawal"} {
-		t.Run("generation/"+cause, func(t *testing.T) {
+	for _, cause := range []string{"deposit", "reserve", "withdrawal", "chain observation"} {
+		t.Run("precheck/"+cause, func(t *testing.T) {
 			logs.Reset()
-			funds, err := (fundedPayer{}).PayerFunds(t.Context(), s.key.Address(), ethcommon.Address{})
-			require.NoError(t, err)
-			switch cause {
-			case "deposit":
-				funds.Deposit = new(big.Int)
-			case "reserve":
-				funds.Reserve = new(big.Int)
-			case "withdrawal":
-				funds.WithdrawRound = new(big.Int).Add(funds.Snapshot.Round, big.NewInt(1))
+			s.SetPaymentChain(payerChainFunc(func(ctx context.Context, payer, recipient ethcommon.Address) (pm.PayerFunds, error) {
+				funds, err := (fundedPayer{}).PayerFunds(ctx, payer, recipient)
+				switch cause {
+				case "deposit":
+					funds.Deposit = new(big.Int)
+				case "reserve":
+					funds.Reserve = new(big.Int)
+				case "withdrawal":
+					funds.WithdrawRound = new(big.Int).Add(funds.Snapshot.Round, big.NewInt(1))
+				case "chain observation":
+					err = errors.New("RPC https://rpc.internal/?token=private-rpc-detail failed")
+				}
+				return funds, err
+			}))
+			outcome := "rejected"
+			if cause == "chain observation" {
+				outcome = "error"
 			}
-			params := pm.TicketParams{ExpirationBlock: new(big.Int).SetBytes(original.TicketParams.ExpirationBlock)}
-			err = s.checkTicketParams(t.Context(), &params, 2, funds, "generation")
-			require.ErrorIs(t, err, pm.ErrPayerUnavailable)
-			_, clientError := errors.AsType[paymentFailure](err)
-			require.False(t, clientError, "generate answers 500 for anything but a paymentFailure")
-			require.Equal(t, "rejected", paymentOutcome(err))
-			require.Contains(t, logs.String(), `"phase":"generation"`)
+			before := test.MetricSum(t, s.metrics.Registry, "signer_payments_total", map[string]string{"outcome": outcome})
+			response := postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(original), "type": "fixed"})
+			requirePaymentFailure(t, response, 400)
+			require.Equal(t, before+1, test.MetricSum(t, s.metrics.Registry, "signer_payments_total", map[string]string{"outcome": outcome}))
+			require.NotContains(t, response.Body.String(), "rpc.internal")
+			require.NotContains(t, response.Body.String(), "private-rpc-detail")
+			require.Contains(t, logs.String(), `"phase":"precheck"`)
+			if cause == "chain observation" {
+				require.NotContains(t, logs.String(), "private-rpc-detail")
+			}
 		})
 	}
 	s.SetPaymentChain(fundedPayer{})
 	t.Run("batch exposure", func(t *testing.T) {
-		info := original
+		s, info := testService(t)
+		defer s.Close()
+		logs.Reset()
 		info.Price.PricePerUnit = 20 // One ticket passes precheck; the full batch exceeds the limit.
 		s.payerPolicy.MaxBatchEV = big.NewRat(15, 1)
+		countingKey := &failingPaymentSigner{TicketSigner: s.key}
+		s.key = countingKey
+		calls := 0
+		s.SetPaymentChain(payerChainFunc(func(ctx context.Context, payer, recipient ethcommon.Address) (pm.PayerFunds, error) {
+			calls++
+			return (fundedPayer{}).PayerFunds(ctx, payer, recipient)
+		}))
+		var authCalls atomic.Int32
+		webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			authCalls.Add(1)
+			_, _ = io.WriteString(w, `{"status":200}`)
+		}))
+		defer webhook.Close()
+		require.NoError(t, s.SetAuthWebhook(testURL(t, webhook.URL), nil))
+		s.events = eventSinkFunc(func(context.Context, signingEvent) error { t.Error("rejected payment emitted an event"); return nil })
 		requirePaymentFailure(t, postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"}), 400)
+		require.Contains(t, logs.String(), `"phase":"generation"`)
+		require.Equal(t, 1, calls)
+		require.Zero(t, countingKey.calls.Load())
+		require.Zero(t, authCalls.Load())
 	})
-	s.payerPolicy = pm.DefaultPayerPolicy()
 	for _, tc := range []struct {
 		name   string
 		log    string
@@ -544,18 +531,30 @@ func TestPaymentFailureStatuses(t *testing.T) {
 func TestBatchRecheckReusesPrecheckObservation(t *testing.T) {
 	s, info := testService(t)
 	defer s.Close()
+	info.Price.PricePerUnit = 20 // Both request types need multiple tickets.
+	funds, err := (fundedPayer{}).PayerFunds(t.Context(), s.key.Address(), ethcommon.Address{})
+	require.NoError(t, err)
+	want, err := (fundedPayer{}).PayerFunds(t.Context(), s.key.Address(), ethcommon.Address{})
+	require.NoError(t, err)
 	calls := 0
-	s.SetPaymentChain(payerChainFunc(func(ctx context.Context, payer, recipient ethcommon.Address) (pm.PayerFunds, error) {
+	s.SetPaymentChain(payerChainFunc(func(_ context.Context, payer, recipient ethcommon.Address) (pm.PayerFunds, error) {
 		calls++
-		funds, err := (fundedPayer{}).PayerFunds(ctx, payer, recipient)
+		require.Equal(t, s.key.Address(), payer)
+		require.Equal(t, ethcommon.BytesToAddress(info.TicketParams.Recipient), recipient)
 		if calls > 1 {
-			funds.Deposit = new(big.Int)
+			return pm.PayerFunds{}, errors.New("unexpected second observation")
 		}
-		return funds, err
+		return funds, nil
 	}))
-	response := postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
-	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-	require.Equal(t, 1, calls)
+	for _, kind := range []string{"fixed", "live"} {
+		t.Run(kind, func(t *testing.T) {
+			calls = 0
+			response := postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": kind})
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.Equal(t, 1, calls)
+			require.Equal(t, want, funds, "validation must not mutate the observation")
+		})
+	}
 }
 
 func TestCancelledPaymentOutcome(t *testing.T) {
