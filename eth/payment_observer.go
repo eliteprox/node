@@ -35,6 +35,10 @@ type PaymentObserver struct {
 	l1Progress        time.Time
 	l1HighWater       *big.Int
 	recipient         common.Address
+	lifecycle         context.Context
+	payers            map[payerKey]*payerEntry
+	payerReads        sync.WaitGroup
+	activeReads       int
 }
 
 func NewPaymentObserver(chain PaymentChain, requireL1 bool, recipient common.Address) *PaymentObserver {
@@ -44,7 +48,17 @@ func NewPaymentObserver(chain PaymentChain, requireL1 bool, recipient common.Add
 
 // Run has one service-owned caller. Every RPC inherits the service lifetime.
 func (o *PaymentObserver) Run(ctx context.Context) {
-	defer func() { o.mu.Lock(); o.stopped = true; o.mu.Unlock() }()
+	o.mu.Lock()
+	lifecycle, cancelReads := context.WithCancel(ctx)
+	o.lifecycle = lifecycle
+	o.mu.Unlock()
+	defer func() {
+		cancelReads()
+		o.mu.Lock()
+		o.stopped = true
+		o.mu.Unlock()
+		o.payerReads.Wait()
+	}()
 	ticker := time.NewTicker(o.interval)
 	defer ticker.Stop()
 	for {
@@ -64,13 +78,20 @@ func (o *PaymentObserver) Run(ctx context.Context) {
 type ObserverStatus struct {
 	ObservedAt, ContactAt, HeadProgressAt, L1ProgressAt time.Time
 	Healthy, RecipientActive                            bool
+	PayerEntries, PayerReads, PayerFailures             int
 }
 
 func (o *PaymentObserver) Status() ObserverStatus {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	healthy := o.validate(o.current) == nil
-	return ObserverStatus{o.current.observedAt, o.contact, o.progress, o.l1Progress, healthy, healthy && o.recipient != (common.Address{}) && o.current.recipientErr == nil && o.current.recipientActive}
+	status := ObserverStatus{ObservedAt: o.current.observedAt, ContactAt: o.contact, HeadProgressAt: o.progress, L1ProgressAt: o.l1Progress, Healthy: healthy, RecipientActive: healthy && o.recipient != (common.Address{}) && o.current.recipientErr == nil && o.current.recipientActive, PayerEntries: len(o.payers), PayerReads: o.activeReads}
+	for _, entry := range o.payers {
+		if !entry.valid && entry.failure != nil {
+			status.PayerFailures++
+		}
+	}
+	return status
 }
 
 func (o *PaymentObserver) Snapshot(ctx context.Context) (ChainSnapshot, error) {
@@ -82,9 +103,14 @@ func (o *PaymentObserver) Snapshot(ctx context.Context) (ChainSnapshot, error) {
 	if err := o.validate(o.current); err != nil {
 		return ChainSnapshot{}, err
 	}
-	s := o.current
-	s.Block, s.Round, s.CurrentRound = new(big.Int).Set(s.Block), new(big.Int).Set(s.Round), new(big.Int).Set(s.CurrentRound)
-	return s, nil
+	return o.current.clone(), nil
+}
+
+func (s ChainSnapshot) clone() ChainSnapshot {
+	for _, value := range []**big.Int{&s.Block, &s.Number, &s.Round, &s.CurrentRound} {
+		*value = new(big.Int).Set(*value)
+	}
+	return s
 }
 
 func (s ChainSnapshot) ObservedAt() time.Time {
@@ -106,7 +132,7 @@ func (s ChainSnapshot) Validate() error {
 }
 
 func (o *PaymentObserver) validate(s ChainSnapshot) error {
-	if o.stopped || o.invalid || s.generation != o.generation || o.expired(s, o.l1Progress) {
+	if o.stopped || o.invalid || (o.lifecycle != nil && o.lifecycle.Err() != nil) || s.generation != o.generation || o.expired(s, o.l1Progress) {
 		return ErrObservationUnavailable
 	}
 	return nil
@@ -117,8 +143,7 @@ func (o *PaymentObserver) expired(s ChainSnapshot, l1Progress time.Time) bool {
 	return s.observedAt.IsZero() || now.Sub(s.observedAt) >= o.maxAge || now.Sub(s.blockTime) >= o.maxAge || now.Sub(l1Progress) >= o.maxAge
 }
 
-// Only Run calls refresh. Previous/current identity is the extension point for
-// complete hash-pinned logs or reset; no partial delta authorizes publication.
+// Only Run calls refresh.
 func (o *PaymentObserver) refresh(ctx context.Context) error {
 	at := o.now()
 	head, err := o.chain.Contracts.RPC.header(ctx, "latest")
@@ -128,7 +153,7 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 	o.mu.Lock()
 	o.contact = o.now()
 	prior := o.header
-	gap := false
+	gap, continuous := false, false
 	if head.Hash == (common.Hash{}) || head.Number == nil {
 		o.mu.Unlock()
 		return ErrObservationUnavailable
@@ -142,6 +167,7 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 			return ErrObservationUnavailable
 		}
 		gap = head.Hash != prior.Hash && distance.Cmp(big.NewInt(1)) > 0
+		continuous = distance.Cmp(big.NewInt(1)) == 0 && head.ParentHash == prior.Hash
 		if head.Hash != prior.Hash && !gap && (distance.Sign() == 0 || head.ParentHash != prior.Hash) {
 			o.invalid = true
 			o.generation++
@@ -171,7 +197,8 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 		// A polling gap does not itself orphan the retained observation. Prove
 		// its anchor before keeping it available during the pinned backfill.
 		anchor, err := o.chain.Contracts.RPC.header(ctx, hexutil.EncodeBig((*big.Int)(prior.Number)))
-		if err != nil || anchor.Hash != prior.Hash || anchor.Number == nil || (*big.Int)(anchor.Number).Cmp((*big.Int)(prior.Number)) != 0 {
+		continuous = err == nil && anchor.Hash == prior.Hash && anchor.Number != nil && (*big.Int)(anchor.Number).Cmp((*big.Int)(prior.Number)) == 0
+		if !continuous {
 			o.mu.Lock()
 			o.invalid = true
 			o.generation++
@@ -193,6 +220,19 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	changed, reset := o.payerChanges(ctx, prior, head, s, continuous)
+	if gap && reset {
+		o.invalidate()
+	}
+	// Hash-pinned logs can outlive their canonical block, even on a reset.
+	canonical, err := o.chain.Contracts.RPC.header(ctx, hexutil.EncodeBig((*big.Int)(head.Number)))
+	if err != nil || canonical.Hash != head.Hash {
+		o.invalidate()
+		return ErrObservationUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	progress, l1Progress, highWater := o.progress, o.l1Progress, o.l1HighWater
@@ -205,6 +245,12 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 	s.observer, s.generation, s.observedAt, s.blockTime = o, o.generation, at, blockTime
 	if o.stopped || o.expired(s, l1Progress) {
 		return ErrObservationUnavailable
+	}
+	for key, entry := range o.payers {
+		if _, affected := changed[key.payer]; reset || affected {
+			entry.version++
+			entry.valid, entry.failure = false, nil
+		}
 	}
 	o.current, o.header, o.invalid = s, head, false
 	o.progress, o.l1Progress, o.l1HighWater = progress, l1Progress, highWater

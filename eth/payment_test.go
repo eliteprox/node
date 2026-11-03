@@ -168,7 +168,7 @@ func TestRedemptionReceiptRequiresCanonicalFinality(t *testing.T) {
 			require.NoError(t, err)
 			defer rpc.Close()
 			contracts := &Contracts{RPC: rpc}
-			confirmed, reverted, err := (PaymentChain{Contracts: contracts}).Receipt(t.Context(), ethcommon.HexToHash("0x1234"))
+			receipt, err := (PaymentChain{Contracts: contracts}).FinalizedReceipt(t.Context(), ethcommon.HexToHash("0x1234"))
 			if strings.HasPrefix(scenario, "invalid") {
 				require.ErrorContains(t, err, "invalid transaction receipt")
 				_, err = contracts.WaitReceipt(t.Context(), ethcommon.HexToHash("0x1234"))
@@ -176,8 +176,12 @@ func TestRedemptionReceiptRequiresCanonicalFinality(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			require.Equal(t, scenario == "confirmed", confirmed)
-			require.Equal(t, scenario == "reverted", reverted)
+			require.Equal(t, scenario == "confirmed", receipt != nil && receipt.Status == types.ReceiptStatusSuccessful)
+			require.Equal(t, scenario == "reverted", receipt != nil && receipt.Status == types.ReceiptStatusFailed)
+			if receipt != nil {
+				require.Equal(t, big.NewInt(16), receipt.BlockNumber)
+				require.Equal(t, hash, receipt.BlockHash.Hex())
+			}
 		})
 	}
 }

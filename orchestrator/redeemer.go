@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/pm"
 )
@@ -68,16 +69,16 @@ func RedeemPending(ctx context.Context, store *RedeemerDB, chain eth.PaymentChai
 		if !active {
 			continue
 		}
-		used, err := chain.IsUsedTicket(ctx, ticket.Hash(), "latest")
+		used, _, err := chain.TicketUse(ctx, ticket.Hash(), "latest")
 		if err != nil {
 			failures = append(failures, err)
 			continue
 		}
 		if used {
-			finalized, err := chain.IsUsedTicket(ctx, ticket.Hash(), "finalized")
+			finalized, observation, err := chain.TicketUse(ctx, ticket.Hash(), "finalized")
 			if err == nil {
 				if finalized {
-					err = store.setTicketPhase(ctx, ticket.Sig, "used")
+					err = store.setTicketPhase(ctx, ticket.Sig, "used", observation)
 				} else {
 					err = store.setTicketPhase(ctx, ticket.Sig, "awaiting_finality")
 				}
@@ -103,9 +104,9 @@ func RedeemPending(ctx context.Context, store *RedeemerDB, chain eth.PaymentChai
 func redeemTicket(ticket *pm.SignedTicket) eth.RedeemTicket {
 	return eth.RedeemTicket{Recipient: ticket.Recipient, Sender: ticket.PayerAddress, FaceValue: ticket.FaceValue, WinProb: ticket.WinProb, SenderNonce: ticket.TicketNonce, RecipientRandHash: ticket.RecipientRandHash, AuxData: ticket.AuxData(), Signature: ticket.Sig, RecipientRand: ticket.RecipientRand}
 }
-func (s *RedeemerDB) setTicketPhase(ctx context.Context, sig []byte, phase string) error {
+func (s *RedeemerDB) setTicketPhase(ctx context.Context, sig []byte, phase string, observation ...eth.ChainSnapshot) error {
 	if terminalRedemption(phase) {
-		return s.finishTicket(ctx, sig, phase, "")
+		return s.finishTicket(ctx, sig, phase, "", observation...)
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO redemption_attempts(sig,attempted_at,phase) VALUES(?,?,?) ON CONFLICT(sig) DO UPDATE SET phase=excluded.phase WHERE redemption_attempts.phase IN ('retryable','awaiting_finality') AND redemption_attempts.phase!=excluded.phase`, sig, time.Now().UTC().Format(time.RFC3339Nano), phase)
 	if err == nil {
@@ -117,7 +118,7 @@ func (s *RedeemerDB) setTicketPhase(ctx context.Context, sig []byte, phase strin
 }
 
 type ReceiptReader interface {
-	Receipt(context.Context, common.Hash) (confirmed, reverted bool, err error)
+	FinalizedReceipt(context.Context, common.Hash) (*types.Receipt, error)
 }
 
 // ReconcileSubmitted checks every retained identity, including old retry groups.
@@ -133,16 +134,16 @@ func ReconcileSubmitted(ctx context.Context, store *RedeemerDB, chain ReceiptRea
 	reverts := map[string]common.Hash{}
 	pending := map[common.Hash]bool{}
 	for _, item := range items {
-		confirmed, reverted, err := chain.Receipt(ctx, item.Hash)
+		receipt, err := chain.FinalizedReceipt(ctx, item.Hash)
 		id := string(item.Signature)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("receipt %s: %w", item.Hash.Hex(), err))
 			continue
 		}
-		if confirmed {
+		if receipt != nil && receipt.Status == types.ReceiptStatusSuccessful {
 			successes[id] = true
-			err = store.finishTicket(ctx, item.Signature, "confirmed", item.Hash.Hex())
-		} else if reverted {
+			err = store.finishTicket(ctx, item.Signature, "confirmed", item.Hash.Hex(), eth.ChainSnapshot{Number: receipt.BlockNumber, BlockHash: receipt.BlockHash})
+		} else if receipt != nil && receipt.Status == types.ReceiptStatusFailed {
 			reverts[id] = item.Hash
 			err = store.finishTicket(ctx, item.Signature, "reverted", item.Hash.Hex())
 		} else {

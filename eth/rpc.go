@@ -226,6 +226,7 @@ type miniHeader struct {
 	Hash          ethcommon.Hash  `json:"hash"`
 	ParentHash    ethcommon.Hash  `json:"parentHash"`
 	Timestamp     *hexutil.Uint64 `json:"timestamp"`
+	LogsBloom     *types.Bloom    `json:"logsBloom"`
 }
 
 func (r *RPC) header(ctx context.Context, block any) (*miniHeader, error) {

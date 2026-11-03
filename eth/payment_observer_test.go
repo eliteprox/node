@@ -26,6 +26,7 @@ func newTestObserver(t *testing.T) (*test.ChainRPC, *PaymentObserver, *time.Time
 	c, err := NewContracts(rpc, f.Controller)
 	require.NoError(t, err)
 	o := NewPaymentObserver(PaymentChain{Contracts: c}, true, common.Address{})
+	o.lifecycle = t.Context()
 	now := time.Now().Truncate(time.Second)
 	o.now = func() time.Time { return now }
 	return f, o, &now
@@ -36,6 +37,7 @@ func advanceObserver(f *test.ChainRPC, now time.Time) {
 		s.Parent, s.Number, s.Timestamp = s.Hash, s.Number+1, uint64(now.Unix())
 		s.Hash = common.BigToHash(new(big.Int).SetUint64(s.Number))
 		s.L1Block++
+		s.Logs, s.LogsBloom = nil, nil
 	})
 }
 
@@ -202,23 +204,27 @@ func TestObserverL1ProgressDeadline(t *testing.T) {
 }
 
 func TestObserverExpiredCandidateIsNotPublished(t *testing.T) {
-	f, o, now := newTestObserver(t)
-	require.NoError(t, o.refresh(t.Context()))
-	old := o.Status()
-	advanceObserver(f, *now)
-	f.Update(func(s *test.ChainState) {
-		s.Before = func(_ context.Context, name string) {
-			if name == "RoundsManager.currentRound" {
-				*now = now.Add(30 * time.Second)
-			}
-		}
-	})
-	require.ErrorIs(t, o.refresh(t.Context()), ErrObservationUnavailable)
-	status := o.Status()
-	require.Equal(t, old.ObservedAt, status.ObservedAt)
-	require.Equal(t, old.HeadProgressAt, status.HeadProgressAt)
-	require.Equal(t, old.L1ProgressAt, status.L1ProgressAt)
-	require.Equal(t, int64(50), o.current.Block.Int64())
+	for _, phase := range []string{"RoundsManager.currentRound", "eth_getLogs"} {
+		t.Run(phase, func(t *testing.T) {
+			f, o, now := newTestObserver(t)
+			require.NoError(t, o.refresh(t.Context()))
+			old := o.Status()
+			advanceObserver(f, *now)
+			f.Update(func(s *test.ChainState) {
+				s.Before = func(_ context.Context, name string) {
+					if name == phase {
+						*now = now.Add(30 * time.Second)
+					}
+				}
+			})
+			require.ErrorIs(t, o.refresh(t.Context()), ErrObservationUnavailable)
+			status := o.Status()
+			require.Equal(t, old.ObservedAt, status.ObservedAt)
+			require.Equal(t, old.HeadProgressAt, status.HeadProgressAt)
+			require.Equal(t, old.L1ProgressAt, status.L1ProgressAt)
+			require.Equal(t, int64(50), o.current.Block.Int64())
+		})
+	}
 }
 
 func TestObserverPinnedBackfillAndReorg(t *testing.T) {

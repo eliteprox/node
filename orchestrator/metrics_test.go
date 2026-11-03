@@ -350,7 +350,7 @@ func TestUpstreamFailureAfterHeaders(t *testing.T) {
 }
 
 func TestRedemptionMetricsDurableAndIdempotent(t *testing.T) {
-	_, store, ticket, _, _ := newRecoveryTest(t, 14)
+	f, store, ticket, _, _ := newRecoveryTest(t, 14)
 	store.metrics = observability.New("orchestrator")
 	store.metrics.Snapshot(store.collectMetrics)
 	store.readiness = &paidReadiness{completed: time.Now(), chain: true, interval: time.Second, snapshot: eth.ChainSnapshot{Block: new(big.Int).Sub(ticket.ParamsExpirationBlock, big.NewInt(1)), Round: big.NewInt(ticket.CreationRound)}}
@@ -378,9 +378,9 @@ func TestRedemptionMetricsDurableAndIdempotent(t *testing.T) {
 	require.EqualValues(t, 1, test.MetricSum(t, store.metrics.Registry, "redemption_transitions_total", map[string]string{"event": "awaiting_finality"}))
 	_, err = store.db.Exec(`DROP TRIGGER fail_transition`)
 	require.NoError(t, err)
-	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "used", ""))
-	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "used", ""))
-	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "confirmed", ""))
+	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "used", "", f.collateralSnapshot()))
+	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "used", "", f.collateralSnapshot()))
+	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "confirmed", "", f.collateralSnapshot()))
 	require.EqualValues(t, 1, test.MetricSum(t, store.metrics.Registry, "redemption_settlements_total", nil))
 	require.Zero(t, test.MetricSum(t, store.metrics.Registry, "redemption_queue_tickets", nil))
 	store = reopenRecoveryStore(t, store)
