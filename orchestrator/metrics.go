@@ -15,34 +15,34 @@ import (
 	"github.com/livepeer/node/pm"
 )
 
-func runnerIdentity(id string, item *runner) observability.Identity {
-	return observability.Identity{App: item.App, Runner: id, Mode: item.Mode}
+func appIdentity(id string, item *app) observability.Identity {
+	return observability.Identity{App: item.App, AppID: id, Runner: item.owner.ID, Mode: item.Mode}
 }
 
 func (r *Registry) identity(id, sid string) observability.Identity {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if item := r.runners[id]; item != nil {
+	if item := r.apps[id]; item != nil {
 		if sess := item.Sessions[sid]; sess != nil {
 			return sess.identity
 		}
-		return runnerIdentity(id, item)
+		return appIdentity(id, item)
 	}
 	return observability.Identity{}
 }
 
-func (r *Registry) runnerEvent(id string, item *runner, event string) {
-	r.metrics.Add("runner_events_total", 1, runnerIdentity(id, item).Labels().With("event", event))
+func (r *Registry) runnerEvent(id string, item *app, event string) {
+	r.metrics.Add("runner_events_total", 1, appIdentity(id, item).Labels().With("event", event))
 	if r.logger != nil {
-		r.logger.Info("runner state changed", "event", "runner_"+event, "operation", "runner_lifecycle", "runner_id", id, "app", item.App, "outcome", "success")
+		r.logger.Info("runner state changed", "event", "runner_"+event, "operation", "runner_lifecycle", "runner_id", item.owner.ID, "app_id", id, "app", item.App, "outcome", "success")
 	}
 }
 
 func (r *Registry) collectMetrics(emit observability.Emit) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for id, item := range r.runners {
-		labels := runnerIdentity(id, item).Labels()
+	for id, item := range r.apps {
+		labels := appIdentity(id, item).Labels()
 		ready := r.usable(item) && r.priceAvailable(item)
 		emit("runner_registered", 1, labels)
 		emit("runner_ready", observability.Bool(ready), labels)
@@ -52,14 +52,14 @@ func (r *Registry) collectMetrics(emit observability.Emit) {
 			available = max(item.Capacity-len(item.Sessions), 0)
 		}
 		emit("runner_capacity_available", float64(available), labels)
-		if !item.Static {
-			emit("runner_last_heartbeat_timestamp_seconds", float64(item.Last.Unix()), labels)
+		if !item.owner.Static {
+			emit("runner_last_heartbeat_timestamp_seconds", float64(item.owner.Last.Unix()), labels)
 		}
 		type group struct {
 			identity observability.Identity
 			pending  bool
 		}
-		counts := map[group]int{{runnerIdentity(id, item), false}: 0, {runnerIdentity(id, item), true}: 0}
+		counts := map[group]int{{appIdentity(id, item), false}: 0, {appIdentity(id, item), true}: 0}
 		for _, sess := range item.Sessions {
 			counts[group{sess.identity, sess.pending}]++
 		}
@@ -232,24 +232,24 @@ func paymentAppOutcome(err error) string {
 	}
 }
 
-func (e *PaymentEngine) paymentLabels(runner, manifest string) observability.Labels {
-	if runner == "" {
+func (e *PaymentEngine) paymentLabels(appID, manifest string) observability.Labels {
+	if appID == "" {
 		e.mu.Lock()
 		if session := e.sessions[manifest]; session != nil {
-			runner = session.runner
+			appID = session.appID
 		}
 		e.mu.Unlock()
 	}
 	if e.identity == nil {
 		return nil
 	}
-	return e.identity(runner, manifest).Labels()
+	return e.identity(appID, manifest).Labels()
 }
 
 func (e *PaymentEngine) recordPayment(operation string, err error, labels observability.Labels) {
 	outcome := paymentOutcome(err)
 	e.metrics.Add("payment_operations_total", 1, labels.With("operation", operation).With("outcome", outcome))
 	if e.store != nil && e.store.logger != nil && operation != "charge" {
-		e.store.logger.Info("payment observed", "event", "payment", "operation", operation, "outcome", outcome, "app", labels["app"], "runner_id", labels["runner_id"])
+		e.store.logger.Info("payment observed", "event", "payment", "operation", operation, "outcome", outcome, "app", labels["app"], "runner_id", labels["runner_id"], "app_id", labels["app_id"])
 	}
 }

@@ -24,6 +24,8 @@ func TestDiscoveryLocalInventory(t *testing.T) {
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/deployment/discovery", nil))
 	require.Equal(t, 200, w.Code)
 	require.NotContains(t, w.Body.String(), `"nodes"`)
+	require.NotContains(t, w.Body.String(), `"app_id"`)
+	require.NotContains(t, w.Body.String(), `"runner_id"`)
 	var entries []discoveryEntry
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &entries))
 	require.Len(t, entries, 1)

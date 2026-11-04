@@ -13,22 +13,22 @@ func TestPendingPaymentDoesNotExposeOrBillSession(t *testing.T) {
 	r := NewRegistry("", "https://orch.example", time.Second, time.Minute)
 	r.SetWeiPerUSD(big.NewRat(10, 1))
 	require.NoError(t, r.AddStatic(StaticRunner{ID: "r", RunnerURL: "https://runner.example", App: "app", Proxy: true, PriceInfo: priceInfo{Price: "1", Currency: "usd", Unit: "fixed"}}))
-	quote, _, err := r.PriceForRunner("r")
+	quote, _, err := r.quoteForApp("r")
 	require.NoError(t, err)
 	var events []string
 	var reservedToken string
-	r.onEvent = func(_, event, _, token string) {
+	r.onEvent = func(_, _, event, _, token string) {
 		events = append(events, event)
 		reservedToken = token
 	}
-	id, _, _, _, err := r.reserveWithPrice("r", "payment-manifest", &quote)
+	id, _, _, _, err := r.reserveWithPrice("r", "payment-manifest", &quote, "persistent")
 	require.NoError(t, err)
 	require.Empty(t, events)
 	require.Empty(t, r.PaidSessions())
 	_, _, status, err := r.sessionTarget("r", id)
 	require.Error(t, err)
 	require.Equal(t, 404, status)
-	for proxy := range r.runners["r"].Sessions[id].Proxies {
+	for proxy := range r.apps["r"].Sessions[id].Proxies {
 		_, _, _, _, ok := r.proxyTarget(proxy)
 		require.False(t, ok)
 	}
@@ -43,7 +43,7 @@ func TestPendingPaymentDoesNotExposeOrBillSession(t *testing.T) {
 	r.ReleaseBySession(id)
 	require.False(t, r.activateSession("r", id), "a released pending reservation cannot be resurrected")
 	for _, reason := range []string{"shutdown", "runner_expired", "runner_unregistered", "runner_unhealthy", "completed", "released", ""} {
-		id, _, _, _, err := r.reserveWithPrice("r", "pending-"+reason, &quote)
+		id, _, _, _, err := r.reserveWithPrice("r", "pending-"+reason, &quote, "persistent")
 		require.NoError(t, err)
 		want := reason
 		if reason == "completed" || reason == "released" || reason == "" {

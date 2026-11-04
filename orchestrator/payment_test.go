@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/livepeer/node/destination"
 	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/test"
@@ -321,4 +324,174 @@ func mustURL(t *testing.T, raw string) *url.URL {
 	u, err := url.Parse(raw)
 	require.NoError(t, err)
 	return u
+}
+
+func TestMultiAppPaidIsolationAndDrain(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, r.Header.Get("Livepeer-Runner-Route"))
+	}))
+	defer upstream.Close()
+	engine, chain, payerKey, _ := newRecipientTestEngine(t)
+	registry, server := reviewServer(t, upstream.URL)
+	defer server.Close()
+	registry.SetWeiPerUSD(big.NewRat(10, 1))
+	server.SetPayment(engine)
+	a, b := registeredApp("live"), registeredApp("fixed")
+	a.RunnerURL, b.RunnerURL = upstream.URL, upstream.URL
+	a.PriceInfo = priceInfo{Price: "3600", Currency: "usd", Unit: "hour"}
+	b.Mode, b.PriceInfo = "single-shot", priceInfo{Price: "2", Currency: "usd", Unit: "fixed"}
+	owner := appHeartbeat(t, registry, "owner", "bootstrap", a, b)
+	payer := crypto.PubkeyToAddress(payerKey.PublicKey)
+	request := func(method, path, payment, segment string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, nil)
+		r.Header.Set("Livepeer-Payer-Address", payer.Hex())
+		r.Header.Set("Livepeer-Payment", payment)
+		r.Header.Set("Livepeer-Segment", segment)
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, r)
+		return w
+	}
+	challenge := func(method, path string) Challenge {
+		w := request(method, path, "", "")
+		require.Equal(t, 402, w.Code, w.Body.String())
+		var challenge Challenge
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &challenge))
+		return challenge
+	}
+	signed := func(challenge Challenge, nonces ...uint32) (string, string) {
+		info, err := engine.ChallengeInfo(challenge.ManifestID)
+		require.NoError(t, err)
+		payment, segment := recipientPayment(t, payerKey, info, nonces...)
+		return base64.StdEncoding.EncodeToString(wire.EncodePayment(payment)), base64.StdEncoding.EncodeToString(wire.EncodeSegData(segment))
+	}
+	live := challenge(http.MethodPost, "/apps/live/session")
+	fixed := challenge(http.MethodGet, "/apps/fixed/app")
+	require.Contains(t, live.PaymentURL, "/apps/live/session/")
+	require.Contains(t, fixed.PaymentURL, "/apps/fixed/session/")
+	livePrice, _, err := engine.ChallengePrice("live", live.ManifestID)
+	require.NoError(t, err)
+	require.EqualValues(t, 10, livePrice)
+	fixedPrice, _, err := engine.ChallengePrice("fixed", fixed.ManifestID)
+	require.NoError(t, err)
+	require.EqualValues(t, 20, fixedPrice)
+	lp, ls := signed(live, 1, 2, 3)
+	w := request(http.MethodGet, "/apps/fixed/app", lp, ls)
+	require.Equal(t, 403, w.Code, w.Body.String())
+	a.Status = "draining"
+	appHeartbeat(t, registry, "owner", owner.HeartbeatSecret, a, b)
+	w = request(http.MethodPost, "/apps/live/session", lp, ls)
+	require.Equal(t, 404, w.Code, w.Body.String())
+	count, err := engine.store.WinningTicketCount(payer, 0)
+	require.NoError(t, err)
+	require.Zero(t, count, "rejected work cannot consume tickets")
+	a.Status = "ready"
+	appHeartbeat(t, registry, "owner", owner.HeartbeatSecret, a, b)
+	// Withdraw after the paid reservation is created but before receipt completes.
+	chain.funds = func(_ context.Context, funds pm.PayerFunds) (pm.PayerFunds, error) {
+		appHeartbeat(t, registry, "owner", owner.HeartbeatSecret, b)
+		return funds, nil
+	}
+	w = request(http.MethodPost, "/apps/live/session", lp, ls)
+	require.Equal(t, 200, w.Code, w.Body.String())
+	chain.funds = nil
+	require.True(t, registry.apps["live"].Removing)
+	ctx, ok := registry.sessionContext("live", live.ManifestID)
+	require.True(t, ok)
+	before, err := engine.Balance(live.ManifestID)
+	require.NoError(t, err)
+	require.NoError(t, engine.Charge(t.Context(), live.ManifestID, time.Now().Add(time.Second)))
+	after, err := engine.Balance(live.ManifestID)
+	require.NoError(t, err)
+	require.Positive(t, before.Cmp(after))
+	fp, fs := signed(fixed, 1, 2, 3)
+	w = request(http.MethodGet, "/apps/fixed/app", fp, fs)
+	require.Equal(t, 200, w.Code, w.Body.String())
+	require.Equal(t, "fixed", w.Body.String())
+	require.NoError(t, ctx.Err())
+	require.Equal(t, "live", registry.sessions[live.ManifestID].ID)
+	require.NotContains(t, registry.sessions, fixed.ManifestID)
+	// Follow-up payment and refresh remain available for the draining live app.
+	refreshBody := mustJSON(t, map[string]string{"sender": payer.Hex(), "manifest_id": live.ManifestID})
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/refresh-payment", bytes.NewReader(refreshBody)))
+	require.Equal(t, 200, w.Code, w.Body.String())
+	next, segment := signed(live, 4, 5, 6)
+	w = request(http.MethodPost, live.PaymentURL, next, segment)
+	require.Equal(t, 200, w.Code, w.Body.String())
+	w = request(http.MethodPost, fixed.PaymentURL, next, segment)
+	require.Equal(t, 404, w.Code, w.Body.String())
+	require.NoError(t, ctx.Err())
+	require.Positive(t, test.MetricSum(t, registry.metrics.Registry, "payment_charge_eth_total", map[string]string{"runner_id": "owner", "app_id": "live"}))
+	require.EqualValues(t, 1, test.MetricSum(t, registry.metrics.Registry, "payment_fixed_charges_total", map[string]string{"runner_id": "owner", "app_id": "fixed"}))
+	registry.ReleaseBySession(live.ManifestID)
+	require.NotContains(t, registry.apps, "live")
+	require.Contains(t, registry.apps, "fixed")
+}
+
+func TestAppIDReuseRejectsPreviousRegistrationQuotes(t *testing.T) {
+	for _, sameOwner := range []bool{false, true} {
+		t.Run(fmt.Sprintf("same-owner=%t", sameOwner), func(t *testing.T) {
+			engine, _, key, _ := newRecipientTestEngine(t)
+			registry, server := reviewServer(t, "http://127.0.0.1:1")
+			defer server.Close()
+			registry.SetWeiPerUSD(big.NewRat(1, 1))
+			server.SetPayment(engine)
+			a := registeredApp("reused")
+			a.PriceInfo = priceInfo{Price: "3600", Currency: "usd", Unit: "hour"}
+			owner := appHeartbeat(t, registry, "old-owner", "bootstrap", a)
+			request := func(payment, segment string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, "/apps/reused/session", nil)
+				req.Header.Set("Livepeer-Payer-Address", crypto.PubkeyToAddress(key.PublicKey).Hex())
+				req.Header.Set("Livepeer-Payment", payment)
+				req.Header.Set("Livepeer-Segment", segment)
+				w := httptest.NewRecorder()
+				server.ServeHTTP(w, req)
+				return w
+			}
+			w := request("", "")
+			require.Equal(t, 402, w.Code, w.Body.String())
+			var old Challenge
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &old))
+			info, err := engine.ChallengeInfo(old.ManifestID)
+			require.NoError(t, err)
+			payment, segment := recipientPayment(t, key, info, 1, 2, 3)
+			encodedPayment := base64.StdEncoding.EncodeToString(wire.EncodePayment(payment))
+			encodedSegment := base64.StdEncoding.EncodeToString(wire.EncodeSegData(segment))
+			pending := httptest.NewRequest(http.MethodPost, "/apps/reused/session", nil)
+			pending.Header.Set("Livepeer-Payment", encodedPayment)
+			pending.Header.Set("Livepeer-Segment", encodedSegment)
+			quote, _, err := server.reservationPrice(pending, "reused")
+			require.NoError(t, err)
+			appHeartbeat(t, registry, "old-owner", owner.HeartbeatSecret)
+			a.App, a.PriceInfo.Price = "replacement", "360000"
+			if sameOwner {
+				appHeartbeat(t, registry, "old-owner", owner.HeartbeatSecret, a)
+			} else {
+				appHeartbeat(t, registry, "new-owner", "bootstrap", a)
+			}
+			// A quote already fetched by a request must be checked again under the admission lock.
+			_, _, _, status, err := registry.reserveWithPrice("reused", old.ManifestID, &quote, "persistent")
+			require.Error(t, err)
+			require.Equal(t, 409, status)
+			w = request(encodedPayment, encodedSegment)
+			require.Equal(t, 409, w.Code, w.Body.String())
+			require.Empty(t, registry.sessions)
+			count, err := engine.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey), 0)
+			require.NoError(t, err)
+			require.Zero(t, count)
+			// A fresh challenge binds the replacement registration and its current quote.
+			w = request("", "")
+			require.Equal(t, 402, w.Code, w.Body.String())
+			var fresh Challenge
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fresh))
+			info, err = engine.ChallengeInfo(fresh.ManifestID)
+			require.NoError(t, err)
+			payment, segment = recipientPayment(t, key, info, 1, 2, 3)
+			w = request(base64.StdEncoding.EncodeToString(wire.EncodePayment(payment)), base64.StdEncoding.EncodeToString(wire.EncodeSegData(segment)))
+			require.Equal(t, 200, w.Code, w.Body.String())
+			actual, _, err := registry.PriceForSession("reused", fresh.ManifestID)
+			require.NoError(t, err)
+			require.Equal(t, "100", actual.Price.String())
+		})
+	}
 }

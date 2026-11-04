@@ -380,7 +380,7 @@ Unit = "fixed"
 	registry := NewRegistry("", "https://public.example", time.Second, time.Minute)
 	registry.SetWeiPerUSD(big.NewRat(1, 1))
 	require.NoError(t, loadStatic(path, registry))
-	runner := registry.runners["r"]
+	runner := registry.apps["r"]
 	require.Equal(t, 204, runner.HealthCode)
 	require.Equal(t, "1.5", runner.USDQuote.Price.String())
 	require.Equal(t, &runnerGPU{ID: "0", Name: "H100", VRAMMB: 80000}, runner.GPU)

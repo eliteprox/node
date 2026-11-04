@@ -10,29 +10,36 @@ See [orchestrator setup](orchestrator.md), [signer setup](signer.md), and
 
 | Method and route | Purpose | Auth / envelope |
 | --- | --- | --- |
-| `POST /runners/heartbeat` | Register or reconcile dynamic runner | `Authorization` bootstrap credential on first call, derived heartbeat credential thereafter; JSON `runner_id`, interval, TTL, optional new credential, `session_ids`, optional `o2r`. |
+| `POST /runners/heartbeat` | Register or reconcile dynamic runner | `Authorization` bootstrap credential on first call, runner-scoped heartbeat credential thereafter; JSON `runner_id`, `version`, and `apps` snapshot; response includes interval, TTL, optional new credential, app reconciliation and `o2r`. |
 | `POST /runners/{runner_id}/unregister` | Remove dynamic runner | Scoped heartbeat credential. |
 | `GET /discovery` | Find available runners | JSON discovery entries with app, URL, mode, capacity and price. |
-| `POST /apps/{runner_id}/session` | Reserve persistent session | JSON `session_id`, `app_url`, `control_url`; paid mode may first return a payment challenge. |
-| `POST /apps/{runner_id}/session/{session_id}/stop` | Stop client session | Session authorization and callback reconciliation. |
-| `POST /apps/{runner_id}/session/{session_id}/payment` | Submit a ticket payment | On-chain only. |
+| `POST /apps/{app_id}/session` | Reserve persistent session | JSON `session_id`, `app_url`, `control_url`; paid mode may first return a payment challenge. |
+| `POST /apps/{app_id}/session/{session_id}/stop` | Stop client session | Session authorization and callback reconciliation. |
+| `POST /apps/{app_id}/session/{session_id}/payment` | Submit a ticket payment | On-chain only. |
 | `POST /refresh-payment` | Refresh ticket parameters for the same payer and manifest | On-chain only; JSON `sender` and `manifest_id`. |
-| `* /apps/{runner_id}/session/{session_id}/app/{app_path...}` | Persistent proxy | Preserve HTTP method, streaming, SSE and WebSocket semantics and Livepeer session headers. |
-| `* /apps/{runner_id}/app/{app_path...}` | Single-shot proxy | Transient capacity-limited reservation; identical session/control headers and cancellation ownership. |
-| `POST /runner/{runner_id}/session/{session_id}/channels` | Create generic trickle channels | Scoped session callback token; JSON `channels`. |
-| `DELETE /runner/{runner_id}/session/{session_id}/channels` | Delete generic trickle channels | Scoped session callback token. |
-| `POST /runner/{runner_id}/session/{session_id}/proxy` | Create session proxy URL | Scoped session callback token; JSON `target_url`; destination policy applies. |
-| `POST /runner/{runner_id}/session/{session_id}/stop` | Runner callback to release session | Scoped session callback token. |
+| `* /apps/{app_id}/session/{session_id}/app/{app_path...}` | Persistent proxy | Preserve HTTP method, streaming, SSE and WebSocket semantics and Livepeer session headers. |
+| `* /apps/{app_id}/app/{app_path...}` | Single-shot proxy | Transient capacity-limited reservation; identical session/control headers and cancellation ownership. |
+| `POST /runner/{app_id}/session/{session_id}/channels` | Create generic trickle channels | Scoped session callback token; JSON `channels`. |
+| `DELETE /runner/{app_id}/session/{session_id}/channels` | Delete generic trickle channels | Scoped session callback token. |
+| `POST /runner/{app_id}/session/{session_id}/proxy` | Create session proxy URL | Scoped session callback token; JSON `target_url`; destination policy applies. |
+| `POST /runner/{app_id}/session/{session_id}/stop` | Runner callback to release session | Scoped session callback token. |
 | `* /ai/trickle/{channel...}` | Generic channel traffic | Use the returned channel URL; see the [Trickle protocol](../trickle/README.md). |
 
-SDK revisions, fixture setup, and compatibility test coverage are documented in
+SDK revisions and fixture setup are documented in
 [development](development.md#sdk-integration-fixtures).
 
-Registration defaults capacity to one and trims/lowercases price units and
-currencies. See [public URLs](orchestrator.md#public-urls-and-tls) for
-`RunnerServiceURL`, and [sessions and proxies](orchestrator.md#sessions-and-proxies)
-for pricing, release behavior, and proxy routes. O2R channels send
-`{"keep":"alive"}` periodically while the runner is registered.
+Each heartbeat supplies a full `apps` snapshot for the owning runner. Each app
+has `id`, `app`, `version`, and `runner_url`, plus `mode`, `proxy`, `capacity`,
+`price_info`, `status`, `metadata`, `gpu`, and `session_ids` as needed. Top-level
+`version` is the runner SDK version; `apps[].version` is the application version.
+Capacity defaults to one; price units and currencies are trimmed and lowercased.
+
+App IDs are unique per node; names may repeat. Omit `id` to generate one, then
+retain the returned ID in later snapshots. Omitted apps finish existing work
+before removal. O2R events use `app_id`.
+See [public URLs](orchestrator.md#public-urls-and-tls) for `RunnerServiceURL`, and
+[sessions and proxies](orchestrator.md#sessions-and-proxies) for pricing, release
+behavior, and proxy routes.
 
 ## Discovery HTTP
 
@@ -49,12 +56,13 @@ with no `address`:
     {"url": "https://orch.example.com:8935", "queried_at": "2026-10-22T18:05:00Z"}
   ]},
   {"address": "https://orch.example.com:8935", "runners": [
-    {"url": "https://orch.example.com:8935/apps/r1/app", "app": "example", "observed_at": "2026-10-22T18:05:00Z"}
+    {"url": "https://orch.example.com:8935/apps/a1/app", "app": "example", "observed_at": "2026-10-22T18:05:00Z"}
   ]}
 ]
 ```
 
-Runner records also carry mode, capacity, prices, and optional metadata/GPU fields.
+Runner records represent ready apps and carry mode, capacity, prices, and optional
+metadata/GPU fields.
 Discovery preserves complete runner records. `nodes` lists successfully queried,
 non-evicted sources, and `queried_at` records each source's last successful query
 time. Empty node and runner lists are omitted. With neither to advertise, discovery

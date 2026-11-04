@@ -136,7 +136,7 @@ func TestRegressionStaticSessionChannelsReleased(t *testing.T) {
 	require.NoError(t, reg.AddStatic(StaticRunner{ID: "static", RunnerURL: "http://127.0.0.1:1", App: "a", Capacity: 1}))
 	sid, _, _, _, err := reg.Reserve("static")
 	require.NoError(t, err)
-	s.newChannel("owned", "events", "application/octet-stream", "static", sid)
+	s.newChannel("owned", "events", "application/octet-stream", "static", "static", sid)
 	reg.ReleaseBySession(sid)
 	require.Empty(t, s.channels, "static runners have no O2R channel, but session channels must still be removed")
 }
@@ -187,7 +187,7 @@ func TestRegressionHourlyUSDMatchesAdvertisedUnit(t *testing.T) {
 func TestRegressionTrickleNextDeliversNextPublishedPart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		_, s := reviewServer(t, "http://127.0.0.1:1")
-		s.newChannel("test", "events", "application/octet-stream", "", "")
+		s.newChannel("test", "events", "application/octet-stream", "", "", "")
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		done := make(chan struct{})
@@ -230,7 +230,7 @@ func (w *reviewStreamingWriter) Flush() {}
 func TestRegressionTrickleStreamsBeforePublisherEOF(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		_, s := reviewServer(t, "http://127.0.0.1:1")
-		s.newChannel("test", "events", "application/octet-stream", "", "")
+		s.newChannel("test", "events", "application/octet-stream", "", "", "")
 		input, writer := io.Pipe()
 		defer writer.Close()
 		ctx, cancel := context.WithCancel(t.Context())

@@ -61,18 +61,18 @@ func NewServer(registry *Registry, runnerPolicy, proxyPolicy destination.Policy,
 	s.mux.HandleFunc("POST /runners/heartbeat", s.heartbeat)
 	s.mux.HandleFunc("POST /runners/{runner_id}/unregister", s.unregister)
 	s.mux.HandleFunc("GET /discovery", s.discovery)
-	s.mux.HandleFunc("POST /apps/{runner_id}/session", s.reserve)
-	s.mux.HandleFunc("POST /apps/{runner_id}/session/{session_id}/stop", s.clientStop)
-	s.mux.HandleFunc("POST /apps/{runner_id}/session/{session_id}/payment", s.sessionPayment)
+	s.mux.HandleFunc("POST /apps/{app_id}/session", s.reserve)
+	s.mux.HandleFunc("POST /apps/{app_id}/session/{session_id}/stop", s.clientStop)
+	s.mux.HandleFunc("POST /apps/{app_id}/session/{session_id}/payment", s.sessionPayment)
 	s.mux.HandleFunc("POST /refresh-payment", s.refreshPayment)
-	s.mux.HandleFunc("POST /runner/{runner_id}/session/{session_id}/stop", s.runnerStop)
-	s.mux.HandleFunc("POST /runner/{runner_id}/session/{session_id}/proxy", s.createProxy)
-	s.mux.HandleFunc("POST /runner/{runner_id}/session/{session_id}/channels", s.createChannels)
-	s.mux.HandleFunc("DELETE /runner/{runner_id}/session/{session_id}/channels", s.deleteChannels)
-	s.mux.HandleFunc("/apps/{runner_id}/session/{session_id}/app", s.proxySession)
-	s.mux.HandleFunc("/apps/{runner_id}/session/{session_id}/app/{app_path...}", s.proxySession)
-	s.mux.HandleFunc("/apps/{runner_id}/app", s.proxySingleShot)
-	s.mux.HandleFunc("/apps/{runner_id}/app/{app_path...}", s.proxySingleShot)
+	s.mux.HandleFunc("POST /runner/{app_id}/session/{session_id}/stop", s.runnerStop)
+	s.mux.HandleFunc("POST /runner/{app_id}/session/{session_id}/proxy", s.createProxy)
+	s.mux.HandleFunc("POST /runner/{app_id}/session/{session_id}/channels", s.createChannels)
+	s.mux.HandleFunc("DELETE /runner/{app_id}/session/{session_id}/channels", s.deleteChannels)
+	s.mux.HandleFunc("/apps/{app_id}/session/{session_id}/app", s.proxySession)
+	s.mux.HandleFunc("/apps/{app_id}/session/{session_id}/app/{app_path...}", s.proxySession)
+	s.mux.HandleFunc("/apps/{app_id}/app", s.proxySingleShot)
+	s.mux.HandleFunc("/apps/{app_id}/app/{app_path...}", s.proxySingleShot)
 	s.mux.HandleFunc("/proxy/{proxy_id}", s.proxyGenerated)
 	s.mux.HandleFunc("/proxy/{proxy_id}/{app_path...}", s.proxyGenerated)
 	s.mux.HandleFunc("/run/{proxy_id}", s.proxyGenerated)
@@ -179,6 +179,7 @@ func (s *Server) SetPayment(engine *PaymentEngine) {
 	s.payment = engine
 	if engine != nil {
 		engine.metrics, engine.identity = s.registry.metrics, s.registry.identity
+		engine.registration = s.registry.appRegistration
 		engine.store.logger = s.logger
 		if engine.store.metrics == nil {
 			engine.store.metrics = s.registry.metrics
@@ -242,23 +243,25 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		fail(w, status, err.Error())
 		return
 	}
-	if resp.HeartbeatSecret != "" {
-		id, err := randomIDWithPrefix(resp.RunnerID+"-", 10)
-		if err != nil {
-			fail(w, http.StatusInternalServerError, "runner channel creation failed")
-			return
-		}
-		id += "-o2r"
+	if resp.HeartbeatSecret != "" || req.Apps != nil {
 		s.registry.mu.Lock()
 		current := s.registry.runners[resp.RunnerID]
-		if s.registry.closed || current == nil || current.Credential != resp.HeartbeatSecret {
+		credential := r.Header.Get("Authorization")
+		if resp.HeartbeatSecret != "" {
+			credential = resp.HeartbeatSecret
+		}
+		if s.registry.closed || current == nil || !equalSecret(current.Credential, credential) {
 			s.registry.mu.Unlock()
 			fail(w, 503, "runner registration expired")
 			return
 		}
 		s.mu.Lock()
-		s.newChannel(id, "o2r", "application/json", resp.RunnerID, "").identity = runnerIdentity(resp.RunnerID, current)
-		s.o2r[resp.RunnerID] = id
+		id := s.o2r[resp.RunnerID]
+		if s.channels[id] == nil {
+			id = resp.RunnerID + "-" + randomID(10) + "-o2r"
+			s.newChannel(id, "o2r", "application/json", resp.RunnerID, "", "").identity = observability.Identity{Runner: current.ID}
+			s.o2r[resp.RunnerID] = id
+		}
 		s.mu.Unlock()
 		s.registry.mu.Unlock()
 		address := s.registry.runnerServiceURL() + "/ai/trickle/" + id
@@ -267,7 +270,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, resp)
 }
 
-func (s *Server) emitSessionEvent(runnerID, event, sid, token string) {
+func (s *Server) emitSessionEvent(runnerID, appID, event, sid, token string) {
 	if event == "expired" || event == "unregistered" {
 		s.mu.Lock()
 		for id, ch := range s.channels {
@@ -285,6 +288,7 @@ func (s *Server) emitSessionEvent(runnerID, event, sid, token string) {
 	}
 	data, err := json.Marshal(filterEmpty(map[string]string{
 		"event":         event,
+		"app_id":        appID,
 		"session":       sid,
 		"session_token": token,
 		"timestamp":     time.Now().UTC().Format(time.RFC3339Nano),
@@ -297,7 +301,7 @@ func (s *Server) emitSessionEvent(runnerID, event, sid, token string) {
 	s.publishSessionEvent(s.o2r[runnerID], data)
 	if event == "released" {
 		for id, owned := range s.channels {
-			if owned.runnerID == runnerID && owned.sessionID == sid {
+			if owned.appID == appID && owned.sessionID == sid {
 				s.closeChannel(id)
 			}
 		}
@@ -323,7 +327,7 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 	if s.reservePaid(w, r) {
 		return
 	}
-	id, appURL, controlURL, status, err := s.registry.Reserve(r.PathValue("runner_id"))
+	id, appURL, controlURL, status, err := s.registry.Reserve(r.PathValue("app_id"))
 	if err != nil {
 		failReservation(w, r, status, err)
 		return
@@ -332,7 +336,7 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) clientStop(w http.ResponseWriter, r *http.Request) {
-	status, err := s.registry.release(r.PathValue("runner_id"), r.PathValue("session_id"), "", false)
+	status, err := s.registry.release(r.PathValue("app_id"), r.PathValue("session_id"), "", false)
 	if err != nil {
 		fail(w, status, err.Error())
 		return
@@ -341,7 +345,7 @@ func (s *Server) clientStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runnerStop(w http.ResponseWriter, r *http.Request) {
-	status, err := s.registry.release(r.PathValue("runner_id"), r.PathValue("session_id"), r.Header.Get("Livepeer-Session-Token"), true)
+	status, err := s.registry.release(r.PathValue("app_id"), r.PathValue("session_id"), r.Header.Get("Livepeer-Session-Token"), true)
 	if err != nil {
 		fail(w, status, err.Error())
 		return
@@ -350,7 +354,7 @@ func (s *Server) runnerStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) callbackAuthorized(r *http.Request) bool {
-	return s.registry.validSessionToken(r.PathValue("runner_id"), r.PathValue("session_id"), r.Header.Get("Livepeer-Session-Token"))
+	return s.registry.validSessionToken(r.PathValue("app_id"), r.PathValue("session_id"), r.Header.Get("Livepeer-Session-Token"))
 }
 
 func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
@@ -368,7 +372,7 @@ func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
 	var target *url.URL
 	var err error
 	if body.TargetURL == "" {
-		target, _, _, err = s.registry.sessionTarget(r.PathValue("runner_id"), r.PathValue("session_id"))
+		target, _, _, err = s.registry.sessionTarget(r.PathValue("app_id"), r.PathValue("session_id"))
 	} else {
 		target, err = destination.ParseURL(body.TargetURL)
 	}
@@ -376,7 +380,7 @@ func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	id, err := s.registry.addProxy(r.PathValue("runner_id"), r.PathValue("session_id"), r.Header.Get("Livepeer-Session-Token"), target)
+	id, err := s.registry.addProxy(r.PathValue("app_id"), r.PathValue("session_id"), r.Header.Get("Livepeer-Session-Token"), target)
 	if err != nil {
 		status := http.StatusForbidden
 		if errors.Is(err, errInvalidSessionToken) {
@@ -389,69 +393,65 @@ func (s *Server) createProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) proxySession(w http.ResponseWriter, r *http.Request) {
-	observability.App(r, s.registry.identity(r.PathValue("runner_id"), r.PathValue("session_id")))
-	target, token, status, err := s.registry.sessionTarget(r.PathValue("runner_id"), r.PathValue("session_id"))
+	observability.App(r, s.registry.identity(r.PathValue("app_id"), r.PathValue("session_id")))
+	target, token, status, err := s.registry.sessionTarget(r.PathValue("app_id"), r.PathValue("session_id"))
 	if err != nil {
 		fail(w, status, err.Error())
 		return
 	}
-	control := s.registry.runnerServiceURL() + "/runner/" + url.PathEscape(r.PathValue("runner_id")) + "/session/" + url.PathEscape(r.PathValue("session_id"))
-	s.proxy(w, r, s.runnerTransport, target, r.PathValue("app_path"), r.PathValue("runner_id"), r.PathValue("session_id"), token, control)
+	control := s.registry.runnerServiceURL() + "/runner/" + url.PathEscape(r.PathValue("app_id")) + "/session/" + url.PathEscape(r.PathValue("session_id"))
+	s.proxy(w, r, s.runnerTransport, target, r.PathValue("app_path"), r.PathValue("app_id"), r.PathValue("session_id"), token, control)
 }
 
 func (s *Server) proxySingleShot(w http.ResponseWriter, r *http.Request) {
-	observability.App(r, s.registry.identity(r.PathValue("runner_id"), ""))
+	observability.App(r, s.registry.identity(r.PathValue("app_id"), ""))
 	if s.proxyPaidSingleShot(w, r) {
 		return
 	}
-	runnerID := r.PathValue("runner_id")
-	id, err := randomIDWithPrefix("session_", 10)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, "session creation failed")
-		return
-	}
-	id, _, _, status, err := s.registry.ReserveWithID(runnerID, id)
+	appID := r.PathValue("app_id")
+	id, _, _, status, err := s.registry.reserveWithPrice(appID, "session_"+randomID(10), nil, "single-shot")
 	if err != nil {
 		failReservation(w, r, status, err)
 		return
 	}
 	defer s.registry.ReleaseBySession(id, "completed")
-	target, token, status, err := s.registry.sessionTarget(runnerID, id)
+	target, token, status, err := s.registry.sessionTarget(appID, id)
 	if err != nil {
 		fail(w, status, err.Error())
 		return
 	}
-	control := s.registry.runnerServiceURL() + "/runner/" + url.PathEscape(runnerID) + "/session/" + id
-	s.proxy(w, r, s.runnerTransport, target, r.PathValue("app_path"), runnerID, id, token, control)
+	control := s.registry.runnerServiceURL() + "/runner/" + url.PathEscape(appID) + "/session/" + id
+	s.proxy(w, r, s.runnerTransport, target, r.PathValue("app_path"), appID, id, token, control)
 }
 
 func (s *Server) proxyGenerated(w http.ResponseWriter, r *http.Request) {
 	if s.registry.singleShotProxy(r.PathValue("proxy_id")) {
-		r.SetPathValue("runner_id", r.PathValue("proxy_id"))
+		r.SetPathValue("app_id", r.PathValue("proxy_id"))
 		s.proxySingleShot(w, r)
 		return
 	}
-	target, runnerID, sid, token, ok := s.registry.proxyTarget(r.PathValue("proxy_id"))
+	target, appID, sid, token, ok := s.registry.proxyTarget(r.PathValue("proxy_id"))
 	if !ok {
 		fail(w, http.StatusNotFound, "proxy not found")
 		return
 	}
-	observability.App(r, s.registry.identity(runnerID, sid))
-	control := s.registry.runnerServiceURL() + "/runner/" + url.PathEscape(runnerID) + "/session/" + url.PathEscape(sid)
+	observability.App(r, s.registry.identity(appID, sid))
+	control := s.registry.runnerServiceURL() + "/runner/" + url.PathEscape(appID) + "/session/" + url.PathEscape(sid)
 	transport := s.proxyTransport
 	if target.runner {
 		transport = s.runnerTransport
 	}
-	s.proxy(w, r, transport, target.target, r.PathValue("app_path"), runnerID, sid, token, control)
+	s.proxy(w, r, transport, target.target, r.PathValue("app_path"), appID, sid, token, control)
 }
 
-func (s *Server) proxy(w http.ResponseWriter, r *http.Request, transport http.RoundTripper, target *url.URL, appPath, runnerID, sid, token, control string) {
+func (s *Server) proxy(w http.ResponseWriter, r *http.Request, transport http.RoundTripper, target *url.URL, appPath, appID, sid, token, control string) {
 	kind := "runner"
 	if transport == s.proxyTransport {
 		kind = "session_proxy"
 	}
-	transport = upstreamObserver{transport, s.registry.metrics, s.registry.identity(runnerID, sid), kind}
-	sessionCtx, ok := s.registry.sessionContext(runnerID, sid)
+	identity := s.registry.identity(appID, sid)
+	transport = upstreamObserver{transport, s.registry.metrics, identity, kind}
+	sessionCtx, ok := s.registry.sessionContext(appID, sid)
 	if !ok || sessionCtx.Err() != nil {
 		fail(w, http.StatusNotFound, "session not found")
 		return
@@ -480,12 +480,12 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, transport http.Ro
 		}
 	}()
 	proxy := &httputil.ReverseProxy{
-		ErrorLog:      log.New(proxyLog{s.logger.With("runner_id", runnerID, "session_id", sid)}, "", 0),
+		ErrorLog:      log.New(proxyLog{s.logger.With("runner_id", identity.Runner, "app_id", appID, "session_id", sid)}, "", 0),
 		Transport:     transport,
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			observability.Outcome(r, "transport_error")
-			s.logger.Warn("runner proxy failed", "event", "proxy_failed", "operation", "proxy", "outcome", "error", "runner_id", runnerID, "session_id", sid, "error_kind", "upstream_failure")
+			s.logger.Warn("runner proxy failed", "event", "proxy_failed", "operation", "proxy", "outcome", "error", "runner_id", identity.Runner, "app_id", appID, "session_id", sid, "error_kind", "upstream_failure")
 			fail(w, http.StatusBadGateway, "runner destination unavailable")
 		},
 		Rewrite: func(req *httputil.ProxyRequest) {
@@ -502,7 +502,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, transport http.Ro
 			req.Out.URL.RawPath = ""
 			req.Out.URL.RawQuery = u.RawQuery
 			req.SetXForwarded()
-			req.Out.Header.Set("Livepeer-Runner-Route", runnerID)
+			req.Out.Header.Set("Livepeer-Runner-Route", appID)
 			req.Out.Header.Set("Livepeer-Session-Id", sid)
 			req.Out.Header.Set("Livepeer-Session-Token", token)
 			req.Out.Header.Set("Livepeer-Session-Control", control)
@@ -534,12 +534,12 @@ func (s *Server) createChannels(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "invalid channels request")
 		return
 	}
-	ctx, ok := s.registry.sessionContext(r.PathValue("runner_id"), r.PathValue("session_id"))
+	ctx, ok := s.registry.sessionContext(r.PathValue("app_id"), r.PathValue("session_id"))
 	if !ok {
 		fail(w, http.StatusNotFound, "session not found")
 		return
 	}
-	identity := s.registry.identity(r.PathValue("runner_id"), r.PathValue("session_id"))
+	identity := s.registry.identity(r.PathValue("app_id"), r.PathValue("session_id"))
 	for _, item := range body.Channels {
 		if item.Name == "" {
 			fail(w, http.StatusBadRequest, "channel name required")
@@ -556,18 +556,14 @@ func (s *Server) createChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	existing := map[string]string{}
 	for id, ch := range s.channels {
-		if ch.runnerID == r.PathValue("runner_id") && ch.sessionID == r.PathValue("session_id") {
+		if ch.appID == r.PathValue("app_id") && ch.sessionID == r.PathValue("session_id") {
 			existing[ch.name] = id
 		}
 	}
 	missing := map[string]string{}
 	for _, item := range body.Channels {
 		if existing[item.Name] == "" && missing[item.Name] == "" {
-			id, err := randomIDWithPrefix("channel_", 10)
-			if err != nil {
-				fail(w, http.StatusInternalServerError, "channel creation failed")
-				return
-			}
+			id := "channel_" + randomID(10)
 			if validRouteID(item.Name) {
 				id += "-" + item.Name
 			}
@@ -587,7 +583,7 @@ func (s *Server) createChannels(w http.ResponseWriter, r *http.Request) {
 			if item.MimeType == "" {
 				item.MimeType = "application/octet-stream"
 			}
-			s.newChannel(id, item.Name, item.MimeType, r.PathValue("runner_id"), r.PathValue("session_id")).identity = identity
+			s.newChannel(id, item.Name, item.MimeType, identity.Runner, r.PathValue("app_id"), r.PathValue("session_id")).identity = identity
 			existing[item.Name] = id
 		}
 		ch := s.channels[id]
@@ -613,7 +609,7 @@ func (s *Server) deleteChannels(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	for _, name := range body.Channels {
 		for id, ch := range s.channels {
-			if ch.runnerID == r.PathValue("runner_id") && ch.sessionID == r.PathValue("session_id") && (id == name || ch.name == name) {
+			if ch.appID == r.PathValue("app_id") && ch.sessionID == r.PathValue("session_id") && (id == name || ch.name == name) {
 				s.closeChannel(id)
 				deleted = append(deleted, name)
 			}

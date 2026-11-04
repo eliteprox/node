@@ -182,7 +182,7 @@ func TestReleaseCancelsActiveProxy(t *testing.T) {
 						reason, outcome = "runner_expired", "transport_error"
 					case "health":
 						registry.mu.Lock()
-						registry.runners["runner"].HealthURL = upstream.URL + "/healthz"
+						registry.apps["runner"].HealthURL = upstream.URL + "/healthz"
 						registry.mu.Unlock()
 						health := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 							return &http.Response{StatusCode: 503, Body: http.NoBody}, nil
@@ -273,9 +273,9 @@ func TestHealthFailureAndExhaustionCleanUpSession(t *testing.T) {
 			require.NoError(t, err)
 			ctx, ok := reg.sessionContext("r", sid)
 			require.True(t, ok)
-			app.newChannel("owned", "events", "application/octet-stream", "r", sid)
+			app.newChannel("owned", "events", "application/octet-stream", "r", "r", sid)
 			if reason == "health" {
-				reg.runners["r"].HealthURL = "http://health.example/healthz"
+				reg.apps["r"].HealthURL = "http://health.example/healthz"
 				health := &http.Client{}
 				for _, code := range []int{503, 503, 200, 503, 503} {
 					health.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -305,5 +305,117 @@ func TestHealthFailureAndExhaustionCleanUpSession(t *testing.T) {
 			_, sessions := reg.Counts()
 			require.Zero(t, sessions)
 		})
+	}
+}
+
+func TestMultiAppRemovalKeepsStreams(t *testing.T) {
+	for _, mode := range []string{"persistent", "single-shot"} {
+		for _, protocol := range []string{"http", "sse", "websocket"} {
+			t.Run(mode+"/"+protocol, func(t *testing.T) {
+				started := make(chan string, 1)
+				finish := make(chan struct{})
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					started <- r.Header.Get("Livepeer-Session-Id")
+					if protocol == "websocket" {
+						conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+						if err != nil {
+							return
+						}
+						defer conn.Close()
+						kind, data, err := conn.ReadMessage()
+						if err == nil {
+							_ = conn.WriteMessage(kind, data)
+						}
+						return
+					}
+					if protocol == "sse" {
+						w.Header().Set("Content-Type", "text/event-stream")
+					}
+					_, _ = io.WriteString(w, "started\n")
+					w.(http.Flusher).Flush()
+					select {
+					case <-finish:
+						_, _ = io.WriteString(w, "finished\n")
+					case <-r.Context().Done():
+					}
+				}))
+				defer upstream.Close()
+				registry, appServer := reviewServer(t, upstream.URL)
+				server := httptest.NewServer(appServer)
+				defer server.Close()
+				defer appServer.Close()
+				a, b := registeredApp("a"), registeredApp("b")
+				a.RunnerURL, a.Mode = upstream.URL, mode
+				owner := appHeartbeat(t, registry, "owner", "bootstrap", a, b)
+				path := "/apps/a/app"
+				if mode == "persistent" {
+					sid, _, _, _, err := registry.Reserve("a")
+					require.NoError(t, err)
+					path = "/apps/a/session/" + sid + "/app"
+				}
+				var conn *websocket.Conn
+				var response *http.Response
+				var err error
+				if protocol == "websocket" {
+					conn, _, err = websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path, nil)
+					require.NoError(t, err)
+					defer conn.Close()
+					require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+				} else {
+					response, err = server.Client().Get(server.URL + path)
+					require.NoError(t, err)
+					defer response.Body.Close()
+					require.Equal(t, 200, response.StatusCode)
+				}
+				var sid string
+				select {
+				case sid = <-started:
+				case <-time.After(3 * time.Second):
+					t.Fatal("upstream did not start")
+				}
+				ctx, ok := registry.sessionContext("a", sid)
+				require.True(t, ok)
+				a.Status = "draining"
+				appHeartbeat(t, registry, "owner", owner.HeartbeatSecret, a, b)
+				_, _, _, _, err = registry.Reserve("a")
+				require.Error(t, err)
+				appHeartbeat(t, registry, "owner", owner.HeartbeatSecret, b)
+				require.NoError(t, ctx.Err())
+				_, _, _, _, err = registry.Reserve("b")
+				require.NoError(t, err, "sibling admission continues")
+				require.Len(t, registry.Discovery()[0].Runners, 1)
+				if mode == "single-shot" {
+					rejected, err := server.Client().Get(server.URL + "/apps/a/app")
+					require.NoError(t, err)
+					require.Equal(t, 404, rejected.StatusCode)
+					require.NoError(t, rejected.Body.Close())
+				}
+				if protocol == "websocket" {
+					require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte("still connected")))
+					_, data, err := conn.ReadMessage()
+					require.NoError(t, err)
+					require.Equal(t, "still connected", string(data))
+					require.NoError(t, conn.Close())
+				} else {
+					close(finish)
+					body, err := io.ReadAll(response.Body)
+					require.NoError(t, err)
+					require.Equal(t, "started\nfinished\n", string(body))
+				}
+				if mode == "persistent" {
+					require.NoError(t, ctx.Err(), "request completion does not release a persistent reservation")
+					registry.ReleaseBySession(sid)
+				}
+				require.Eventually(t, func() bool {
+					registry.mu.Lock()
+					defer registry.mu.Unlock()
+					return registry.apps["a"] == nil
+				}, 3*time.Second, time.Millisecond)
+				require.ErrorIs(t, ctx.Err(), context.Canceled)
+				registry.mu.Lock()
+				require.Contains(t, registry.apps, "b")
+				registry.mu.Unlock()
+			})
+		}
 	}
 }

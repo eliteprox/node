@@ -56,7 +56,7 @@ func TestTrickleActiveStreamAndCancellation(t *testing.T) {
 				require.NoError(t, reg.AddStatic(StaticRunner{ID: "r", RunnerURL: "http://127.0.0.1:1", App: "test"}))
 				sid, _, _, _, err := reg.Reserve("r")
 				require.NoError(t, err)
-				s.newChannel("test", "events", "application/octet-stream", "r", sid).identity = reg.identity("r", sid)
+				s.newChannel("test", "events", "application/octet-stream", "r", "r", sid).identity = reg.identity("r", sid)
 				input, writer := io.Pipe()
 				defer writer.Close()
 				pubDone, subDone := make(chan struct{}), make(chan struct{})
@@ -117,16 +117,11 @@ func TestTrickleOwnershipSurvivesHeartbeatChanges(t *testing.T) {
 	defer upstream.Close()
 	reg, s := reviewServer(t, upstream.URL)
 	defer s.Close()
-	request := httptest.NewRequest("POST", "/runners/heartbeat", strings.NewReader(`{"runner_id":"r","runner_url":"http://127.0.0.1:1","app":"original","capacity":1}`))
-	request.Header.Set("Authorization", "bootstrap")
-	response := httptest.NewRecorder()
-	s.ServeHTTP(response, request)
+	response := heartbeatHTTP(t, s, map[string]any{"runner_id": "r", "runner_url": "http://127.0.0.1:1", "app": "original", "capacity": 1}, "bootstrap")
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	var registered heartbeatResponse
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &registered))
 	require.NotNil(t, registered.O2R)
-	require.Len(t, test.MetricSamples(t, reg.metrics.Registry, "runner_sessions", map[string]string{"runner_id": "r", "state": "active"}), 1)
-	require.Zero(t, test.MetricSum(t, reg.metrics.Registry, "runner_sessions", map[string]string{"runner_id": "r"}))
 	s.mu.Lock()
 	s.publishSessionEvent(registered.O2R.ChannelName, []byte("ownership"))
 	s.mu.Unlock()
@@ -136,7 +131,7 @@ func TestTrickleOwnershipSurvivesHeartbeatChanges(t *testing.T) {
 	s.ServeHTTP(response, httptest.NewRequest("GET", registered.O2R.URL+"/0", nil))
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	require.Equal(t, "ownership", response.Body.String())
-	require.EqualValues(t, len("ownership"), test.MetricSum(t, reg.metrics.Registry, "stream_transfer_bytes_total", map[string]string{"app": "original", "direction": "out"}))
+	require.EqualValues(t, len("ownership"), test.MetricSum(t, reg.metrics.Registry, "stream_transfer_bytes_total", map[string]string{"runner_id": "r", "app_id": "", "app": "", "direction": "out"}))
 	require.Zero(t, test.MetricSum(t, reg.metrics.Registry, "stream_transfer_bytes_total", map[string]string{"app": "updated"}))
 	reg.proxyTemplate = "https://{proxy}.apps.example"
 	require.NoError(t, reg.AddStatic(StaticRunner{ID: "proxy", App: "generated", Mode: "single-shot", RunnerURL: upstream.URL, Capacity: 1, Proxy: true}))
@@ -145,9 +140,7 @@ func TestTrickleOwnershipSurvivesHeartbeatChanges(t *testing.T) {
 	require.Equal(t, 200, response.Code, response.Body.String())
 	require.Equal(t, "proxy reply", response.Body.String())
 	require.EqualValues(t, 1, test.MetricSum(t, reg.metrics.Registry, "app_calls_total", map[string]string{"app": "generated", "protocol": "http"}))
-	for _, app := range []string{"generated", "original"} {
-		require.Zero(t, test.MetricSum(t, reg.metrics.Registry, "app_calls_in_flight", map[string]string{"app": app}))
-	}
+	require.Zero(t, test.MetricSum(t, reg.metrics.Registry, "app_calls_in_flight", nil))
 	_, err = reg.Unregister("r", registered.HeartbeatSecret)
 	for _, name := range []string{"runner_registered", "runner_sessions", "runner_capacity_available"} {
 		require.Empty(t, test.MetricSamples(t, reg.metrics.Registry, name, map[string]string{"runner_id": "r"}))
@@ -189,7 +182,7 @@ func TestNamedChannelsAreIdempotentAndReleased(t *testing.T) {
 func TestTrickleLargeSegmentDelivered(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		_, s := reviewServer(t, "http://127.0.0.1:1")
-		s.newChannel("large", "events", "application/octet-stream", "", "")
+		s.newChannel("large", "events", "application/octet-stream", "", "", "")
 		input, writer := io.Pipe()
 		defer writer.Close()
 		pub, sub := httptest.NewRecorder(), httptest.NewRecorder()

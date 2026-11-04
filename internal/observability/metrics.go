@@ -38,10 +38,10 @@ func (l Labels) With(key, value string) Labels {
 	return copy
 }
 
-type Identity struct{ App, Runner, Mode string }
+type Identity struct{ App, AppID, Runner, Mode string }
 
 func (i Identity) Labels() Labels {
-	return Labels{"app": i.App, "runner_id": i.Runner, "mode": i.Mode}
+	return Labels{"app": i.App, "app_id": i.AppID, "runner_id": i.Runner, "mode": i.Mode}
 }
 
 // Metrics owns a registry; services and tests never share global collectors.

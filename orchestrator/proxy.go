@@ -63,7 +63,7 @@ func (r *Registry) matchProxy(req *http.Request) (string, string) {
 	return "", ""
 }
 
-func (r *Registry) discoveryURL(id string, item *runner) string {
+func (r *Registry) discoveryURL(id string, item *app) string {
 	if item.Proxy && item.Mode == "single-shot" {
 		return r.proxyURL(id)
 	}
@@ -73,22 +73,22 @@ func (r *Registry) discoveryURL(id string, item *runner) string {
 func (r *Registry) singleShotProxy(id string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	item := r.apps[id]
 	return item != nil && item.Proxy && item.Mode == "single-shot"
 }
 
-// Single-shot discovery uses the runner ID as the proxy hostname label.
-func (r *Registry) validateProxyRunner(req heartbeatRequest) error {
-	if !req.Proxy || req.Mode != "single-shot" || req.RunnerID == "" || r.proxyTemplate == "" {
+// Single-shot discovery uses the app ID as the proxy hostname label.
+func (r *Registry) validateProxyApp(req appRequest) error {
+	if !req.Proxy || req.Mode != "single-shot" || r.proxyTemplate == "" {
 		return nil
 	}
 	u, _ := url.Parse(strings.Replace(r.proxyTemplate, "{proxy}", proxyMarker, 1))
 	if !strings.Contains(u.Host, proxyMarker) {
 		return nil
 	}
-	id := req.RunnerID
+	id := req.ID
 	if len(id) > 63 || strings.HasPrefix(id, "-") || strings.HasSuffix(id, "-") || strings.ContainsAny(id, "_ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
-		return errors.New("single-shot domain proxy requires a lowercase DNS-label runner ID of at most 63 characters")
+		return errors.New("single-shot domain proxy requires a lowercase DNS-label app ID of at most 63 characters")
 	}
 	return nil
 }

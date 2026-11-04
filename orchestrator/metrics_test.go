@@ -174,12 +174,12 @@ func TestApplicationMetricsAndInventory(t *testing.T) {
 	require.EqualValues(t, 3, test.MetricSum(t, registry.metrics.Registry, "upstream_requests_total", nil))
 	// An application change affects new sessions, never an existing identity.
 	registry.mu.Lock()
-	registry.runners["runner"].Mode = "persistent"
+	registry.apps["runner"].Mode = "persistent"
 	registry.mu.Unlock()
 	sid, _, _, _, err := registry.Reserve("runner")
 	require.NoError(t, err)
 	registry.mu.Lock()
-	registry.runners["runner"].App = "new-model"
+	registry.apps["runner"].App = "new-model"
 	registry.mu.Unlock()
 	require.Equal(t, "model", registry.identity("runner", sid).App)
 	registry.ReleaseBySession(sid)

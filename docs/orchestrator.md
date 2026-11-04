@@ -75,23 +75,24 @@ its HTTPS address. The separate metrics listener must remain on loopback; see
 
 ## Sessions and proxies
 
-Each session keeps its reserved price and paid status; heartbeat and exchange-rate
-updates affect new sessions. Releasing a session immediately frees capacity,
-revokes its token, and removes its channels and proxies.
+Each session keeps its reserved endpoint, app/mode settings, price, and paid status;
+heartbeat and exchange-rate updates affect new sessions. Releasing a session
+immediately frees capacity, revokes its token, and removes its channels and proxies.
 A runner stop gives in-flight HTTP, SSE, and WebSocket requests up to one second
 to finish; all other releases cancel them immediately. This applies to both
 persistent and single-shot sessions.
 
-Enabling a runner's proxy creates an automatic proxy. Without a URL
-template, generated URLs use `ServiceURL/run/{proxy}`. The earlier
+Enabling an app's proxy creates an automatic proxy belonging to that app; use its
+returned proxy ID and URL. Without a URL template, generated URLs use
+`ServiceURL/run/{proxy}`. The earlier
 `/proxy/{proxy}` path remains an alias for active proxies. A runner can also
 create a session proxy through its callback route with a `target_url`.
 
 `ProxyURLTemplate` accepts a hostname label or final path segment, for example
 `https://{proxy}.apps.example` or `https://apps.example/proxy/{proxy}`. Configure
 DNS, TLS, and forwarding to this listener for those URLs. Hostname routing uses
-the actual Host header. Single-shot domain proxies require a runner ID that is
-a lowercase DNS label of at most 63 characters.
+the actual Host header. Single-shot domain proxies require an app registration ID
+that is a lowercase DNS label of at most 63 characters.
 
 ## Enable payments
 
@@ -137,7 +138,8 @@ Paid `/readyz` returns 503 until payment dependencies and the redemption worker
 are ready. See [metrics and operational events](metrics.md) for requirements,
 app/runner measurements, queue monitoring, and scrape/query examples.
 
-The registry accepts up to 256 runners and 10,000 sessions, with 25 generated
+The registry accepts up to 256 runners, 128 retained apps per runner, 512 apps
+globally (including draining apps), and 10,000 sessions, with 25 generated
 proxies per session. Control requests have 64 admission slots and a five-second
 body deadline. Streaming requests have 256 separate slots.
 

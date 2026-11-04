@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -58,8 +59,8 @@ func (g *runnerGPU) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type heartbeatRequest struct {
-	RunnerID   string     `json:"runner_id"`
+type appRequest struct {
+	ID         string     `json:"id,omitempty"`
 	RunnerURL  string     `json:"runner_url"`
 	Version    string     `json:"version"`
 	Metadata   string     `json:"metadata"`
@@ -73,14 +74,70 @@ type heartbeatRequest struct {
 	SessionIDs []string   `json:"session_ids"`
 }
 
+type appResponse struct {
+	ID         string   `json:"id"`
+	Status     string   `json:"status"`
+	SessionIDs []string `json:"session_ids"`
+}
+
+type heartbeatRequest struct {
+	Apps       []appRequest `json:"apps,omitzero"`
+	RunnerID   string       `json:"runner_id"`
+	RunnerURL  string       `json:"runner_url"`
+	Version    string       `json:"version"`
+	Metadata   string       `json:"metadata"`
+	GPU        *runnerGPU   `json:"gpu,omitempty"`
+	Status     string       `json:"status"`
+	Mode       string       `json:"mode"`
+	Proxy      bool         `json:"proxy"`
+	App        string       `json:"app"`
+	Capacity   int          `json:"capacity"`
+	PriceInfo  priceInfo    `json:"price_info"`
+	SessionIDs []string     `json:"session_ids"`
+}
+
 type heartbeatResponse struct {
 	RunnerID          string          `json:"runner_id"`
 	Orchestrator      string          `json:"orchestrator,omitempty"`
 	HeartbeatInterval string          `json:"heartbeat_interval"`
 	HeartbeatTTL      string          `json:"heartbeat_ttl"`
 	HeartbeatSecret   string          `json:"heartbeat_secret,omitempty"`
-	SessionIDs        []string        `json:"session_ids"`
+	SessionIDs        []string        `json:"session_ids,omitzero"`
+	Apps              []appResponse   `json:"apps,omitzero"`
 	O2R               *trickleChannel `json:"o2r,omitempty"`
+}
+
+// Presence matters: even null or zero-valued legacy fields conflict with apps.
+func (req *heartbeatRequest) UnmarshalJSON(data []byte) error {
+	type plain heartbeatRequest
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	normalized := make(map[string]json.RawMessage, len(fields))
+	for key, raw := range fields {
+		normalized[strings.ToLower(key)] = raw
+	}
+	if raw, exists := normalized["apps"]; exists {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return errors.New("apps must be an array")
+		}
+		for _, field := range []string{"app", "runner_url", "mode", "proxy", "capacity", "price_info", "status", "metadata", "gpu", "session_ids"} {
+			if _, exists := normalized[field]; exists {
+				return fmt.Errorf("apps cannot be mixed with %s", field)
+			}
+		}
+	}
+	*req = heartbeatRequest(value)
+	return nil
+}
+
+func (req heartbeatRequest) scalarApp() appRequest {
+	return appRequest{ID: req.RunnerID, RunnerURL: req.RunnerURL, Version: req.Version, Metadata: req.Metadata, GPU: req.GPU, Status: req.Status, Mode: req.Mode, Proxy: req.Proxy, App: req.App, Capacity: req.Capacity, PriceInfo: req.PriceInfo, SessionIDs: req.SessionIDs}
 }
 
 type trickleChannel struct {
@@ -91,23 +148,32 @@ type trickleChannel struct {
 	MimeType    string `json:"mime_type"`
 }
 
+// runner is the authenticated owner of one or more app registrations.
 type runner struct {
-	USDQuote   priceInfo
-	PriceError bool
-	heartbeatRequest
-	Credential string
-	Last       time.Time
-	Static     bool
-	Healthy    bool
-	HealthURL  string
-	HealthCode int
-	Sessions   map[string]*session
+	ID, Version, Credential string
+	Last                    time.Time
+	Static                  bool
+	Apps                    map[string]*app
+}
 
-	healthFailures int
+// appLifetime distinguishes registration instances without retaining their state.
+type appLifetime struct{ _ byte }
+
+type app struct {
+	lifetime *appLifetime
+	appRequest
+	owner                         *runner
+	USDQuote                      priceInfo
+	PriceError, Removing, Healthy bool
+	HealthURL                     string
+	HealthCode                    int
+	Sessions                      map[string]*session
+	healthFailures                int
 }
 
 type session struct {
 	identity  observability.Identity
+	target    *url.URL
 	pending   bool
 	ID        string
 	Token     string
@@ -146,22 +212,29 @@ type Registry struct {
 	server        *Server
 	mu            sync.Mutex
 	runners       map[string]*runner
+	apps          map[string]*app
+	sessions      map[string]*app
+	proxies       map[string]*session
 	secret        string
 	service       string
 	runnerService string
 	interval      time.Duration
 	ttl           time.Duration
-	onEvent       func(runnerID, event, sessionID, sessionToken string)
+	onEvent       func(runnerID, appID, event, sessionID, sessionToken string)
 	weiPerUSD     *big.Rat
 	rateUntil     time.Time
 	proxyTemplate string
 	closed        bool
 }
 
-const maxRunners = 256
+const (
+	maxRunners       = 256
+	maxAppsPerRunner = 128
+	maxApps          = 512
+)
 
 func NewRegistry(secret, service string, interval, ttl time.Duration) *Registry {
-	r := &Registry{metrics: observability.New("orchestrator"), runners: make(map[string]*runner), secret: secret, service: strings.TrimRight(service, "/"), interval: interval, ttl: ttl}
+	r := &Registry{metrics: observability.New("orchestrator"), runners: make(map[string]*runner), apps: make(map[string]*app), sessions: make(map[string]*app), proxies: make(map[string]*session), secret: secret, service: strings.TrimRight(service, "/"), interval: interval, ttl: ttl}
 	r.metrics.Snapshot(r.collectMetrics)
 	r.metrics.Legacy(func(emit observability.Emit) {
 		runners, sessions := r.Counts()
@@ -189,7 +262,7 @@ func (r *Registry) setRate(rate *big.Rat, until time.Time) {
 	r.weiPerUSD = new(big.Rat).Set(rate)
 	r.rateUntil = until
 	r.metrics.Gauge("price_feed_valid_until_timestamp_seconds", nil).Set(float64(until.Unix()) * observability.Bool(!until.IsZero()))
-	for _, item := range r.runners {
+	for _, item := range r.apps {
 		quote := item.USDQuote
 		item.PriceError = normalizePriceAt(&quote, r.weiPerUSD) != nil
 		if !item.PriceError {
@@ -198,7 +271,7 @@ func (r *Registry) setRate(rate *big.Rat, until time.Time) {
 	}
 }
 
-func (r *Registry) priceAvailable(item *runner) bool {
+func (r *Registry) priceAvailable(item *app) bool {
 	return !item.PriceError && (item.PriceInfo.Price == "" || r.rateUntil.IsZero() || time.Now().Before(r.rateUntil))
 }
 
@@ -243,17 +316,10 @@ func normalizePriceAt(price *priceInfo, rate *big.Rat) error {
 	return nil
 }
 
-func randomIDWithPrefix(prefix string, n int) (string, error) {
-	id, err := randomID(n)
-	return prefix + id, err
-}
-
-func randomID(n int) (string, error) {
+func randomID(n int) string {
 	raw := make([]byte, n)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw)), nil
+	rand.Read(raw)
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw))
 }
 
 func equalSecret(a, b string) bool {
@@ -277,14 +343,14 @@ func (r *Registry) acceptsHeartbeatCredential(auth string) bool {
 	return false
 }
 
-func validateHeartbeat(req *heartbeatRequest) error {
+func validateApp(req *appRequest) error {
 	if req.Capacity == 0 {
 		req.Capacity = 1
 	}
 	req.PriceInfo.Unit = strings.ToLower(strings.TrimSpace(req.PriceInfo.Unit))
 	req.PriceInfo.Currency = strings.ToLower(strings.TrimSpace(req.PriceInfo.Currency))
-	if req.RunnerID != "" && !validRouteID(req.RunnerID) {
-		return errors.New("runner_id must contain only ASCII letters, digits, '-' or '_' and be at most 128 bytes")
+	if req.ID != "" && !validRouteID(req.ID) {
+		return errors.New("app id must contain only ASCII letters, digits, '-' or '_' and be at most 128 bytes")
 	}
 	if req.App == "" || req.Capacity < 1 || req.Capacity > 10000 {
 		return errors.New("app and capacity between 1 and 10000 are required")
@@ -300,6 +366,15 @@ func validateHeartbeat(req *heartbeatRequest) error {
 	}
 	if req.PriceInfo.Unit != "" && req.PriceInfo.Unit != "hour" && req.PriceInfo.Unit != "fixed" {
 		return errors.New("price_info.unit must be hour or fixed")
+	}
+	if req.GPU != nil && req.GPU.VRAMMB < 0 {
+		return errors.New("GPU VRAM must be nonnegative")
+	}
+	if req.Mode == "" {
+		req.Mode = "persistent"
+	}
+	if req.Status == "" {
+		req.Status = "ready"
 	}
 	return nil
 }
@@ -319,27 +394,37 @@ func validRouteID(id string) bool {
 }
 
 func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatResponse, int, error) {
-	if err := validateHeartbeat(&req); err != nil {
-		return heartbeatResponse{}, http.StatusBadRequest, err
+	if req.RunnerID != "" && !validRouteID(req.RunnerID) {
+		return heartbeatResponse{}, http.StatusBadRequest, errors.New("runner_id must be a route-safe identifier")
 	}
-	if err := r.validateProxyRunner(req); err != nil {
-		return heartbeatResponse{}, http.StatusBadRequest, err
+	requests := slices.Clone(req.Apps)
+	if req.Apps == nil {
+		requests = []appRequest{req.scalarApp()}
 	}
-	quote := req.PriceInfo
+	if len(requests) > maxAppsPerRunner {
+		return heartbeatResponse{}, http.StatusBadRequest, errors.New("too many apps in heartbeat")
+	}
+	seen := make(map[string]bool, len(requests))
+	for i := range requests {
+		entry := &requests[i]
+		if err := validateApp(entry); err != nil {
+			return heartbeatResponse{}, http.StatusBadRequest, err
+		}
+		if entry.ID != "" {
+			if seen[entry.ID] {
+				return heartbeatResponse{}, http.StatusBadRequest, errors.New("duplicate app id")
+			}
+			seen[entry.ID] = true
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := normalizePriceAt(&req.PriceInfo, r.weiPerUSD); err != nil {
-		return heartbeatResponse{}, http.StatusBadRequest, err
-	}
 	if r.closed {
 		return heartbeatResponse{}, http.StatusServiceUnavailable, errors.New("orchestrator shutting down")
 	}
+	resp := heartbeatResponse{Orchestrator: r.runnerServiceURL(), HeartbeatInterval: r.interval.String(), HeartbeatTTL: r.ttl.String()}
 	current := r.runners[req.RunnerID]
-	if current != nil && current.Static {
-		return heartbeatResponse{}, http.StatusForbidden, errors.New("static runner cannot heartbeat")
-	}
-	initial := current == nil
-	if initial {
+	if current == nil {
 		if !equalSecret(auth, r.secret) {
 			return heartbeatResponse{}, http.StatusUnauthorized, errors.New("invalid runner credential")
 		}
@@ -348,44 +433,99 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 		}
 		id := req.RunnerID
 		if id == "" {
-			var err error
-			id, err = randomIDWithPrefix("runner_", 5)
-			if err != nil {
-				return heartbeatResponse{}, http.StatusInternalServerError, err
+			id = r.newID("app-", 5, seen)
+		}
+		current = &runner{ID: id, Credential: randomID(32), Apps: map[string]*app{}}
+		resp.HeartbeatSecret = current.Credential
+	} else {
+		if current.Static {
+			return heartbeatResponse{}, http.StatusForbidden, errors.New("static runner cannot heartbeat")
+		}
+		if !equalSecret(auth, current.Credential) {
+			return heartbeatResponse{}, http.StatusUnauthorized, errors.New("invalid runner credential")
+		}
+	}
+	if req.Apps == nil {
+		requests[0].ID = current.ID
+		seen[current.ID] = true
+	}
+	retained := len(requests)
+	for id, item := range current.Apps {
+		if req.Apps == nil && id != current.ID {
+			return heartbeatResponse{}, http.StatusConflict, errors.New("scalar heartbeat cannot replace other app registrations")
+		}
+		if !seen[id] && len(item.Sessions) != 0 {
+			retained++
+		}
+	}
+	if retained > maxAppsPerRunner || len(r.apps)-len(current.Apps)+retained > maxApps {
+		return heartbeatResponse{}, http.StatusServiceUnavailable, errors.New("app capacity reached")
+	}
+	quotes := make([]priceInfo, len(requests))
+	for i := range requests {
+		entry := &requests[i]
+		if entry.ID == "" {
+			entry.ID = r.newID("app-", 5, seen)
+			seen[entry.ID] = true
+		}
+		if err := r.validateProxyApp(*entry); err != nil {
+			return heartbeatResponse{}, http.StatusBadRequest, err
+		}
+		if r.proxies[entry.ID] != nil {
+			return heartbeatResponse{}, http.StatusConflict, errors.New("app id conflicts with a generated proxy")
+		}
+		if existing := r.apps[entry.ID]; existing != nil && existing.owner != current {
+			return heartbeatResponse{}, http.StatusConflict, errors.New("app id belongs to another runner")
+		}
+		quotes[i] = entry.PriceInfo
+		if err := normalizePriceAt(&entry.PriceInfo, r.weiPerUSD); err != nil {
+			return heartbeatResponse{}, http.StatusBadRequest, err
+		}
+	}
+	// Nothing above this point mutates the registry, including existing prices.
+	current.Version, current.Last = req.Version, time.Now()
+	r.runners[current.ID] = current
+	resp.RunnerID, resp.Apps = current.ID, make([]appResponse, 0, retained)
+	for i, entry := range requests {
+		item := current.Apps[entry.ID]
+		if item == nil {
+			item = &app{appRequest: entry, owner: current, lifetime: new(appLifetime), Healthy: true, Sessions: map[string]*session{}}
+			current.Apps[entry.ID], r.apps[entry.ID] = item, item
+			r.runnerEvent(entry.ID, item, "registered")
+		}
+		item.appRequest, item.USDQuote, item.PriceError, item.Removing = entry, quotes[i], false, false
+		resp.Apps = append(resp.Apps, item.response())
+	}
+	for _, id := range slices.Sorted(maps.Keys(current.Apps)) {
+		if !seen[id] {
+			item := current.Apps[id]
+			item.Removing = true
+			if len(item.Sessions) == 0 {
+				r.removeApp(item)
+			} else {
+				resp.Apps = append(resp.Apps, item.response())
 			}
 		}
-		credential, err := randomID(32)
-		if err != nil {
-			return heartbeatResponse{}, http.StatusInternalServerError, err
-		}
-		current = &runner{Credential: credential, Sessions: make(map[string]*session), Healthy: true}
-		req.RunnerID = id
-		r.runners[id] = current
-	} else if !equalSecret(auth, current.Credential) {
-		return heartbeatResponse{}, http.StatusUnauthorized, errors.New("invalid runner credential")
 	}
-	if req.Mode == "" {
-		req.Mode = "persistent"
-	}
-	if req.Status == "" {
-		req.Status = "ready"
-	}
-	current.USDQuote, current.PriceError = quote, false
-	current.heartbeatRequest = req
-	current.Last = time.Now()
-	// The SDK sends its active session IDs for reconciliation. Preserve
-	// reservations until an explicit stop or runner expiry; the runner may
-	// have missed a callback and will receive the authoritative list.
-	ids := make([]string, 0, len(current.Sessions))
-	for id := range current.Sessions {
-		ids = append(ids, id)
-	}
-	resp := heartbeatResponse{RunnerID: req.RunnerID, Orchestrator: r.runnerServiceURL(), HeartbeatInterval: r.interval.String(), HeartbeatTTL: r.ttl.String(), SessionIDs: ids}
-	if initial {
-		resp.HeartbeatSecret = current.Credential
-		r.runnerEvent(req.RunnerID, current, "registered")
+	if req.Apps == nil {
+		resp.SessionIDs, resp.Apps = resp.Apps[0].SessionIDs, nil
 	}
 	return resp, http.StatusOK, nil
+}
+
+func (item *app) response() appResponse {
+	status := item.Status
+	if item.Removing {
+		status = "draining"
+	}
+	return appResponse{ID: item.ID, Status: status, SessionIDs: append([]string{}, slices.Sorted(maps.Keys(item.Sessions))...)}
+}
+
+// removeApp requires r.mu and an app with no remaining sessions.
+func (r *Registry) removeApp(item *app) {
+	r.runnerEvent(item.ID, item, "removed")
+	delete(item.owner.Apps, item.ID)
+	delete(r.apps, item.ID)
 }
 
 func (r *Registry) Unregister(id, auth string) (int, error) {
@@ -398,15 +538,24 @@ func (r *Registry) Unregister(id, auth string) (int, error) {
 	if current.Static || !equalSecret(current.Credential, auth) {
 		return http.StatusUnauthorized, errors.New("invalid runner credential")
 	}
-	for sid := range current.Sessions {
-		r.releaseLocked(id, sid, nil, "runner_unregistered")
+	r.removeRunner(current, nil, "runner_unregistered", "unregistered")
+	return http.StatusOK, nil
+}
+
+// removeRunner requires r.mu. Session teardown precedes owner/channel removal.
+func (r *Registry) removeRunner(current *runner, cause error, reason, event string) {
+	for id, item := range current.Apps {
+		item.Removing = false
+		for sid := range item.Sessions {
+			r.releaseLocked(id, sid, cause, reason)
+		}
+		r.runnerEvent(id, item, event)
+		delete(r.apps, id)
 	}
 	if r.onEvent != nil {
-		r.onEvent(id, "unregistered", "", "")
+		r.onEvent(current.ID, "", event, "", "")
 	}
-	r.runnerEvent(id, current, "unregistered")
-	delete(r.runners, id)
-	return http.StatusOK, nil
+	delete(r.runners, current.ID)
 }
 
 type discoveryRunner struct {
@@ -434,8 +583,8 @@ func (r *Registry) Discovery() []discoveryEntry {
 	defer r.mu.Unlock()
 	result := []discoveryRunner{}
 	observed := time.Now().UTC().Format(time.RFC3339Nano)
-	for _, id := range slices.Sorted(maps.Keys(r.runners)) {
-		item := r.runners[id]
+	for _, id := range slices.Sorted(maps.Keys(r.apps)) {
+		item := r.apps[id]
 		if !r.usable(item) || !r.priceAvailable(item) {
 			continue
 		}
@@ -445,8 +594,13 @@ func (r *Registry) Discovery() []discoveryEntry {
 	return []discoveryEntry{{Address: r.service, Runners: result}}
 }
 
-func (r *Registry) usable(item *runner) bool {
-	return !r.closed && (item.Static || time.Since(item.Last) <= r.ttl) && item.Healthy && item.Status == "ready"
+// Admission depends on readiness; admitted sessions depend only on liveness.
+func (r *Registry) usable(item *app) bool {
+	return r.serving(item) && !item.Removing && item.Status == "ready"
+}
+
+func (r *Registry) serving(item *app) bool {
+	return !r.closed && (item.owner.Static || time.Since(item.owner.Last) <= r.ttl) && item.Healthy
 }
 
 func (r *Registry) appURL(id, mode, sessionID string) string {
@@ -460,17 +614,17 @@ func (r *Registry) appURL(id, mode, sessionID string) string {
 }
 
 func (r *Registry) Reserve(id string) (string, string, string, int, error) {
-	return r.ReserveWithID(id, "")
+	return r.reserveWithPrice(id, "", nil, "persistent")
 }
 
 func (r *Registry) ReserveWithID(id, requestedID string) (string, string, string, int, error) {
-	return r.reserveWithPrice(id, requestedID, nil)
+	return r.reserveWithPrice(id, requestedID, nil, "")
 }
 
-func (r *Registry) reserveWithPrice(id, requestedID string, agreed *priceInfo) (sid, app, control string, status int, result error) {
+func (r *Registry) reserveWithPrice(id, requestedID string, agreed *appQuote, mode string) (sid, app, control string, status int, result error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	item := r.apps[id]
 	if item != nil {
 		defer func() {
 			outcome := "success"
@@ -482,23 +636,22 @@ func (r *Registry) reserveWithPrice(id, requestedID string, agreed *priceInfo) (
 					outcome = "unavailable"
 				}
 			}
-			r.metrics.Add("session_reservations_total", 1, runnerIdentity(id, item).Labels().With("outcome", outcome))
+			r.metrics.Add("session_reservations_total", 1, appIdentity(id, item).Labels().With("outcome", outcome))
 		}()
 	}
 	if item == nil || !r.usable(item) {
 		return "", "", "", http.StatusNotFound, errors.New("runner unavailable")
 	}
+	if agreed != nil && agreed.registration != item.lifetime {
+		return "", "", "", http.StatusConflict, errors.New("app registration changed; request a new payment challenge")
+	}
 	if agreed == nil && !r.priceAvailable(item) {
 		return "", "", "", http.StatusServiceUnavailable, errors.New("runner price unavailable")
 	}
-	if item.Mode != "persistent" && !(item.Mode == "single-shot" && requestedID != "") {
+	if (mode != "" && item.Mode != mode) || (item.Mode != "persistent" && !(item.Mode == "single-shot" && requestedID != "")) {
 		return "", "", "", http.StatusBadRequest, errors.New("only persistent runners have sessions")
 	}
-	total := 0
-	for _, registered := range r.runners {
-		total += len(registered.Sessions)
-	}
-	if total >= 10000 {
+	if len(r.sessions) >= 10000 {
 		return "", "", "", http.StatusServiceUnavailable, errSessionCapacity
 	}
 	if len(item.Sessions) >= item.Capacity {
@@ -506,60 +659,72 @@ func (r *Registry) reserveWithPrice(id, requestedID string, agreed *priceInfo) (
 	}
 	sessionID := requestedID
 	if sessionID == "" {
-		var err error
-		sessionID, err = randomIDWithPrefix("session_", 10)
-		if err != nil {
-			return "", "", "", http.StatusInternalServerError, err
-		}
+		sessionID = "session_" + randomID(10)
 	}
-	if !validRouteID(sessionID) || item.Sessions[sessionID] != nil {
+	if !validRouteID(sessionID) || r.sessions[sessionID] != nil {
 		return "", "", "", http.StatusConflict, errors.New("session already exists or invalid")
 	}
-	token, err := randomID(32)
-	if err != nil {
-		return "", "", "", http.StatusInternalServerError, err
-	}
+	token := randomID(32)
 	price := item.PriceInfo
 	if agreed != nil {
-		price = *agreed
+		price = agreed.priceInfo
 	}
+	target, _ := destination.ParseURL(item.RunnerURL)
 	ctx, cancel := context.WithCancelCause(context.Background())
-	item.Sessions[sessionID] = &session{identity: runnerIdentity(id, item), pending: agreed != nil, ID: sessionID, Token: token, Created: time.Now(), Proxies: map[string]sessionProxy{}, PriceInfo: price, ctx: ctx, cancel: cancel}
+	item.Sessions[sessionID] = &session{target: target, identity: appIdentity(id, item), pending: agreed != nil, ID: sessionID, Token: token, Created: time.Now(), Proxies: map[string]sessionProxy{}, PriceInfo: price, ctx: ctx, cancel: cancel}
+	r.sessions[sessionID] = item
 	appURL := r.appURL(id, item.Mode, sessionID)
 	if item.Proxy && item.Mode == "persistent" {
-		target, _ := url.Parse(item.RunnerURL)
-		proxyID, err := randomID(10)
-		if err != nil {
-			cancel(nil)
-			delete(item.Sessions, sessionID)
-			return "", "", "", http.StatusInternalServerError, err
-		}
+		proxyID := r.newID("", 10, nil)
 		item.Sessions[sessionID].Proxies[proxyID] = sessionProxy{target: target, runner: true}
+		r.proxies[proxyID] = item.Sessions[sessionID]
 		appURL = r.proxyURL(proxyID)
 	}
 	if agreed == nil && r.onEvent != nil {
-		r.onEvent(id, "reserved", sessionID, token)
+		r.onEvent(item.owner.ID, id, "reserved", sessionID, token)
 	}
 	return sessionID, appURL, r.service + "/apps/" + url.PathEscape(id) + "/session/" + url.PathEscape(sessionID), http.StatusOK, nil
 }
 
-func (r *Registry) PriceForRunner(id string) (priceInfo, int, error) {
+// appQuote carries an agreed price and the registration that offered it.
+// The registration is process-local and never introduces another wire identity.
+type appQuote struct {
+	priceInfo
+	registration *appLifetime
+}
+
+func (r *Registry) appRegistration(id string) *appLifetime {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	if item := r.apps[id]; item != nil {
+		return item.lifetime
+	}
+	return nil
+}
+
+// PriceForRunner returns the price for an app registration ID (a runner ID for legacy apps).
+func (r *Registry) PriceForRunner(id string) (priceInfo, int, error) {
+	quote, status, err := r.quoteForApp(id)
+	return quote.priceInfo, status, err
+}
+
+func (r *Registry) quoteForApp(id string) (appQuote, int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	item := r.apps[id]
 	if item == nil || !r.usable(item) {
-		return priceInfo{}, http.StatusNotFound, errors.New("runner unavailable")
+		return appQuote{}, http.StatusNotFound, errors.New("runner unavailable")
 	}
 	if !r.priceAvailable(item) {
-		return priceInfo{}, http.StatusServiceUnavailable, errors.New("runner price unavailable")
+		return appQuote{}, http.StatusServiceUnavailable, errors.New("runner price unavailable")
 	}
-	return item.PriceInfo, http.StatusOK, nil
+	return appQuote{priceInfo: item.PriceInfo, registration: item.lifetime}, http.StatusOK, nil
 }
 
 func (r *Registry) ModeForRunner(id string) (string, int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	item := r.apps[id]
 	if item == nil || !r.usable(item) {
 		return "", http.StatusNotFound, errors.New("runner unavailable")
 	}
@@ -569,7 +734,7 @@ func (r *Registry) ModeForRunner(id string) (string, int, error) {
 func (r *Registry) PriceForSession(id, sid string) (priceInfo, int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	item := r.apps[id]
 	if item == nil || item.Sessions[sid] == nil || item.Sessions[sid].pending {
 		return priceInfo{}, http.StatusNotFound, errors.New("session not found")
 	}
@@ -580,7 +745,7 @@ func (r *Registry) PaidSessions() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var ids []string
-	for _, item := range r.runners {
+	for _, item := range r.apps {
 		for id, sess := range item.Sessions {
 			if !sess.pending && sess.PriceInfo.Price != "" {
 				ids = append(ids, id)
@@ -593,18 +758,15 @@ func (r *Registry) PaidSessions() []string {
 func (r *Registry) ReleaseBySession(sid string, reasons ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for id, item := range r.runners {
-		if item.Sessions[sid] != nil {
-			r.releaseLocked(id, sid, nil, reasons...)
-			return
-		}
+	if item := r.sessions[sid]; item != nil {
+		r.releaseLocked(item.ID, sid, nil, reasons...)
 	}
 }
 
 func (r *Registry) release(id, sid, token string, callback bool) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	item := r.apps[id]
 	if item == nil || item.Sessions[sid] == nil {
 		return http.StatusNotFound, errors.New("session not found")
 	}
@@ -623,7 +785,7 @@ func (r *Registry) release(id, sid, token string, callback bool) (int, error) {
 // releaseLocked is the single teardown path for capacity and active requests.
 // The caller holds r.mu; cancellation never waits for the request to finish.
 func (r *Registry) releaseLocked(id, sid string, cause error, reasons ...string) {
-	item := r.runners[id]
+	item := r.apps[id]
 	if item == nil || item.Sessions[sid] == nil {
 		return
 	}
@@ -640,19 +802,26 @@ func (r *Registry) releaseLocked(id, sid string, cause error, reasons ...string)
 		r.metrics.Observe("session_duration_seconds", time.Since(sess.Created).Seconds(), sess.identity.Labels())
 	}
 	if r.logger != nil {
-		r.logger.Info("session ended", "event", "session_ended", "operation", "release", "outcome", reason, "app", sess.identity.App, "runner_id", id, "session_id", sid)
+		r.logger.Info("session ended", "event", "session_ended", "operation", "release", "outcome", reason, "app", sess.identity.App, "runner_id", sess.identity.Runner, "app_id", id, "session_id", sid)
 	}
 	sess.cancel(cause)
 	delete(item.Sessions, sid)
+	delete(r.sessions, sid)
+	for proxyID := range sess.Proxies {
+		delete(r.proxies, proxyID)
+	}
 	if r.onEvent != nil {
-		r.onEvent(id, "released", sid, "")
+		r.onEvent(item.owner.ID, id, "released", sid, "")
+	}
+	if item.Removing && len(item.Sessions) == 0 {
+		r.removeApp(item)
 	}
 }
 
 func (r *Registry) sessionContext(id, sid string) (context.Context, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	item := r.apps[id]
 	if item == nil || item.Sessions[sid] == nil {
 		return nil, false
 	}
@@ -663,69 +832,61 @@ func (r *Registry) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closed = true
-	for id, item := range r.runners {
-		for sid := range item.Sessions {
-			r.releaseLocked(id, sid, nil, "shutdown")
-		}
-		if r.onEvent != nil {
-			r.onEvent(id, "unregistered", "", "")
-		}
+	for _, current := range r.runners {
+		r.removeRunner(current, nil, "shutdown", "unregistered")
 	}
 }
 
 func (r *Registry) sessionTarget(id, sid string) (*url.URL, string, int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
-	if item == nil || !r.usable(item) || item.Sessions[sid] == nil || item.Sessions[sid].pending {
+	item := r.apps[id]
+	if item == nil || !r.serving(item) || item.Sessions[sid] == nil || item.Sessions[sid].pending {
 		return nil, "", http.StatusNotFound, errors.New("session not found")
 	}
-	target, err := destination.ParseURL(item.RunnerURL)
-	if err != nil {
-		return nil, "", http.StatusBadGateway, err
-	}
-	return target, item.Sessions[sid].Token, http.StatusOK, nil
+	return item.Sessions[sid].target, item.Sessions[sid].Token, http.StatusOK, nil
 }
 
 func (r *Registry) validSessionToken(id, sid, token string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	item := r.apps[id]
 	return item != nil && item.Sessions[sid] != nil && !item.Sessions[sid].pending && equalSecret(item.Sessions[sid].Token, token)
 }
 
 func (r *Registry) addProxy(id, sid, token string, target *url.URL) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
+	item := r.apps[id]
 	if item == nil || item.Sessions[sid] == nil || !equalSecret(item.Sessions[sid].Token, token) {
 		return "", errInvalidSessionToken
-	}
-	proxyID, err := randomID(10)
-	if err != nil {
-		return "", err
 	}
 	if len(item.Sessions[sid].Proxies) >= 25 {
 		return "", errors.New("too many session proxies")
 	}
+	proxyID := r.newID("", 10, nil)
 	item.Sessions[sid].Proxies[proxyID] = sessionProxy{target: target}
+	r.proxies[proxyID] = item.Sessions[sid]
 	return proxyID, nil
+}
+
+// newID requires r.mu and avoids both registered and staged identifiers.
+func (r *Registry) newID(prefix string, size int, seen map[string]bool) string {
+	for {
+		id := prefix + randomID(size)
+		if r.runners[id] == nil && r.apps[id] == nil && r.proxies[id] == nil && !seen[id] {
+			return id
+		}
+	}
 }
 
 func (r *Registry) proxyTarget(proxyID string) (sessionProxy, string, string, string, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for runnerID, item := range r.runners {
-		if !r.usable(item) {
-			continue
-		}
-		for sid, sess := range item.Sessions {
-			if sess.pending {
-				continue
-			}
-			if target, ok := sess.Proxies[proxyID]; ok {
-				return target, runnerID, sid, sess.Token, true
-			}
+	sess := r.proxies[proxyID]
+	if sess != nil && !sess.pending {
+		if item := r.sessions[sess.ID]; item != nil && r.serving(item) {
+			return sess.Proxies[proxyID], item.ID, sess.ID, sess.Token, true
 		}
 	}
 	return sessionProxy{}, "", "", "", false
@@ -734,16 +895,9 @@ func (r *Registry) proxyTarget(proxyID string) (sessionProxy, string, string, st
 func (r *Registry) Expire() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for id, item := range r.runners {
-		if !item.Static && time.Since(item.Last) > r.ttl {
-			for sid := range item.Sessions {
-				r.releaseLocked(id, sid, errRunnerUnavailable, "runner_expired")
-			}
-			if r.onEvent != nil {
-				r.onEvent(id, "expired", "", "")
-			}
-			r.runnerEvent(id, item, "expired")
-			delete(r.runners, id)
+	for _, current := range r.runners {
+		if !current.Static && time.Since(current.Last) > r.ttl {
+			r.removeRunner(current, errRunnerUnavailable, "runner_expired", "expired")
 		}
 	}
 }
@@ -768,11 +922,11 @@ func (r *Registry) AddStatic(config StaticRunner) error {
 	if !validRouteID(config.ID) {
 		return errors.New("static runner id must be a route-safe identifier")
 	}
-	req := heartbeatRequest{RunnerID: config.ID, Proxy: config.Proxy, RunnerURL: config.RunnerURL, Version: config.Version, Metadata: config.Metadata, GPU: config.GPU, App: config.App, Mode: config.Mode, Status: config.Status, Capacity: config.Capacity, PriceInfo: config.PriceInfo}
-	if err := validateHeartbeat(&req); err != nil {
+	req := appRequest{ID: config.ID, Proxy: config.Proxy, RunnerURL: config.RunnerURL, Version: config.Version, Metadata: config.Metadata, GPU: config.GPU, App: config.App, Mode: config.Mode, Status: config.Status, Capacity: config.Capacity, PriceInfo: config.PriceInfo}
+	if err := validateApp(&req); err != nil {
 		return fmt.Errorf("static runner %s: %w", config.ID, err)
 	}
-	if err := r.validateProxyRunner(req); err != nil {
+	if err := r.validateProxyApp(req); err != nil {
 		return err
 	}
 	quote := req.PriceInfo
@@ -780,12 +934,6 @@ func (r *Registry) AddStatic(config StaticRunner) error {
 		if _, err := destination.ParseURL(config.HealthURL); err != nil {
 			return fmt.Errorf("static runner %s has invalid health URL", config.ID)
 		}
-	}
-	if req.Mode == "" {
-		req.Mode = "persistent"
-	}
-	if req.Status == "" {
-		req.Status = "ready"
 	}
 	if config.HealthCode == 0 {
 		config.HealthCode = http.StatusOK
@@ -795,22 +943,25 @@ func (r *Registry) AddStatic(config StaticRunner) error {
 	if err := normalizePriceAt(&req.PriceInfo, r.weiPerUSD); err != nil {
 		return fmt.Errorf("static runner %s: %w", config.ID, err)
 	}
-	if r.runners[config.ID] != nil {
+	if r.runners[config.ID] != nil || r.apps[config.ID] != nil || r.proxies[config.ID] != nil {
 		return fmt.Errorf("duplicate static runner id %s", config.ID)
 	}
-	if len(r.runners) >= maxRunners {
+	if len(r.runners) >= maxRunners || len(r.apps) >= maxApps {
 		return errors.New("static runner capacity reached")
 	}
-	r.runners[config.ID] = &runner{USDQuote: quote, heartbeatRequest: req, Static: true, Healthy: config.HealthURL == "", HealthURL: config.HealthURL, HealthCode: config.HealthCode, Sessions: map[string]*session{}}
-	r.runnerEvent(config.ID, r.runners[config.ID], "registered")
+	owner := &runner{ID: config.ID, Version: config.Version, Static: true, Apps: map[string]*app{}}
+	item := &app{owner: owner, lifetime: new(appLifetime), USDQuote: quote, appRequest: req, Healthy: config.HealthURL == "", HealthURL: config.HealthURL, HealthCode: config.HealthCode, Sessions: map[string]*session{}}
+	owner.Apps[config.ID] = item
+	r.runners[config.ID], r.apps[config.ID] = owner, item
+	r.runnerEvent(config.ID, item, "registered")
 	return nil
 }
 
 func (r *Registry) CheckStaticHealth(ctx context.Context, client *http.Client) {
 	r.mu.Lock()
 	checks := make(map[string]string)
-	for id, item := range r.runners {
-		if item.Static && item.HealthURL != "" {
+	for id, item := range r.apps {
+		if item.owner.Static && item.HealthURL != "" {
 			checks[id] = item.HealthURL
 		}
 	}
@@ -844,13 +995,13 @@ func (r *Registry) checkStaticHealth(ctx context.Context, client *http.Client, i
 	if err == nil {
 		_ = response.Body.Close()
 		r.mu.Lock()
-		item := r.runners[id]
+		item := r.apps[id]
 		healthy = item != nil && response.StatusCode == item.HealthCode
 		r.mu.Unlock()
 	}
 	r.mu.Lock()
-	if item := r.runners[id]; item != nil && item.Static {
-		r.metrics.Add("runner_health_checks_total", 1, runnerIdentity(id, item).Labels().With("outcome", map[bool]string{true: "success", false: "error"}[healthy]))
+	if item := r.apps[id]; item != nil && item.owner.Static {
+		r.metrics.Add("runner_health_checks_total", 1, appIdentity(id, item).Labels().With("outcome", map[bool]string{true: "success", false: "error"}[healthy]))
 		if healthy {
 			item.healthFailures = 0
 		} else {
@@ -877,10 +1028,7 @@ func (r *Registry) checkStaticHealth(ctx context.Context, client *http.Client, i
 func (r *Registry) Counts() (runners, sessions int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, item := range r.runners {
-		runners++
-		sessions += len(item.Sessions)
-	}
+	runners, sessions = len(r.runners), len(r.sessions)
 	return
 }
 
@@ -892,15 +1040,15 @@ func (r *Registry) String() string {
 func (r *Registry) activateSession(id, sid string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	item := r.runners[id]
-	if item == nil || !r.usable(item) || item.Sessions[sid] == nil {
+	item := r.apps[id]
+	if item == nil || !r.serving(item) || item.Sessions[sid] == nil {
 		return false
 	}
 	sess := item.Sessions[sid]
 	if sess.pending {
 		sess.pending = false
 		if r.onEvent != nil {
-			r.onEvent(id, "reserved", sid, sess.Token)
+			r.onEvent(item.owner.ID, id, "reserved", sid, sess.Token)
 		}
 	}
 	return true

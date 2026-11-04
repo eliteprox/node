@@ -2,11 +2,9 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
@@ -22,7 +20,7 @@ func paymentPrice(price priceInfo) (int64, bool) {
 	return value, err == nil && value > 0
 }
 
-func (s *Server) challenge(w http.ResponseWriter, r *http.Request, runnerID string, price priceInfo) {
+func (s *Server) challenge(w http.ResponseWriter, r *http.Request, appID string, quote appQuote) {
 	if s.payment == nil {
 		fail(w, http.StatusServiceUnavailable, "on-chain payment is unavailable")
 		return
@@ -32,23 +30,19 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, runnerID stri
 		fail(w, http.StatusPaymentRequired, "Livepeer-Payer-Address is required")
 		return
 	}
-	manifest, err := randomIDWithPrefix("session_", 10)
-	if err != nil {
-		fail(w, 500, "cannot create payment challenge")
-		return
-	}
-	wei, _ := paymentPrice(price)
-	challenge, err := s.payment.MakeChallenge(r.Context(), runnerID, manifest, ethcommon.HexToAddress(payerRaw), wei, price.Unit, s.registry.service)
+	manifest := "session_" + randomID(10)
+	wei, _ := paymentPrice(quote.priceInfo)
+	challenge, err := s.payment.makeAppChallenge(r.Context(), appID, manifest, ethcommon.HexToAddress(payerRaw), wei, quote.Unit, s.registry.service, quote.registration)
 	if err != nil {
 		observability.Outcome(r, paymentAppOutcome(err))
-		s.logger.Warn("payment challenge failed", "event", "payment_challenge", "operation", "challenge", "runner_id", runnerID, "outcome", paymentOutcome(err), "error_kind", observability.ErrorKind(err))
+		s.logger.Warn("payment challenge failed", "event", "payment_challenge", "operation", "challenge", "runner_id", s.registry.identity(appID, manifest).Runner, "app_id", appID, "outcome", paymentOutcome(err), "error_kind", observability.ErrorKind(err))
 		fail(w, 502, "payment challenge unavailable")
 		return
 	}
 	writeJSON(w, http.StatusPaymentRequired, challenge)
 }
 
-func (s *Server) paidReceipt(w http.ResponseWriter, r *http.Request, runnerID string, price priceInfo) (string, bool) {
+func (s *Server) paidReceipt(w http.ResponseWriter, r *http.Request, appID string, price priceInfo) (string, bool) {
 	manifest, err := ManifestFromSegment(r.Header.Get("Livepeer-Segment"))
 	if err != nil {
 		fail(w, http.StatusPaymentRequired, "invalid segment credentials")
@@ -60,7 +54,7 @@ func (s *Server) paidReceipt(w http.ResponseWriter, r *http.Request, runnerID st
 		fail(w, http.StatusConflict, "runner price changed; request a new payment challenge")
 		return "", false
 	}
-	if _, _, err := s.payment.Receive(r.Context(), runnerID, manifest, r.Header.Get("Livepeer-Payment"), r.Header.Get("Livepeer-Segment")); err != nil {
+	if _, _, err := s.payment.Receive(r.Context(), appID, manifest, r.Header.Get("Livepeer-Payment"), r.Header.Get("Livepeer-Segment")); err != nil {
 		observability.Outcome(r, paymentAppOutcome(err))
 		status := http.StatusBadRequest
 		if errors.Is(err, ErrMissingChallenge) {
@@ -76,8 +70,8 @@ func (s *Server) paidReceipt(w http.ResponseWriter, r *http.Request, runnerID st
 }
 
 func (s *Server) reservePaid(w http.ResponseWriter, r *http.Request) bool {
-	runnerID := r.PathValue("runner_id")
-	mode, status, err := s.registry.ModeForRunner(runnerID)
+	appID := r.PathValue("app_id")
+	mode, status, err := s.registry.ModeForRunner(appID)
 	if err != nil {
 		fail(w, status, err.Error())
 		return true
@@ -86,16 +80,16 @@ func (s *Server) reservePaid(w http.ResponseWriter, r *http.Request) bool {
 		fail(w, http.StatusBadRequest, "runner is not persistent")
 		return true
 	}
-	price, status, err := s.reservationPrice(r, runnerID)
+	price, status, err := s.reservationPrice(r, appID)
 	if err != nil {
 		fail(w, status, err.Error())
 		return true
 	}
-	if _, paid := paymentPrice(price); !paid {
+	if _, paid := paymentPrice(price.priceInfo); !paid {
 		return false
 	}
 	if r.Header.Get("Livepeer-Payment") == "" || r.Header.Get("Livepeer-Segment") == "" {
-		s.challenge(w, r, runnerID, price)
+		s.challenge(w, r, appID, price)
 		return true
 	}
 	manifest, err := ManifestFromSegment(r.Header.Get("Livepeer-Segment"))
@@ -103,12 +97,12 @@ func (s *Server) reservePaid(w http.ResponseWriter, r *http.Request) bool {
 		fail(w, 403, "invalid segment credentials")
 		return true
 	}
-	id, appURL, controlURL, status, err := s.registry.reserveWithPrice(runnerID, manifest, &price)
+	id, appURL, controlURL, status, err := s.registry.reserveWithPrice(appID, manifest, &price, "persistent")
 	if err != nil {
 		failReservation(w, r, status, err)
 		return true
 	}
-	if _, ok := s.paidReceipt(w, r, runnerID, price); !ok {
+	if _, ok := s.paidReceipt(w, r, appID, price.priceInfo); !ok {
 		s.registry.ReleaseBySession(id)
 		return true
 	}
@@ -118,7 +112,7 @@ func (s *Server) reservePaid(w http.ResponseWriter, r *http.Request) bool {
 		fail(w, 402, "insufficient payment balance")
 		return true
 	}
-	if !s.registry.activateSession(runnerID, id) {
+	if !s.registry.activateSession(appID, id) {
 		fail(w, 404, "session ended during payment")
 		return true
 	}
@@ -127,8 +121,8 @@ func (s *Server) reservePaid(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) proxyPaidSingleShot(w http.ResponseWriter, r *http.Request) bool {
-	runnerID := r.PathValue("runner_id")
-	mode, status, err := s.registry.ModeForRunner(runnerID)
+	appID := r.PathValue("app_id")
+	mode, status, err := s.registry.ModeForRunner(appID)
 	if err != nil {
 		fail(w, status, err.Error())
 		return true
@@ -137,16 +131,16 @@ func (s *Server) proxyPaidSingleShot(w http.ResponseWriter, r *http.Request) boo
 		fail(w, http.StatusBadRequest, "runner is not single-shot")
 		return true
 	}
-	price, status, err := s.reservationPrice(r, runnerID)
+	price, status, err := s.reservationPrice(r, appID)
 	if err != nil {
 		fail(w, status, err.Error())
 		return true
 	}
-	if _, paid := paymentPrice(price); !paid {
+	if _, paid := paymentPrice(price.priceInfo); !paid {
 		return false
 	}
 	if r.Header.Get("Livepeer-Payment") == "" || r.Header.Get("Livepeer-Segment") == "" {
-		s.challenge(w, r, runnerID, price)
+		s.challenge(w, r, appID, price)
 		return true
 	}
 	manifest, err := ManifestFromSegment(r.Header.Get("Livepeer-Segment"))
@@ -154,13 +148,13 @@ func (s *Server) proxyPaidSingleShot(w http.ResponseWriter, r *http.Request) boo
 		fail(w, 403, "invalid segment credentials")
 		return true
 	}
-	id, _, _, status, err := s.registry.reserveWithPrice(runnerID, manifest, &price)
+	id, _, _, status, err := s.registry.reserveWithPrice(appID, manifest, &price, "single-shot")
 	if err != nil {
 		failReservation(w, r, status, err)
 		return true
 	}
 	defer s.registry.ReleaseBySession(id, "completed")
-	if _, ok := s.paidReceipt(w, r, runnerID, price); !ok {
+	if _, ok := s.paidReceipt(w, r, appID, price.priceInfo); !ok {
 		return true
 	}
 	if err := s.payment.Charge(r.Context(), id, time.Now()); err != nil {
@@ -168,17 +162,17 @@ func (s *Server) proxyPaidSingleShot(w http.ResponseWriter, r *http.Request) boo
 		fail(w, 402, "insufficient payment balance")
 		return true
 	}
-	if !s.registry.activateSession(runnerID, id) {
+	if !s.registry.activateSession(appID, id) {
 		fail(w, 404, "session ended during payment")
 		return true
 	}
-	target, token, status, err := s.registry.sessionTarget(runnerID, id)
+	target, token, status, err := s.registry.sessionTarget(appID, id)
 	if err != nil {
 		fail(w, status, err.Error())
 		return true
 	}
-	control := s.registry.runnerServiceURL() + "/runner/" + url.PathEscape(runnerID) + "/session/" + url.PathEscape(id)
-	s.proxy(w, r, s.runnerTransport, target, r.PathValue("app_path"), runnerID, id, token, control)
+	control := s.registry.runnerServiceURL() + "/runner/" + url.PathEscape(appID) + "/session/" + url.PathEscape(id)
+	s.proxy(w, r, s.runnerTransport, target, r.PathValue("app_path"), appID, id, token, control)
 	return true
 }
 
@@ -187,8 +181,8 @@ func (s *Server) sessionPayment(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "payment unavailable")
 		return
 	}
-	runnerID, manifest := r.PathValue("runner_id"), r.PathValue("session_id")
-	price, status, err := s.registry.PriceForSession(runnerID, manifest)
+	appID, manifest := r.PathValue("app_id"), r.PathValue("session_id")
+	price, status, err := s.registry.PriceForSession(appID, manifest)
 	if err != nil {
 		fail(w, status, err.Error())
 		return
@@ -197,10 +191,10 @@ func (s *Server) sessionPayment(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, "fixed-price sessions do not accept follow-up payments")
 		return
 	}
-	if _, ok := s.paidReceipt(w, r, runnerID, price); !ok {
+	if _, ok := s.paidReceipt(w, r, appID, price); !ok {
 		return
 	}
-	challenge, err := s.payment.ChallengeForManifest(runnerID, manifest, s.registry.service)
+	challenge, err := s.payment.ChallengeForManifest(appID, manifest, s.registry.service)
 	if err != nil {
 		fail(w, 500, "payment params unavailable")
 		return
@@ -245,17 +239,17 @@ func (s *Server) ChargePaidSessions(ctx context.Context) {
 	}
 }
 
-func (s *Server) reservationPrice(r *http.Request, runnerID string) (priceInfo, int, error) {
+func (s *Server) reservationPrice(r *http.Request, appID string) (appQuote, int, error) {
 	if s.payment != nil && r.Header.Get("Livepeer-Payment") != "" && r.Header.Get("Livepeer-Segment") != "" {
 		manifest, err := ManifestFromSegment(r.Header.Get("Livepeer-Segment"))
 		if err != nil {
-			return priceInfo{}, 403, err
+			return appQuote{}, http.StatusForbidden, err
 		}
-		price, unit, err := s.payment.ChallengePrice(runnerID, manifest)
+		quote, err := s.payment.challengeQuote(appID, manifest)
 		if err != nil {
-			return priceInfo{}, 403, ErrMissingChallenge
+			return appQuote{}, http.StatusForbidden, ErrMissingChallenge
 		}
-		return priceInfo{Price: json.Number(strconv.FormatInt(price, 10)), Currency: "wei", Unit: unit}, 200, nil
+		return quote, http.StatusOK, nil
 	}
-	return s.registry.PriceForRunner(runnerID)
+	return s.registry.quoteForApp(appID)
 }

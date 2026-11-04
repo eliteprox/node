@@ -14,16 +14,16 @@ const o2rKeepaliveMessage = `{"keep":"alive"}`
 
 // channel tracks ownership; trickle.Server owns the stream and its segments.
 type channel struct {
-	name, mime, runnerID, sessionID string
-	identity                        observability.Identity
-	publisher                       *trickle.TrickleLocalPublisher
+	name, mime, runnerID, appID, sessionID string
+	identity                               observability.Identity
+	publisher                              *trickle.TrickleLocalPublisher
 }
 
 // newChannel requires s.mu.
-func (s *Server) newChannel(id, name, mime, runnerID, sessionID string) *channel {
+func (s *Server) newChannel(id, name, mime, runnerID, appID, sessionID string) *channel {
 	publisher := trickle.NewLocalPublisher(s.trickleServer, id, mime)
 	publisher.CreateChannel()
-	ch := &channel{name: name, mime: mime, runnerID: runnerID, sessionID: sessionID, publisher: publisher}
+	ch := &channel{name: name, mime: mime, runnerID: runnerID, appID: appID, sessionID: sessionID, publisher: publisher}
 	s.channels[id] = ch
 	return ch
 }

@@ -38,11 +38,18 @@ func TestRunnerProxyRoutingMatrix(t *testing.T) {
 						registry.proxyTemplate = template
 						s := NewServer(registry, policy, denied, slog.New(slog.NewTextHandler(io.Discard, nil)))
 						defer s.Close()
+						runnerID := "runner"
 						if static {
 							require.NoError(t, registry.AddStatic(StaticRunner{ID: "runner", RunnerURL: upstream.URL + "/base", App: "app", Mode: mode, Proxy: proxy}))
 						} else {
-							_, _, err := registry.Heartbeat(heartbeatRequest{RunnerID: "runner", RunnerURL: upstream.URL + "/base", App: "app", Mode: mode, Proxy: proxy}, "secret")
+							req := heartbeatRequest{RunnerURL: upstream.URL + "/base", App: "app", Mode: mode, Proxy: proxy}
+							registered, _, err := registry.Heartbeat(req, "secret")
 							require.NoError(t, err)
+							runnerID, req.RunnerID = registered.RunnerID, registered.RunnerID
+							require.Regexp(t, `^app-[a-z2-7]{8}$`, runnerID)
+							_, code, err := registry.Heartbeat(req, registered.HeartbeatSecret)
+							require.NoError(t, err)
+							require.Equal(t, http.StatusOK, code)
 						}
 						discovery := httptest.NewRecorder()
 						s.ServeHTTP(discovery, httptest.NewRequest("GET", "https://orch.example/deployment/discovery", nil))
@@ -50,10 +57,11 @@ func TestRunnerProxyRoutingMatrix(t *testing.T) {
 						var entries []discoveryEntry
 						require.NoError(t, json.Unmarshal(discovery.Body.Bytes(), &entries))
 						app := entries[0].Runners[0].URL
+						require.Contains(t, app, runnerID)
 						var sid string
 						if mode == "persistent" {
 							var err error
-							sid, app, _, _, err = registry.Reserve("runner")
+							sid, app, _, _, err = registry.Reserve(runnerID)
 							require.NoError(t, err)
 							runners := registry.Discovery()[0].Runners
 							require.Len(t, runners, 1)

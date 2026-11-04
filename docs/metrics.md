@@ -26,13 +26,14 @@ Failed collectors omit unavailable statistics and report
 
 ## Identity and counting
 
-New Livepeer families carry `component`; legacy and Go/process collectors retain
-their existing labels. App/runner labels use registered `app`, `runner_id`, and
-`mode`; aggregate runners for app totals. Sessions and Trickle retain ownership.
+Livepeer families carry `component`; aggregate and Go/process collectors retain
+their existing labels. App identity labels are `app` (name), `app_id`,
+`runner_id` (owner), and `mode`. Inventory families measure app registrations;
+the aggregate `runners` gauge counts owners. Sessions and Trickle retain ownership.
 Inventory exists before traffic; unregister/expiry removes it, retaining counters.
 
 Counters reset on restart; durable queue gauges recover from SQLite. ETH values
-are approximate operational measurements. Legacy aggregate runner/session, up,
+are approximate operational measurements. Aggregate runner/session, up,
 and outbox names remain available.
 
 Operations use route patterns or fixed names; unknown routes/methods use
@@ -74,13 +75,13 @@ gauges; timestamps use Unix seconds. Most event families appear on first use.
 | Area | Families and dimensions |
 | --- | --- |
 | Runtime | `build_info{version,revision}`, standard `go_*`, `process_*`, and `go_build_info`. |
-| Legacy | `runners`, `sessions`, `signer_up`, and `discovery_up` retain their existing labels. |
+| Aggregate | `runners`, `sessions`, `signer_up`, and `discovery_up` retain their existing labels. |
 | HTTP | `http_requests_total{operation,method,status}`, `http_request_duration_seconds{operation,method}`, `http_requests_in_flight`, `http_admission_rejections_total{pool}`. Probe/scrape requests are excluded. |
-| Apps | `app_calls_total{app,runner_id,mode,protocol,outcome}`, `app_call_duration_seconds`, `app_response_header_duration_seconds`, `app_calls_in_flight`. Histograms use identity/protocol; in-flight uses identity. |
-| Upstreams | `upstream_requests_total{app,runner_id,mode,destination,outcome}`, `upstream_response_header_duration_seconds`. Destination is `runner` or `session_proxy`; HTTP failures use `http_4xx`/`http_5xx`. |
+| Apps | `app_calls_total{app,app_id,runner_id,mode,protocol,outcome}`, `app_call_duration_seconds`, `app_response_header_duration_seconds`, `app_calls_in_flight`. Histograms use identity/protocol; in-flight uses identity. |
+| Upstreams | `upstream_requests_total{app,app_id,runner_id,mode,destination,outcome}`, `upstream_response_header_duration_seconds`. Destination is `runner` or `session_proxy`; HTTP failures use `http_4xx`/`http_5xx`. |
 | Inventory | `runner_registered`, `runner_ready`, `runner_capacity`, `runner_capacity_available`, `runner_sessions{state="pending\|active"}`, `runner_last_heartbeat_timestamp_seconds`, all with app identity. Unavailable runners expose zero available capacity; heartbeat timestamps apply to dynamic runners. |
 | Lifecycle | `runner_events_total{event}`, `runner_health_checks_total{outcome}`, `session_reservations_total{outcome}`, `session_ends_total{reason}`, `session_duration_seconds`, with app identity. Reservations include allocations pending payment; only activated sessions contribute lifetime observations. |
-| Streams | `trickle_channels{kind="control\|session"}`, `trickle_buffered_bytes` for retained published segment bytes; `stream_transfer_bytes_total{app,runner_id,mode,protocol,direction}`, `stream_errors_total{app,runner_id,mode,protocol,outcome}`. Trickle requests are transport activity, not extra app invocations. |
+| Streams | `trickle_channels{kind="control\|session"}`, `trickle_buffered_bytes` for retained published segment bytes; `stream_transfer_bytes_total{app,app_id,runner_id,mode,protocol,direction}`, `stream_errors_total{app,app_id,runner_id,mode,protocol,outcome}`. Trickle requests are transport activity, not extra app invocations. |
 | Payments | `payment_operations_total{operation,outcome}` for challenge/receive/refresh/charge; `payment_tickets_total{kind="accepted\|winning"}`, `payment_credit_eth_total`, `payment_charge_eth_total`, `payment_billed_seconds_total`, `payment_fixed_charges_total`, with app identity. Credit is accepted expected ticket value; charges are successfully debited service usage. |
 | Signer | `signer_payments_total{type,outcome}`, `signer_tickets_total{type}`, `signer_sign_operations_total{kind,outcome}`. Signing kinds are ticket, segment, state, and orchestrator_info. Partial signing before a failed request remains visible. Successful payment/ticket totals follow required outbox persistence, even if response delivery is interrupted. |
 | Authorization | `signer_auth_webhook_requests_total{status,outcome}`, `signer_auth_webhook_duration_seconds`, `signer_auth_cache_hits_total`. Status zero means no webhook response; outcomes distinguish success, denied, and error. |

@@ -6,8 +6,10 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"math/big"
+	"strconv"
 	"sync"
 	"time"
 
@@ -25,6 +27,7 @@ var maxWinProb = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewI
 type PaymentEngine struct {
 	metrics       *observability.Metrics
 	identity      func(string, string) observability.Identity
+	registration  func(string) *appLifetime
 	mu            sync.Mutex
 	store         *RedeemerDB
 	chain         pm.PaymentChain
@@ -40,17 +43,18 @@ type PaymentEngine struct {
 }
 
 // Session scope, the latest response, and accounting are process-local, just as
-// the runner sessions are. Issued PM parameters and secrets are never persisted.
+// the app sessions are. Issued PM parameters and secrets are never persisted.
 // The cached response serves refresh/retry routes; it does not authenticate PM.
 type paymentSession struct {
-	runner     string
-	payer      ethcommon.Address
-	price      wire.PriceInfo
-	unit       string
-	info       []byte
-	balance    *big.Rat
-	lastCharge time.Time
-	updated    time.Time
+	registration *appLifetime
+	appID        string
+	payer        ethcommon.Address
+	price        wire.PriceInfo
+	unit         string
+	info         []byte
+	balance      *big.Rat
+	lastCharge   time.Time
+	updated      time.Time
 }
 
 func NewPaymentEngine(store *RedeemerDB, chain pm.PaymentChain, recipient ethcommon.Address, faceValue, winProb *big.Int) (*PaymentEngine, error) {
@@ -74,14 +78,22 @@ type Challenge struct {
 
 // MakeChallenge returns a Python/Go runner compatible 402 body. Ticket
 // parameters are authenticated by the recipient HMAC.
-func (e *PaymentEngine) MakeChallenge(ctx context.Context, runner, manifest string, payer ethcommon.Address, price int64, unit, service string) (challenge Challenge, result error) {
-	labels := e.paymentLabels(runner, manifest)
-	defer func() { e.recordPayment("challenge", result, labels) }()
-	return e.makeChallenge(ctx, runner, manifest, payer, price, unit, service)
+func (e *PaymentEngine) MakeChallenge(ctx context.Context, appID, manifest string, payer ethcommon.Address, price int64, unit, service string) (challenge Challenge, result error) {
+	var registration *appLifetime
+	if e.registration != nil {
+		registration = e.registration(appID)
+	}
+	return e.makeAppChallenge(ctx, appID, manifest, payer, price, unit, service, registration)
 }
 
-func (e *PaymentEngine) makeChallenge(ctx context.Context, runner, manifest string, payer ethcommon.Address, price int64, unit, service string) (Challenge, error) {
-	if runner == "" || manifest == "" || payer == (ethcommon.Address{}) || price <= 0 || (unit != "seconds" && unit != "fixed") {
+func (e *PaymentEngine) makeAppChallenge(ctx context.Context, appID, manifest string, payer ethcommon.Address, price int64, unit, service string, registration *appLifetime) (challenge Challenge, result error) {
+	labels := e.paymentLabels(appID, manifest)
+	defer func() { e.recordPayment("challenge", result, labels) }()
+	return e.makeChallenge(ctx, appID, manifest, payer, price, unit, service, registration)
+}
+
+func (e *PaymentEngine) makeChallenge(ctx context.Context, appID, manifest string, payer ethcommon.Address, price int64, unit, service string, registration *appLifetime) (Challenge, error) {
+	if appID == "" || manifest == "" || payer == (ethcommon.Address{}) || price <= 0 || (unit != "seconds" && unit != "fixed") {
 		return Challenge{}, errors.New("invalid payment challenge scope")
 	}
 	snapshot, err := e.chain.Snapshot(ctx)
@@ -116,17 +128,17 @@ func (e *PaymentEngine) makeChallenge(ctx context.Context, runner, manifest stri
 		if len(e.sessions) >= 100000 {
 			return Challenge{}, errPaymentSessionCapacity
 		}
-		current = &paymentSession{runner: runner, payer: payer, price: priceInfo, unit: unit, balance: new(big.Rat)}
+		current = &paymentSession{appID: appID, registration: registration, payer: payer, price: priceInfo, unit: unit, balance: new(big.Rat)}
 		e.sessions[manifest] = current
-	} else if current.runner != runner || current.payer != payer || current.price != priceInfo || current.unit != unit {
+	} else if current.appID != appID || current.registration != registration || current.payer != payer || current.price != priceInfo || current.unit != unit {
 		return Challenge{}, errors.New("payment session scope conflict")
 	}
 	current.info, current.updated = wire.EncodeOrchestratorInfo(info), time.Now()
-	return paymentChallenge(runner, manifest, service, current.info), nil
+	return paymentChallenge(appID, manifest, service, current.info), nil
 }
 
-func paymentChallenge(runner, manifest, service string, info []byte) Challenge {
-	return Challenge{PaymentParams: base64.StdEncoding.EncodeToString(info), Orchestrator: service, ManifestID: manifest, PaymentURL: service + "/apps/" + runner + "/session/" + manifest + "/payment"}
+func paymentChallenge(appID, manifest, service string, info []byte) Challenge {
+	return Challenge{PaymentParams: base64.StdEncoding.EncodeToString(info), Orchestrator: service, ManifestID: manifest, PaymentURL: service + "/apps/" + appID + "/session/" + manifest + "/payment"}
 }
 
 func (e *PaymentEngine) ChallengeInfo(manifest string) (wire.OrchestratorInfo, error) {
@@ -139,14 +151,14 @@ func (e *PaymentEngine) ChallengeInfo(manifest string) (wire.OrchestratorInfo, e
 	return wire.DecodeOrchestratorInfo(current.info)
 }
 
-func (e *PaymentEngine) ChallengeForManifest(runner, manifest, service string) (Challenge, error) {
+func (e *PaymentEngine) ChallengeForManifest(appID, manifest, service string) (Challenge, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	current := e.sessions[manifest]
-	if current == nil || current.runner != runner {
+	if current == nil || current.appID != appID {
 		return Challenge{}, ErrMissingChallenge
 	}
-	return paymentChallenge(runner, manifest, service, current.info), nil
+	return paymentChallenge(appID, manifest, service, current.info), nil
 }
 
 func (e *PaymentEngine) RefreshChallenge(ctx context.Context, manifest string, payer ethcommon.Address, service string) (challenge Challenge, result error) {
@@ -158,12 +170,12 @@ func (e *PaymentEngine) RefreshChallenge(ctx context.Context, manifest string, p
 		e.mu.Unlock()
 		return Challenge{}, ErrMissingChallenge
 	}
-	runner, expectedPayer, price, unit := current.runner, current.payer, current.price, current.unit
+	appID, expectedPayer, price, unit, registration := current.appID, current.payer, current.price, current.unit, current.registration
 	e.mu.Unlock()
 	if payer != expectedPayer {
 		return Challenge{}, ErrInvalidPayment
 	}
-	return e.makeChallenge(ctx, runner, manifest, payer, price.PricePerUnit, unit, service)
+	return e.makeChallenge(ctx, appID, manifest, payer, price.PricePerUnit, unit, service, registration)
 }
 
 func ManifestFromSegment(header string) (string, error) {
@@ -205,8 +217,8 @@ func decodeHeaders(paymentHeader, segmentHeader string) (wire.Payment, wire.SegD
 	return payment, segment, nil
 }
 
-func (e *PaymentEngine) Receive(ctx context.Context, runner, manifest, paymentHeader, segmentHeader string) (payerResult ethcommon.Address, credit *big.Rat, result error) {
-	labels := e.paymentLabels(runner, manifest)
+func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHeader, segmentHeader string) (payerResult ethcommon.Address, credit *big.Rat, result error) {
+	labels := e.paymentLabels(appID, manifest)
 	defer func() { e.recordPayment("receive", result, labels) }()
 	payment, segment, err := decodeHeaders(paymentHeader, segmentHeader)
 	if err != nil {
@@ -222,10 +234,10 @@ func (e *PaymentEngine) Receive(ctx context.Context, runner, manifest, paymentHe
 		e.mu.Unlock()
 		return ethcommon.Address{}, nil, ErrMissingChallenge
 	}
-	runnerMatches, payerMatches, price := session.runner == runner, session.payer == payer, session.price
+	appMatches, payerMatches, price := session.appID == appID, session.payer == payer, session.price
 	e.mu.Unlock()
 	params, recipientRand, err := e.authenticatePayment(payment, segment.Auth)
-	if err != nil || !runnerMatches || !payerMatches || payment.ExpectedPrice != price || len(payment.PayerParams) == 0 || len(payment.PayerParams) > 100 {
+	if err != nil || !appMatches || !payerMatches || payment.ExpectedPrice != price || len(payment.PayerParams) == 0 || len(payment.PayerParams) > 100 {
 		return ethcommon.Address{}, nil, ErrInvalidPayment
 	}
 	flatten := append([]byte(manifest), make([]byte, 32)...)
@@ -377,15 +389,21 @@ func (e *PaymentEngine) Balance(manifest string) (*big.Rat, error) {
 }
 
 // ChallengePrice returns the agreed quote for a pending reservation, scoped to
-// its runner. Updating the runner/feed must not change a previously issued quote.
-func (e *PaymentEngine) ChallengePrice(runner, manifest string) (int64, string, error) {
+// its app registration. App and feed updates must not change a previously issued quote.
+func (e *PaymentEngine) ChallengePrice(appID, manifest string) (int64, string, error) {
+	quote, err := e.challengeQuote(appID, manifest)
+	price, _ := quote.Price.Int64()
+	return price, quote.Unit, err
+}
+
+func (e *PaymentEngine) challengeQuote(appID, manifest string) (appQuote, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	current := e.sessions[manifest]
-	if current == nil || current.runner != runner {
-		return 0, "", ErrMissingChallenge
+	if current == nil || current.appID != appID {
+		return appQuote{}, ErrMissingChallenge
 	}
-	return current.price.PricePerUnit, current.unit, nil
+	return appQuote{priceInfo: priceInfo{Price: json.Number(strconv.FormatInt(current.price.PricePerUnit, 10)), Currency: "wei", Unit: current.unit}, registration: current.registration}, nil
 }
 
 // authenticatePayment reconstructs the PM commitment from the supplied fields,
