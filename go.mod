@@ -9,7 +9,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/holiman/uint256 v1.3.2
-	github.com/j0sh/boa v1.0.2
+	github.com/j0sh/boa v1.0.4
 	github.com/j0sh/minikafka v0.0.0-20261001174935-0bc8dcedd322
 	github.com/prometheus/client_golang v1.25.0
 	github.com/segmentio/kafka-go v0.4.51

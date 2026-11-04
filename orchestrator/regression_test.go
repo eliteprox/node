@@ -24,7 +24,7 @@ import (
 
 func TestRegressionUnauthenticatedSlowBodiesCannotStarveDiscovery(t *testing.T) {
 	address := fmt.Sprintf("127.0.0.1:%d", freeTCPPort(t))
-	p := Params{Listen: netip.MustParseAddrPort(address), MetricsListen: netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", freeTCPPort(t))), ServiceURL: boa.Text[*url.URL]{Value: mustURL(t, "http://"+address)}, BootstrapSecret: "bootstrap", HeartbeatInterval: time.Second, HeartbeatTTL: time.Minute}
+	p := Params{Listen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort(address)}, MetricsListen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", freeTCPPort(t)))}, ServiceURL: boa.Text[*url.URL]{Value: mustURL(t, "http://"+address)}, BootstrapSecret: "bootstrap", HeartbeatInterval: time.Second, HeartbeatTTL: time.Minute}
 	require.NoError(t, p.Validate())
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)

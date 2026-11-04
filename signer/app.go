@@ -8,7 +8,6 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"os/signal"
 	"sync"
@@ -44,8 +43,8 @@ type Params struct {
 	WeiPerUSD                   *big.Rat             `name:"wei-per-usd" optional:"true" descr:"Fixed wei per USD conversion, mostly for testing"`
 	ETHUSDFeed                  ethcommon.Address    `name:"eth-usd-feed" optional:"true" descr:"ETH/USD oracle address"`
 	ETHUSDMaxAge                time.Duration        `name:"eth-usd-max-age" default:"2h" descr:"Maximum age of the ETH/USD oracle observation"`
-	Listen                      netip.AddrPort       `name:"listen" default:"127.0.0.1:8937"`
-	MetricsListen               netip.AddrPort       `name:"metrics-listen" default:"127.0.0.1:8938"`
+	Listen                      boa.HTTPBind         `name:"listen" default:"127.0.0.1:8937"`
+	MetricsListen               boa.HTTPBind         `name:"metrics-listen" default:"127.0.0.1:8938"`
 	RPCURL                      *url.URL             `name:"rpc-url" secret:"true" required:"true"`
 	RPCURLFile                  string               `basepath:"source" name:"rpc-url-file" secretfor:"RPCURL"`
 	ChainID                     *uint64              `name:"chain-id" min:"1" descr:"Optional expected RPC chain ID"`
@@ -116,8 +115,8 @@ func (p Params) Validate() error {
 	if _, err := p.payerPolicy(); err != nil {
 		return fmt.Errorf("invalid payer limits (--max-ticket-ev, --max-batch-ev, --deposit-multiplier): %w", err)
 	}
-	if !p.MetricsListen.Addr().IsLoopback() {
-		return errors.New("--metrics-listen (or LIVEPEER_SIGNER_METRICS_LISTEN) must bind a loopback IP:port address, e.g. 127.0.0.1:8938 or [::1]:8938")
+	if !p.Listen.IsValid() || !p.MetricsListen.IsValid() {
+		return errors.New("--listen and --metrics-listen require IP:port addresses")
 	}
 	if err := destination.ValidateURL(p.RPCURL); err != nil {
 		return fmt.Errorf("invalid RPC URL (LIVEPEER_SIGNER_RPC_URL or --rpc-url-file): %w", err)
@@ -226,7 +225,7 @@ func serve(parent context.Context, p Params) error {
 	defer listener.Close()
 	metricsListener, err := net.Listen("tcp", p.MetricsListen.String())
 	if err != nil {
-		return fmt.Errorf("cannot start signer metrics listener on %s; choose an available loopback address with --metrics-listen or LIVEPEER_SIGNER_METRICS_LISTEN: %w", p.MetricsListen, err)
+		return fmt.Errorf("cannot start signer metrics listener on %s; choose an available address with --metrics-listen or LIVEPEER_SIGNER_METRICS_LISTEN: %w", p.MetricsListen, err)
 	}
 	defer metricsListener.Close()
 	metricsMux := http.NewServeMux()

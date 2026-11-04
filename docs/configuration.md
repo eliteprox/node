@@ -142,7 +142,7 @@ For signer accounting, use an owner-only parent directory and preserve those
 permissions on SQLite's WAL and SHM files during restore.
 See [payment recovery](payment-recovery.md) for backup and restart procedures.
 
-Health and metrics endpoints use separate loopback listeners:
+Health and metrics endpoints use separate listeners that default to loopback:
 
 | Component | Default application address | Default metrics address |
 | --- | --- | --- |
@@ -156,6 +156,7 @@ curl -fsS http://127.0.0.1:8938/readyz
 curl -fsS http://127.0.0.1:8940/readyz
 ```
 
-All metrics listeners serve `/healthz`, `/readyz`, and `/metrics`.
+All metrics listeners serve `/healthz`, `/readyz`, and `/metrics`. Non-loopback
+`Listen` and `MetricsListen` addresses require `unsafe@`, e.g. `unsafe@0.0.0.0:8936`.
 See [metrics and operational events](metrics.md) for readiness requirements,
 scrape configuration, measurements, and query/alert examples.

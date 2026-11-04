@@ -137,7 +137,7 @@ func TestO2RKeepaliveRepeatsUntilShutdown(t *testing.T) {
 
 func TestRunnerServiceURLValidation(t *testing.T) {
 	p := Params{
-		Listen: netip.MustParseAddrPort("[::]:8935"), MetricsListen: netip.MustParseAddrPort("[::1]:8936"),
+		Listen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("[::]:8935")}, MetricsListen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("[::1]:8936")},
 		ServiceURL: boa.Text[*url.URL]{Value: mustURL(t, "https://public.example/external")}, RunnerServiceURL: boa.Text[*url.URL]{Value: mustURL(t, "http://runner.internal/internal")},
 		BootstrapSecret: "bootstrap", HeartbeatInterval: time.Second, HeartbeatTTL: time.Minute,
 	}

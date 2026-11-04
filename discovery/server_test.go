@@ -25,7 +25,7 @@ import (
 
 func discoveryTestParams(t *testing.T, targets ...string) Params {
 	t.Helper()
-	p := Params{Listen: netip.MustParseAddrPort("127.0.0.1:8939"), MetricsListen: netip.MustParseAddrPort("127.0.0.1:8940"), AdvertiseNodes: true, AdvertiseRunners: true, RefreshInterval: 5 * time.Minute, MaxFailedRefreshes: 6, Grants: []string{"127.0.0.1"}}
+	p := Params{Listen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:8939")}, MetricsListen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:8940")}, AdvertiseNodes: true, AdvertiseRunners: true, RefreshInterval: 5 * time.Minute, MaxFailedRefreshes: 6, Grants: []string{"127.0.0.1"}}
 	for _, target := range targets {
 		p.Nodes = append(p.Nodes, boa.Text[*url.URL]{Value: mustURL(t, target)})
 	}

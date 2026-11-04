@@ -31,8 +31,8 @@ func validParams(t *testing.T) Params {
 	t.Helper()
 	return Params{
 		DiscoveryRefreshInterval: 5 * time.Minute, DiscoveryMaxFailedRefreshes: 6,
-		Listen:        netip.MustParseAddrPort("0.0.0.0:8937"),
-		MetricsListen: netip.MustParseAddrPort("127.0.0.1:8938"),
+		Listen:        boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:8937")},
+		MetricsListen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:8938")},
 		KeystoreFile:  "key", KeystorePasswordFile: "password", DepositMultiplier: 1,
 		RPCURL:         testURL(t, "http://localhost:8545"),
 		Controller:     ethcommon.HexToAddress("0x1234567890123456789012345678901234567890"),
@@ -44,7 +44,6 @@ func validParams(t *testing.T) Params {
 }
 
 func TestSignerConfigurationValidation(t *testing.T) {
-	require.NoError(t, validParams(t).Validate())
 	p := validParams(t)
 	p.DiscoveryMaxFailedRefreshes = 0
 	require.NoError(t, p.Validate())
@@ -54,6 +53,8 @@ func TestSignerConfigurationValidation(t *testing.T) {
 		want   string
 	}{
 		{"missing password file", func(p *Params) { p.KeystorePasswordFile = "" }, "keystore-password-file"},
+		{"empty listen", func(p *Params) { p.Listen = boa.HTTPBind{} }, "IP:port"},
+		{"empty metrics", func(p *Params) { p.MetricsListen = boa.HTTPBind{} }, "IP:port"},
 		{"empty Kafka", func(p *Params) { p.Kafka = &KafkaConfig{} }, "kafka broker"},
 		{"RPC scheme", func(p *Params) { p.RPCURL = testURL(t, "file:///rpc") }, "RPC URL"},
 		{"Controller", func(p *Params) { p.Controller = ethcommon.Address{} }, "controller-address"},
@@ -62,7 +63,6 @@ func TestSignerConfigurationValidation(t *testing.T) {
 		{"fixed price", func(p *Params) { p.MaxFixedPrice = big.NewRat(0, 1) }, "max-fixed-price"},
 		{"fixed rate", func(p *Params) { p.WeiPerUSD = big.NewRat(0, 1) }, "wei-per-usd"},
 		{"feed age", func(p *Params) { p.WeiPerUSD = nil }, "eth-usd-max-age"},
-		{"metrics", func(p *Params) { p.MetricsListen = netip.MustParseAddrPort("0.0.0.0:8938") }, "loopback"},
 		{"zero deposit multiplier", func(p *Params) { p.DepositMultiplier = 0 }, "deposit multiplier"},
 		{"headers without webhook", func(p *Params) { p.AuthWebhookHeaders = Headers{"Authorization": {"Bearer token"}} }, "webhook URL"},
 		{"orchestrator headers without webhook", func(p *Params) { p.OrchestratorWebhookHeaders = Headers{"Authorization": {"Bearer token"}} }, "orchestrator webhook URL"},
@@ -132,7 +132,7 @@ func TestSignerLoadsConfigAndSecretFiles(t *testing.T) {
 			require.NoError(t, os.WriteFile(webhookFile, []byte("http://localhost:9000/auth"), 0600))
 			require.NoError(t, os.WriteFile(headersFile, []byte("Authorization: Bearer private-token, X-User: alice"), 0600))
 			config := `Listen = "127.0.0.1:9001"
-MetricsListen = "127.0.0.1:9002"
+MetricsListen = "unsafe@0.0.0.0:9002"
 KeystoreFile = "keystore.json"
 KeystorePasswordFile = "password"
 RPCURLFile = "rpc"
@@ -161,6 +161,7 @@ DiscoveryGrants = ["127.0.0.1:8935"]
 					require.NotContains(t, string(dumped), p.OrchestratorWebhook.String())
 					require.NotContains(t, string(dumped), http.Header(p.OrchestratorWebhookHeaders).Get("Authorization"))
 					require.Contains(t, string(dumped), "OrchestratorWebhookRefreshInterval")
+					require.Contains(t, string(dumped), "unsafe@0.0.0.0:9002")
 					return p.Validate()
 				},
 			}
@@ -168,7 +169,8 @@ DiscoveryGrants = ["127.0.0.1:8935"]
 			require.Equal(t, uint64(42161), *p.ChainID)
 			require.Equal(t, "0xD8E8328501E9645d16Cf49539efC04f734606ee4", p.Controller.Hex())
 			require.Equal(t, "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612", p.ETHUSDFeed.Hex())
-			require.Equal(t, netip.MustParseAddrPort("127.0.0.1:9001"), p.Listen)
+			require.Equal(t, boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:9001")}, p.Listen)
+			require.Equal(t, "0.0.0.0:9002", p.MetricsListen.String())
 			require.Equal(t, keyFile, p.KeystoreFile)
 			require.Equal(t, passwordPath, p.KeystorePasswordFile)
 			require.NotNil(t, p.KeystorePassword)
@@ -338,12 +340,12 @@ func TestSignerReadiness(t *testing.T) {
 			p.OrchestratorWebhook = testURL(t, rpc.URL+"/list")
 			p.OrchestratorWebhookRefreshInterval = time.Hour
 			p.DiscoveryGrants = []string{"127.0.0.1"}
-			free := func() netip.AddrPort {
+			free := func() boa.HTTPBind {
 				l, err := net.Listen("tcp", "127.0.0.1:0")
 				require.NoError(t, err)
 				address := l.Addr().(*net.TCPAddr).AddrPort()
 				require.NoError(t, l.Close())
-				return address
+				return boa.HTTPBind{AddrPort: address}
 			}
 			p.Listen, p.MetricsListen = free(), free()
 			var outbox *eventOutbox

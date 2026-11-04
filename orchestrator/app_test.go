@@ -112,12 +112,12 @@ func TestPaidHTTPStartup(t *testing.T) {
 			defer rpc.Close()
 			defer releaseDependencies()
 			p.RPCURL = mustURL(t, rpc.URL)
-			p.Listen = netip.MustParseAddrPort(fmt.Sprintf("0.0.0.0:%d", mainPort))
-			p.MetricsListen = netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", metricsPort))
+			require.NoError(t, p.Listen.UnmarshalText(fmt.Appendf(nil, "unsafe@0.0.0.0:%d", mainPort)))
+			require.NoError(t, p.MetricsListen.UnmarshalText(fmt.Appendf(nil, "unsafe@0.0.0.0:%d", metricsPort)))
+			metricsURL := fmt.Sprintf("http://127.0.0.1:%d", metricsPort)
 			p.ServiceURL = boa.Text[*url.URL]{Value: mustURL(t, "https://public.example/external")}
 			p.RunnerConfig = filepath.Join(t.TempDir(), "runners.toml")
 			require.NoError(t, os.WriteFile(p.RunnerConfig, []byte("[[Runners]]\nID = 'r'\nRunnerURL = 'https://runner.example'\nApp = 'test'\n[Runners.PriceInfo]\nPrice = 1\n"), 0600))
-			require.NoError(t, p.Validate())
 			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan error, 1)
 			go func() { done <- Serve(ctx, p, io.Discard) }()
@@ -140,7 +140,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 			}, 5*time.Second, 20*time.Millisecond)
 			require.EqualValues(t, 1, requests.Load())
 			require.FileExists(t, p.RedeemerDB)
-			response, err := http.Get("http://" + p.MetricsListen.String() + "/readyz")
+			response, err := http.Get(metricsURL + "/readyz")
 			require.NoError(t, err)
 			response.Body.Close()
 			require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
@@ -177,14 +177,14 @@ func TestPaidHTTPStartup(t *testing.T) {
 			require.Equal(t, recipient.Bytes(), info.Address)
 			require.Equal(t, recipient.Bytes(), info.TicketParams.Recipient)
 			require.Eventually(t, func() bool {
-				ready, err := http.Get("http://" + p.MetricsListen.String() + "/readyz")
+				ready, err := http.Get(metricsURL + "/readyz")
 				if err != nil {
 					return false
 				}
 				defer ready.Body.Close()
 				return ready.StatusCode == http.StatusOK
 			}, 7*time.Second, 20*time.Millisecond, "paid readiness must become healthy after the first dependency and worker observations")
-			response, err = http.Get("http://" + p.MetricsListen.String() + "/metrics")
+			response, err = http.Get(metricsURL + "/metrics")
 			require.NoError(t, err)
 			metrics, err := io.ReadAll(response.Body)
 			response.Body.Close()
@@ -219,12 +219,12 @@ RunnerGrants = ['10.0.0.0/8', 'fc00::/7']
 			} {
 				t.Setenv("LIVEPEER_ORCHESTRATOR_"+key, value)
 			}
-			output, err := execute(t, "--config", path, "--listen", "127.0.0.1:8002",
+			output, err := execute(t, "--config", path, "--listen", "unsafe@0.0.0.0:8002",
 				"--service-url", "https://user:password@flag.example", "--redeemer-max-fee-per-gas", "300",
 				"--chain-id", "3", "--controller-address", "0x0000000000000000000000000000000000000003",
 				"--health-grants", "10.0.0.0/8,fc00::/7", "--print-config")
 			require.NoError(t, err)
-			require.Contains(t, output, "127.0.0.1:8002")
+			require.Contains(t, output, "unsafe@0.0.0.0:8002")
 			for _, absent := range []string{"127.0.0.1:8001", "127.0.0.1:8000", "password", "keystore", "/missing/", "flag.example", "env.example", "super-secret-env", "keystore-secret", path} {
 				require.NotContains(t, output, absent)
 			}
@@ -346,9 +346,13 @@ func TestValidationBeforeStartup(t *testing.T) {
 	require.ErrorContains(t, err, "on-chain payments require")
 	require.True(t, boa.IsUserInputError(err))
 	require.NoFileExists(t, db)
-	_, err = execute(t, "--metrics-listen", "0.0.0.0:8936")
-	require.ErrorContains(t, err, "loopback")
-	require.True(t, boa.IsUserInputError(err))
+	for _, tc := range []struct{ value, want string }{{"", "IP:port"}, {"0.0.0.0:8936", "unsafe@0.0.0.0:8936"}} {
+		for _, flag := range []string{"--listen", "--metrics-listen"} {
+			_, err = execute(t, flag, tc.value)
+			require.ErrorContains(t, err, tc.want)
+			require.True(t, boa.IsUserInputError(err))
+		}
+	}
 
 	_, err = execute(t, "--orchestrator-address", "0x0000000000000000000000000000000000000001")
 	require.ErrorContains(t, err, "on-chain payments require")
@@ -416,7 +420,7 @@ func paymentKeystoreParams(t *testing.T, endpoint string) Params {
 	return Params{
 		RedeemerTxTimeout: 5 * time.Minute, RedeemerMaxTxReplacements: 1,
 
-		Listen: netip.MustParseAddrPort("127.0.0.1:0"), MetricsListen: netip.MustParseAddrPort("127.0.0.1:0"), ServiceURL: boa.Text[*url.URL]{Value: mustURL(t, "http://127.0.0.1:8935")},
+		Listen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:0")}, MetricsListen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:0")}, ServiceURL: boa.Text[*url.URL]{Value: mustURL(t, "http://127.0.0.1:8935")},
 		BootstrapSecret: "test", HeartbeatInterval: time.Hour, HeartbeatTTL: 2 * time.Hour,
 		RedeemerDB: filepath.Join(t.TempDir(), "payments.sqlite"), RPCURL: mustURL(t, endpoint),
 		ChainID: new(uint64(1)), Controller: new(ethcommon.HexToAddress("0x0000000000000000000000000000000000001000")),

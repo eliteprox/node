@@ -65,7 +65,7 @@ func TestSignerDiscovery(t *testing.T) {
 		require.Zero(t, connections.Load(), "denial must happen before connecting")
 	}
 	collector, err := discovery.NewServer(discovery.Params{
-		Listen: netip.MustParseAddrPort("127.0.0.1:8939"), MetricsListen: netip.MustParseAddrPort("127.0.0.1:8940"),
+		Listen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:8939")}, MetricsListen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:8940")},
 		Nodes: []boa.Text[*url.URL]{{Value: sources["good"]}}, Grants: []string{endpoint.Hostname()},
 		AdvertiseNodes: true, AdvertiseRunners: true, RefreshInterval: time.Minute, MaxFailedRefreshes: 6,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))

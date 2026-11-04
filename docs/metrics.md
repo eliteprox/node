@@ -1,6 +1,6 @@
 # Metrics and operational events
 
-Scrape `/metrics` on each component's existing loopback `MetricsListen`:
+Scrape `/metrics` on each component's `MetricsListen` (loopback by default):
 
 ```yaml
 scrape_configs:

@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,13 +21,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func freeAddress(t *testing.T) netip.AddrPort {
+func freeAddress(t *testing.T) boa.HTTPBind {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	address := l.Addr().(*net.TCPAddr).AddrPort()
 	require.NoError(t, l.Close())
-	return address
+	return boa.HTTPBind{AddrPort: address}
 }
 
 func TestServeWithoutRunnerOrPaymentDependencies(t *testing.T) {
@@ -108,12 +107,17 @@ func TestDiscoveryConfigDefaultsAndPrecedence(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, out, `RefreshInterval = "3m0s"`)
 	require.Contains(t, out, "AdvertiseNodes = true")
+	out, err = execute(t, "--listen=unsafe@[::]:8939", "--metrics-listen=unsafe@0.0.0.0:8940", "--print-config")
+	require.NoError(t, err)
+	require.Contains(t, out, `Listen = "unsafe@[::]:8939"`)
+	require.Contains(t, out, `MetricsListen = "unsafe@0.0.0.0:8940"`)
 }
 
 func TestDiscoveryInvalidConfig(t *testing.T) {
 	for _, args := range [][]string{
 		{"--refresh-interval=0"}, {"--max-failed-refreshes=-1"}, {"--grants=bad"},
-		{"--metrics-listen=0.0.0.0:8940"},
+		{"--metrics-listen="}, {"--metrics-listen=0.0.0.0:8940"},
+		{"--listen="}, {"--listen=[::]:8939"},
 		{"--nodes=ftp://child.example"}, {"--nodes=https://user:secret@child.example"},
 		{"--nodes=https://child.example?token=secret"}, {"--nodes=https://child.example#fragment"}, {"--runner-config=unused"},
 	} {

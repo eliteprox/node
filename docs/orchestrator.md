@@ -68,9 +68,9 @@ to use `ServiceURL`.
 
 The application listener serves HTTP and defaults to loopback. Use explicit
 IP:port addresses for `Listen` and `MetricsListen`, including IPv6 addresses
-such as `[::1]:8935`. `Listen = "0.0.0.0:8935"` or `"[::]:8935"` binds all
+such as `[::1]:8935`. `Listen = "unsafe@0.0.0.0:8935"` or `"unsafe@[::]:8935"` binds all
 interfaces. Terminate public HTTPS in a reverse proxy and set `ServiceURL` to
-its HTTPS address. The separate metrics listener must remain on loopback; see
+its HTTPS address. See
 [probe addresses](configuration.md#local-storage-and-probes).
 
 ## Sessions and proxies

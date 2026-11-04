@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -27,8 +26,8 @@ import (
 type Params struct {
 	ConfigFile string `name:"config" configfile:"optional-default" basepath:"source" default:"config.toml" boa:"noconfig" descr:"Configuration file; empty disables config discovery"`
 	nodeconfig.Settings
-	Listen             netip.AddrPort       `default:"127.0.0.1:8939" descr:"Public HTTP listener"`
-	MetricsListen      netip.AddrPort       `default:"127.0.0.1:8940" descr:"Loopback metrics listener"`
+	Listen             boa.HTTPBind         `default:"127.0.0.1:8939" descr:"Public HTTP listener"`
+	MetricsListen      boa.HTTPBind         `default:"127.0.0.1:8940" descr:"Metrics listener"`
 	Nodes              []boa.Text[*url.URL] `optional:"true" descr:"Orchestrator or discovery node base URLs"`
 	AdvertiseNodes     bool                 `default:"true" descr:"Advertise available discovery nodes"`
 	AdvertiseRunners   bool                 `default:"true" descr:"Advertise collected runners"`
