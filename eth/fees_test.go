@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -134,128 +135,130 @@ func TestCLIReplacementConfirmation(t *testing.T) {
 		{name: "reverted receipt", limit: 2, revert: true, error: "reverted", attempts: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			keyFile, passwordFile := test.WriteFixedKeystore(t)
-			key, err := OpenKeystoreFile(keyFile, passwordFile)
-			require.NoError(t, err)
-			var mu sync.Mutex
-			var sent []*types.Transaction
-			nonceReads := 0
-			rpc := testRPC(t, func(method string, params []json.RawMessage) any {
+			synctest.Test(t, func(t *testing.T) {
+				keyFile, passwordFile := test.WriteFixedKeystore(t)
+				key, err := OpenKeystoreFile(keyFile, passwordFile)
+				require.NoError(t, err)
+				var mu sync.Mutex
+				var sent []*types.Transaction
+				nonceReads := 0
+				rpc := testRPC(t, func(method string, params []json.RawMessage) any {
+					mu.Lock()
+					defer mu.Unlock()
+					switch method {
+					case "eth_call":
+						return "0x"
+					case "eth_estimateGas":
+						return "0x5208"
+					case "eth_getTransactionCount":
+						nonceReads++
+						return "0x7"
+					case "eth_getBlockByNumber":
+						base := int64(100)
+						if tc.fresh && len(sent) > 0 {
+							base = 200
+						}
+						return &types.Header{Number: big.NewInt(1), Difficulty: new(big.Int), BaseFee: big.NewInt(base)}
+					case "eth_maxPriorityFeePerGas":
+						if tc.fresh && len(sent) > 0 {
+							return "0x9"
+						}
+						return "0x3"
+					case "eth_sendRawTransaction":
+						var data hexutil.Bytes
+						require.NoError(t, json.Unmarshal(params[0], &data))
+						tx := new(types.Transaction)
+						require.NoError(t, tx.UnmarshalBinary(data))
+						sent = append(sent, tx)
+						return tx.Hash().Hex()
+					case "eth_getTransactionReceipt":
+						var hash common.Hash
+						require.NoError(t, json.Unmarshal(params[0], &hash))
+						if tc.malformed {
+							return map[string]any{"transactionHash": hash, "blockNumber": "0x10", "blockHash": common.Hash{31: 1}, "logs": []any{}, "cumulativeGasUsed": "0x0", "gasUsed": "0x0", "logsBloom": types.Bloom{}}
+						}
+						if tc.revert || (tc.originalWins && len(sent) > 1 && hash == sent[0].Hash()) || (tc.replacementWins && len(sent) > 1 && hash == sent[len(sent)-1].Hash()) {
+							status := uint64(1)
+							if tc.revert {
+								status = 0
+							}
+							return &types.Receipt{TxHash: hash, Status: status, BlockNumber: big.NewInt(16), BlockHash: common.Hash{31: 1}, Logs: []*types.Log{}}
+						}
+						return nil
+					default:
+						t.Fatalf("unexpected %s", method)
+						return nil
+					}
+				})
+				c, err := NewContracts(rpc, common.HexToAddress("0x100"))
+				require.NoError(t, err)
+				if tc.ceiling != 0 {
+					c.MaxFeePerGas = big.NewInt(tc.ceiling)
+				}
+				plan, err := c.PlanTransactionWithOptions(t.Context(), key.Address(), common.HexToAddress("0x200"), []byte{1, 2, 3}, big.NewInt(5), FeeOptions{PriorityFee: tc.tip})
+				require.NoError(t, err)
+				signed, err := c.Prepare(t.Context(), plan, key, big.NewInt(42161))
+				require.NoError(t, err)
+				require.NoError(t, c.Broadcast(t.Context(), signed))
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				if tc.cancel {
+					cancel()
+				}
+				if tc.providerTimeout {
+					rpc.http.Transport = receiptDeadlineTransport{rpc.http.Transport}
+				}
+				var reported []common.Hash
+				start := time.Now()
+				result, err := c.WaitConfirmation(ctx, signed, key, WaitOptions{Timeout: 50 * time.Millisecond, MaxReplacements: tc.limit}, func(tx SignedTransaction, p TransactionPlan) error {
+					reported = append(reported, tx.Hash)
+					require.Equal(t, signed.Nonce, tx.Nonce)
+					require.Equal(t, plan.GasLimit, p.GasLimit)
+					return nil
+				})
+				if tc.error != "" {
+					require.ErrorContains(t, err, tc.error)
+				} else {
+					require.NoError(t, err)
+					winner := signed.Hash
+					if tc.replacementWins {
+						winner = result.Attempts[len(result.Attempts)-1]
+					}
+					require.Equal(t, winner, result.Hash)
+					require.EqualValues(t, 16, result.Block)
+				}
+				require.Len(t, result.Attempts, tc.attempts)
+				require.Len(t, reported, tc.attempts-1)
+				if tc.name == "exhaustion waits after final" {
+					require.GreaterOrEqual(t, time.Since(start), 150*time.Millisecond)
+				}
 				mu.Lock()
 				defer mu.Unlock()
-				switch method {
-				case "eth_call":
-					return "0x"
-				case "eth_estimateGas":
-					return "0x5208"
-				case "eth_getTransactionCount":
-					nonceReads++
-					return "0x7"
-				case "eth_getBlockByNumber":
-					base := int64(100)
-					if tc.fresh && len(sent) > 0 {
-						base = 200
+				require.Len(t, sent, tc.attempts)
+				require.Equal(t, 1, nonceReads, "replacements must not reserve another nonce")
+				for i, tx := range sent {
+					require.Equal(t, result.Attempts[i], tx.Hash())
+					require.EqualValues(t, 7, tx.Nonce())
+					require.Equal(t, sent[0].To(), tx.To())
+					require.Equal(t, sent[0].Value(), tx.Value())
+					require.Equal(t, sent[0].Data(), tx.Data())
+					require.Equal(t, sent[0].Gas(), tx.Gas())
+					if i > 0 {
+						require.GreaterOrEqual(t, tx.GasTipCap().Cmp(bumpFee(sent[i-1].GasTipCap())), 0)
+						require.GreaterOrEqual(t, tx.GasFeeCap().Cmp(bumpFee(sent[i-1].GasFeeCap())), 0)
 					}
-					return &types.Header{Number: big.NewInt(1), Difficulty: new(big.Int), BaseFee: big.NewInt(base)}
-				case "eth_maxPriorityFeePerGas":
-					if tc.fresh && len(sent) > 0 {
-						return "0x9"
-					}
-					return "0x3"
-				case "eth_sendRawTransaction":
-					var data hexutil.Bytes
-					require.NoError(t, json.Unmarshal(params[0], &data))
-					tx := new(types.Transaction)
-					require.NoError(t, tx.UnmarshalBinary(data))
-					sent = append(sent, tx)
-					return tx.Hash().Hex()
-				case "eth_getTransactionReceipt":
-					var hash common.Hash
-					require.NoError(t, json.Unmarshal(params[0], &hash))
-					if tc.malformed {
-						return map[string]any{"transactionHash": hash, "blockNumber": "0x10", "blockHash": common.Hash{31: 1}, "logs": []any{}, "cumulativeGasUsed": "0x0", "gasUsed": "0x0", "logsBloom": types.Bloom{}}
-					}
-					if tc.revert || (tc.originalWins && len(sent) > 1 && hash == sent[0].Hash()) || (tc.replacementWins && len(sent) > 1 && hash == sent[len(sent)-1].Hash()) {
-						status := uint64(1)
-						if tc.revert {
-							status = 0
-						}
-						return &types.Receipt{TxHash: hash, Status: status, BlockNumber: big.NewInt(16), BlockHash: common.Hash{31: 1}, Logs: []*types.Log{}}
-					}
-					return nil
-				default:
-					t.Fatalf("unexpected %s", method)
-					return nil
+				}
+				if tc.fresh {
+					require.Equal(t, "9", sent[1].GasTipCap().String())
+					require.Equal(t, "409", sent[1].GasFeeCap().String())
+				} else if tc.tip != nil {
+					require.Equal(t, "23", sent[1].GasTipCap().String())
+					require.Equal(t, "245", sent[1].GasFeeCap().String())
+				} else if len(sent) > 1 {
+					require.Equal(t, "4", sent[1].GasTipCap().String())
+					require.Equal(t, "226", sent[1].GasFeeCap().String())
 				}
 			})
-			c, err := NewContracts(rpc, common.HexToAddress("0x100"))
-			require.NoError(t, err)
-			if tc.ceiling != 0 {
-				c.MaxFeePerGas = big.NewInt(tc.ceiling)
-			}
-			plan, err := c.PlanTransactionWithOptions(t.Context(), key.Address(), common.HexToAddress("0x200"), []byte{1, 2, 3}, big.NewInt(5), FeeOptions{PriorityFee: tc.tip})
-			require.NoError(t, err)
-			signed, err := c.Prepare(t.Context(), plan, key, big.NewInt(42161))
-			require.NoError(t, err)
-			require.NoError(t, c.Broadcast(t.Context(), signed))
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			if tc.cancel {
-				cancel()
-			}
-			if tc.providerTimeout {
-				rpc.http.Transport = receiptDeadlineTransport{rpc.http.Transport}
-			}
-			var reported []common.Hash
-			start := time.Now()
-			result, err := c.WaitConfirmation(ctx, signed, key, WaitOptions{Timeout: 50 * time.Millisecond, MaxReplacements: tc.limit}, func(tx SignedTransaction, p TransactionPlan) error {
-				reported = append(reported, tx.Hash)
-				require.Equal(t, signed.Nonce, tx.Nonce)
-				require.Equal(t, plan.GasLimit, p.GasLimit)
-				return nil
-			})
-			if tc.error != "" {
-				require.ErrorContains(t, err, tc.error)
-			} else {
-				require.NoError(t, err)
-				winner := signed.Hash
-				if tc.replacementWins {
-					winner = result.Attempts[len(result.Attempts)-1]
-				}
-				require.Equal(t, winner, result.Hash)
-				require.EqualValues(t, 16, result.Block)
-			}
-			require.Len(t, result.Attempts, tc.attempts)
-			require.Len(t, reported, tc.attempts-1)
-			if tc.name == "exhaustion waits after final" {
-				require.GreaterOrEqual(t, time.Since(start), 150*time.Millisecond)
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			require.Len(t, sent, tc.attempts)
-			require.Equal(t, 1, nonceReads, "replacements must not reserve another nonce")
-			for i, tx := range sent {
-				require.Equal(t, result.Attempts[i], tx.Hash())
-				require.EqualValues(t, 7, tx.Nonce())
-				require.Equal(t, sent[0].To(), tx.To())
-				require.Equal(t, sent[0].Value(), tx.Value())
-				require.Equal(t, sent[0].Data(), tx.Data())
-				require.Equal(t, sent[0].Gas(), tx.Gas())
-				if i > 0 {
-					require.GreaterOrEqual(t, tx.GasTipCap().Cmp(bumpFee(sent[i-1].GasTipCap())), 0)
-					require.GreaterOrEqual(t, tx.GasFeeCap().Cmp(bumpFee(sent[i-1].GasFeeCap())), 0)
-				}
-			}
-			if tc.fresh {
-				require.Equal(t, "9", sent[1].GasTipCap().String())
-				require.Equal(t, "409", sent[1].GasFeeCap().String())
-			} else if tc.tip != nil {
-				require.Equal(t, "23", sent[1].GasTipCap().String())
-				require.Equal(t, "245", sent[1].GasFeeCap().String())
-			} else if len(sent) > 1 {
-				require.Equal(t, "4", sent[1].GasTipCap().String())
-				require.Equal(t, "226", sent[1].GasFeeCap().String())
-			}
 		})
 	}
 }

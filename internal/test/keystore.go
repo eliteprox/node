@@ -14,7 +14,7 @@ import (
 )
 
 // WriteKeystore creates an owner-only keystore and exact-byte password file. A nil
-// private key generates a new account. Lightweight scrypt is only for tests.
+// private key generates a new account. Minimal scrypt parameters are only for tests.
 func WriteKeystore(t testing.TB, private *ecdsa.PrivateKey) (keystorePath, passwordPath string) {
 	t.Helper()
 	if private == nil {
@@ -25,7 +25,7 @@ func WriteKeystore(t testing.TB, private *ecdsa.PrivateKey) (keystorePath, passw
 	const password = "  test keystore password\r\n"
 	data, err := keystore.EncryptKey(&keystore.Key{
 		Id: uuid.New(), Address: crypto.PubkeyToAddress(private.PublicKey), PrivateKey: private,
-	}, password, keystore.LightScryptN, keystore.LightScryptP)
+	}, password, 2, 1)
 	require.NoError(t, err)
 	dir := t.TempDir()
 	keystorePath, passwordPath = filepath.Join(dir, "keystore.json"), filepath.Join(dir, "password")

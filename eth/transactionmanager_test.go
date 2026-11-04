@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math/big"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -84,35 +85,37 @@ func TestTransactionManager_SendTransaction(t *testing.T) {
 }
 
 func TestTransactionManager_Wait(t *testing.T) {
-	assert := assert.New(t)
+	synctest.Test(t, func(t *testing.T) {
+		assert := assert.New(t)
 
-	eth := &stubTransactionSenderReader{
-		err:     make(map[string]error),
-		pending: true,
-	}
-	tm := NewTransactionManager(eth, nil, nil, 2*time.Second, 0)
-	defer tm.Stop()
+		eth := &stubTransactionSenderReader{
+			err:     make(map[string]error),
+			pending: true,
+		}
+		tm := NewTransactionManager(eth, nil, nil, 2*time.Second, 0)
+		defer tm.Stop()
 
-	// Test error
-	// This calls bind.WaitMined() on the ethereum client, which will never actually return the actual underlying error and only log it using go-ethereum's custom logger
-	// The expected error should thus be 'context deadline exceeded'
-	// https://github.com/ethereum/go-ethereum/blob/aa637fd38a379db6da98df0d520fb1c5139a18ce/accounts/abi/bind/util.go#L41
-	expErr := errors.New("context deadline exceeded")
+		// Test error
+		// This calls bind.WaitMined() on the ethereum client, which will never actually return the actual underlying error and only log it using go-ethereum's custom logger
+		// The expected error should thus be 'context deadline exceeded'
+		// https://github.com/ethereum/go-ethereum/blob/aa637fd38a379db6da98df0d520fb1c5139a18ce/accounts/abi/bind/util.go#L41
+		expErr := errors.New("context deadline exceeded")
 
-	tx := types.NewTransaction(1, randomNonceAddress(), big.NewInt(100), 100000, big.NewInt(100), randomManagerBytes(68))
+		tx := types.NewTransaction(1, randomNonceAddress(), big.NewInt(100), 100000, big.NewInt(100), randomManagerBytes(68))
 
-	receipt, err := tm.wait(tx)
-	assert.Nil(receipt)
-	assert.EqualError(err, expErr.Error())
+		receipt, err := tm.wait(tx)
+		assert.Nil(receipt)
+		assert.EqualError(err, expErr.Error())
 
-	// No error, stub a receipt
-	eth.receipt = types.NewReceipt(randomManagerHash().Bytes(), false, 100000)
-	eth.err = nil
+		// No error, stub a receipt
+		eth.receipt = types.NewReceipt(randomManagerHash().Bytes(), false, 100000)
+		eth.err = nil
 
-	receipt, err = tm.wait(tx)
-	assert.Equal(receipt.Status, uint64(1))
-	assert.Equal(receipt.CumulativeGasUsed, uint64(100000))
-	assert.Nil(err)
+		receipt, err = tm.wait(tx)
+		assert.Equal(receipt.Status, uint64(1))
+		assert.Equal(receipt.CumulativeGasUsed, uint64(100000))
+		assert.Nil(err)
+	})
 }
 
 func TestTransactionManager_Replace(t *testing.T) {

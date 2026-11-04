@@ -90,7 +90,7 @@ func TestOptionalChainID(t *testing.T) {
 // testRPC keeps adapter tests focused on their requests and responses.
 func testRPC(t *testing.T, reply func(string, []json.RawMessage) any) *RPC {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			ID     json.RawMessage
 			Method string
@@ -99,8 +99,10 @@ func testRPC(t *testing.T, reply func(string, []json.RawMessage) any) *RPC {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": reply(req.Method, req.Params)}))
 	}))
-	t.Cleanup(server.Close)
-	rpc, err := OpenRPC(server.URL)
+	client := server.Client()
+	endpoint, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	rpc, err := NewRPC(endpoint, client.Transport)
 	require.NoError(t, err)
 	t.Cleanup(rpc.Close)
 	return rpc
