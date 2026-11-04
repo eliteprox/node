@@ -35,8 +35,14 @@ have expired, rerun all jobs to rebuild before retrying publication.
 
 For tested snapshot bundles without publication, run
 [Build](../.github/workflows/build.yml) manually. Eligible PRs also build bundles;
-main pushes automatically test and publish snapshot Docker images, retained as
-workflow artifacts for one day.
+main pushes automatically test and publish snapshot Docker images. Exported
+images are retained as workflow artifacts for one day.
+
+## PR Docker images
+
+Same-repository PRs (except Dependabot) publish Linux amd64/arm64 images to
+`ghcr.io/livepeer/node` and `docker.io/livepeer/node`: `pr-<number>`
+(moving) and `pr-<number>-sha-<full-head-sha>`.
 
 ## Checks
 

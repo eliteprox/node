@@ -21,12 +21,34 @@ jobs:
   package:
     if: >-
       github.event_name != 'pull_request' ||
-      (github.base_ref == 'main' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+      github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/package.yml
     with:
+      commit: ${{ github.event.pull_request.head.sha || github.sha }}
       bundles: ${{ github.event_name != 'push' }}
-      export_images: ${{ github.event_name == 'push' }}
+      export_images: >-
+        ${{ github.event_name == 'push' ||
+            (github.event_name == 'pull_request' &&
+             github.actor != 'dependabot[bot]' &&
+             github.event.pull_request.user.login != 'dependabot[bot]') }}
+
+  docker-pr:
+    needs: package
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    with:
+      commit: ${{ github.event.pull_request.head.sha }}
+      version: ${{ needs.package.outputs.version }}
+      target: pr-${{ github.event.pull_request.number }}
 
   docker:
     needs: [checks, package]

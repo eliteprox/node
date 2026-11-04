@@ -3,6 +3,10 @@ name: Package
 on:
   workflow_call:
     inputs:
+      commit:
+        description: Commit to package; defaults to the workflow commit
+        type: string
+        default: ''
       release:
         type: boolean
         default: false
@@ -40,18 +44,18 @@ jobs:
     timeout-minutes: 30
     env:
       ARCH: ${{ matrix.arch }}
+      COMMIT: ${{ inputs.commit || github.sha }}
       BUILD_RELEASE: ${{ inputs.bundles }}
       EXPORT_IMAGE: ${{ inputs.export_images }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.COMMIT }}
           persist-credentials: false
       - name: Release metadata
         id: metadata
         env:
           RELEASE: ${{ inputs.release }}
-          COMMIT: ${{ github.sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$COMMIT"
           release=$(git show HEAD:VERSION)
@@ -78,7 +82,7 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           build-args: |
             VERSION=${{ steps.metadata.outputs.version }}
-            COMMIT=${{ github.sha }}
+            COMMIT=${{ env.COMMIT }}
           outputs: type=local,dest=${{ runner.temp }}/bin
           cache-from: type=gha,scope=docker-${{ matrix.arch }}
       - name: Verify static binaries
@@ -97,7 +101,7 @@ jobs:
         if: env.BUILD_RELEASE == 'true'
         env:
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
-          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_COMMIT: ${{ env.COMMIT }}
           RELEASE_GO_VERSION: ${{ steps.metadata.outputs.go }}
           SOURCE_DATE_EPOCH: ${{ steps.metadata.outputs.epoch }}
           BUNDLE: livepeer-${{ steps.metadata.outputs.version }}-linux-${{ matrix.arch }}
@@ -120,7 +124,7 @@ jobs:
         if: env.BUILD_RELEASE == 'true'
         env:
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
-          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_COMMIT: ${{ env.COMMIT }}
           BUNDLE: livepeer-${{ steps.metadata.outputs.version }}-linux-${{ matrix.arch }}
         run: |
           docker run --rm --network none --read-only --cap-drop=ALL \
@@ -139,18 +143,18 @@ jobs:
           # Matching inputs reuse the binaries stage compiled above.
           build-args: |
             VERSION=${{ steps.metadata.outputs.version }}
-            COMMIT=${{ github.sha }}
+            COMMIT=${{ env.COMMIT }}
           load: true
           tags: livepeer:test-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ env.COMMIT }}
             org.opencontainers.image.version=${{ steps.metadata.outputs.version }}
           cache-to: type=gha,scope=docker-${{ matrix.arch }},mode=max
       - name: Smoke test image
         env:
           IMAGE_VERSION: ${{ steps.metadata.outputs.version }}
-          IMAGE_COMMIT: ${{ github.sha }}
+          IMAGE_COMMIT: ${{ env.COMMIT }}
           IMAGE: livepeer:test-${{ matrix.arch }}
         run: sh .github/scripts/docker-smoke.sh "$IMAGE" "$IMAGE_VERSION" "$IMAGE_COMMIT"
       - name: Save tested release bundle

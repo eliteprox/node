@@ -10,9 +10,12 @@ on:
         required: true
         type: string
       target:
-        description: main or the release tag
+        description: main, pr-<number>, or the release tag
         required: true
         type: string
+    secrets:
+      DOCKERHUB_TOKEN:
+        required: true
 
 permissions:
   contents: read
@@ -35,13 +38,13 @@ jobs:
     steps:
       - &release_checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: inputs.target != 'main'
+        if: inputs.target != 'main' && !startsWith(inputs.target, 'pr-')
         with:
           ref: ${{ inputs.commit }}
           persist-credentials: false
       - &authorize_release
         name: Require current release administrators
-        if: inputs.target != 'main'
+        if: inputs.target != 'main' && !startsWith(inputs.target, 'pr-')
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./release.sh --authorize
@@ -69,12 +72,22 @@ jobs:
           COMMIT: ${{ inputs.commit }}
           REF_NAME: ${{ inputs.target }}
           VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_COMMIT: ${{ github.event.pull_request.head.sha }}
+          PR_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           repository=$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')
           ghcr_image="ghcr.io/$repository"
           dockerhub_image="docker.io/$repository"
           tag="sha-$COMMIT"
-          if [[ "$REF_NAME" != main ]]; then
+          if [[ "$REF_NAME" =~ ^pr-([1-9][0-9]*)$ ]]; then
+            test "$EVENT_NAME" = pull_request
+            test "$REF_NAME" = "pr-$PR_NUMBER"
+            test "$PR_REPOSITORY" = "$REPOSITORY"
+            test "$COMMIT" = "$PR_COMMIT"
+            tag="$REF_NAME-$tag"
+          elif [[ "$REF_NAME" != main ]]; then
             [[ "$REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
               echo "Invalid release tag: $REF_NAME" >&2
               exit 1
@@ -193,6 +206,13 @@ jobs:
             head=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
             if [[ "$head" != "$COMMIT" ]]; then
               echo "Skipping main tag: $COMMIT is no longer the head of main." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          elif [[ "$REF_NAME" =~ ^pr-([1-9][0-9]*)$ ]]; then
+            pr=$(gh api "repos/$GH_REPO/pulls/${BASH_REMATCH[1]}")
+            if ! jq -e --arg commit "$COMMIT" --arg repository "$GH_REPO" \
+              '.state == "open" and .head.sha == $commit and .head.repo.full_name == $repository' <<< "$pr" > /dev/null; then
+              echo "Skipping $REF_NAME tag: PR is closed or its head has changed." >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
           fi
