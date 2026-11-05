@@ -13,6 +13,7 @@ require (
 	github.com/j0sh/minikafka v0.0.0-20261001174935-0bc8dcedd322
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/segmentio/kafka-go v0.4.51
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1

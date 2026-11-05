@@ -210,38 +210,66 @@ func TestDiscoveryFailureThreshold(t *testing.T) {
 }
 
 func TestDiscoveryPreservesWholeRecords(t *testing.T) {
-	const record = `{"url":"https://orch.example/apps/runner/session","app":"test","observed_at":"2000-01-01T00:00:00.123+00:00","mode":"persistent","capacity":4,"capacity_used":1,"capacity_available":3,"gpu":{"id":"0","name":"H100","vram_mb":80000},"price_info":{"price":123456789012345678901234567890,"currency":"wei","unit":"seconds"},"extension":{"value":9007199254740993}}`
-	s := discoveryTestServer(t, "https://old.example", "https://child.example", "https://tie.example")
+	const record = `{"url":"https://orch.example/apps/runner/session","app":"test","observed_at":"2000-01-01T00:00:00.123+00:00","mode":"persistent","capacity":4,"capacity_used":1,"capacity_available":3,"gpu":{"id":"0","name":"H100","vram_mb":80000},"price_info":{"price":123456789012345678901234567890,"price_usd":0.123456789012345678901234567890123456,"currency":"wei","unit":"tokens"},"extension":{"value":9007199254740993,"ratio":1.2300e+04}}`
 	var calls atomic.Int32
-	s.collector.Client.Transport = discoveryRoundTrip(func(r *http.Request) (*http.Response, error) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		owner, runner := "https://orch.example", record
-		switch r.URL.Host {
-		case "old.example":
+		switch r.URL.Path {
+		case "/old/discovery":
 			owner = "https://old-owner.example"
 			runner = strings.ReplaceAll(runner, "2000-01-01", "1999-01-01")
-		case "tie.example":
+		case "/tie/discovery":
 			runner = strings.ReplaceAll(runner, `"app":"test"`, `"app":"tie"`)
 		}
-		body := `[{"address":"` + owner + `","runners":[` + runner + `]}]`
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
-	})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"address":"`+owner+`","runners":[`+runner+`]}]`)
+	}))
+	defer upstream.Close()
+	s := discoveryTestServer(t, upstream.URL+"/old", upstream.URL+"/child", upstream.URL+"/tie")
 	var dumped bytes.Buffer
 	require.NoError(t, s.dump(t.Context(), &dumped))
 	require.Equal(t, int32(3), calls.Load())
+	server := httptest.NewServer(s)
+	defer server.Close()
+	schema := discoverySchema(t)
 	for range 2 {
-		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/discovery", nil))
-		require.Equal(t, 200, w.Code)
-		require.Equal(t, dumped.String(), w.Body.String(), "dump and HTTP share the same snapshot and encoding")
+		response, err := server.Client().Get(server.URL + "/discovery")
+		require.NoError(t, err)
+		data, err := io.ReadAll(response.Body)
+		require.NoError(t, response.Body.Close())
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, "application/json", response.Header.Get("Content-Type"))
+		require.NoError(t, validateDiscoveryJSON(t, schema, data))
+		require.Equal(t, dumped.String(), string(data), "dump and HTTP share the same snapshot and encoding")
 		var result []map[string]json.RawMessage
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &result))
+		require.NoError(t, json.Unmarshal(data, &result))
 		require.Len(t, result, 2)
 		require.NotContains(t, result[0], "address")
+		var nodes []discoveryNode
+		require.NoError(t, json.Unmarshal(result[0]["nodes"], &nodes))
+		require.Len(t, nodes, 3)
+		require.Equal(t, upstream.URL+"/old", nodes[0].URL)
 		require.Equal(t, `"https://orch.example"`, string(result[1]["address"]))
-		// Compare raw JSON so large integers cannot be rounded through float64.
+		// Compare raw JSON to retain unknown fields and exact numeric tokens.
 		require.Equal(t, "["+record+"]", string(result[1]["runners"]))
 	}
+}
+
+func TestDiscoveryEmptyInventory(t *testing.T) {
+	s := discoveryTestServer(t)
+	server := httptest.NewServer(s)
+	defer server.Close()
+	response, err := server.Client().Get(server.URL + "/discovery")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.Equal(t, "application/json", response.Header.Get("Content-Type"))
+	data, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.JSONEq(t, `[]`, string(data))
+	require.NoError(t, validateDiscoveryJSON(t, discoverySchema(t), data))
 }
 
 func TestDiscoveryPrivateSourcesRequireGrants(t *testing.T) {

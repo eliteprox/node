@@ -43,6 +43,8 @@ behavior, and proxy routes.
 
 ## Discovery HTTP
 
+The response body follows the [discovery JSON Schema](discovery.schema.json).
+
 `GET /discovery` returns available local runners at an orchestrator, or cached
 runners grouped by owning orchestrator at standalone discovery. In this
 live-runner format, `address` is the orchestrator's HTTP(S) base URL, such as

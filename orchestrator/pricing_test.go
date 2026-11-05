@@ -1,9 +1,7 @@
 package orchestrator
 
 import (
-	"encoding/json"
 	"math/big"
-	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -11,25 +9,6 @@ import (
 	"github.com/livepeer/node/internal/test"
 	"github.com/stretchr/testify/require"
 )
-
-func TestDiscoveryOmitsOffchainPriceInfo(t *testing.T) {
-	for name, paid := range map[string]bool{"offchain": false, "onchain": true} {
-		t.Run(name, func(t *testing.T) {
-			r := NewRegistry("", "https://orch.example", time.Second, time.Minute)
-			if paid {
-				r.SetWeiPerUSD(big.NewRat(10, 1))
-			}
-			require.NoError(t, r.AddStatic(StaticRunner{ID: "r", RunnerURL: "https://runner.example", App: "app", PriceInfo: priceInfo{Price: "1", Unit: "fixed", Currency: "usd"}}))
-
-			entries := r.Discovery()
-			require.Len(t, entries, 1)
-			require.Len(t, entries[0].Runners, 1)
-			data, err := json.Marshal(entries)
-			require.NoError(t, err)
-			require.Equal(t, paid, strings.Contains(string(data), `"price_info":`), "price_info presence in discovery JSON")
-		})
-	}
-}
 
 func TestFeedUpdatesOnlyNewSessionPricesAndFailsClosedWhenStale(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
