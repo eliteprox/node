@@ -265,6 +265,9 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 		return ethcommon.Address{}, nil, paymentObservation{err, "rejected"}
 	}
 	if funds.Reserve.Cmp(params.FaceValue) < 0 || funds.Deposit.Cmp(params.FaceValue) < 0 {
+		if e.store != nil && e.store.logger != nil {
+			e.store.logger.WarnContext(ctx, "orchestrator payer deposit or claimable reserve below ticket face value", "event", "payment", "operation", "receive", "outcome", "rejected", "payer", payer, "deposit", funds.Deposit, "claimable_reserve", funds.Reserve, "face_value", params.FaceValue)
+		}
 		return ethcommon.Address{}, nil, pm.ErrPayerUnavailable
 	}
 	e.mu.Lock()

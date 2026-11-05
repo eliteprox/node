@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -147,6 +149,7 @@ func (p Params) Validate() error {
 }
 
 func Serve(p Params) error {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	return serve(ctx, p)
@@ -269,6 +272,7 @@ func serve(parent context.Context, p Params) error {
 	}
 	workers.Go(func() { errCh <- srv.Serve(listener) })
 	workers.Go(func() { errCh <- metricsServer.Serve(metricsListener) })
+	slog.Info("signer started", "component", "signer", "event", "started", "operation", "serve", "outcome", "success", "listen", p.Listen, "metrics_listen", p.MetricsListen)
 	select {
 	case <-ctx.Done():
 	case err = <-errCh:

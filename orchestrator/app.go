@@ -354,7 +354,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	var workers sync.WaitGroup
 	workers.Go(func() { errs <- mainServer.Serve(mainListener) })
 	workers.Go(func() { errs <- metricsServer.Serve(metricsListener) })
-	logger.Info("orchestrator started", "event", "started", "operation", "serve", "outcome", "success", "listen", p.Listen, "metrics_listen", p.MetricsListen)
+	logger.Info("orchestrator started", "event", "started", "operation", "serve", "outcome", "success", "listen", p.Listen, "metrics_listen", p.MetricsListen, "onchain", engine != nil)
 	// Independent bounded workers keep slow RPC/health calls off the billing
 	// and expiry paths. Every worker uses the shutdown context and is joined.
 	startWorker := func(period, timeout time.Duration, work func(context.Context)) {
