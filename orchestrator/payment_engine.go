@@ -121,6 +121,8 @@ func (e *PaymentEngine) makeChallenge(ctx context.Context, appID, manifest strin
 	info := wire.OrchestratorInfo{Transcoder: service, Address: e.recipient.Bytes(), Price: priceInfo,
 		TicketParams: wire.TicketParams{Recipient: e.recipient.Bytes(), FaceValue: e.faceValue.Bytes(), WinProb: e.winProb.Bytes(), RecipientRandHash: randHash.Bytes(), Seed: seed, ExpirationBlock: expiresAtBlock.Bytes(), Expiration: wire.ExpirationParams{CreationRound: expiration.CreationRound, CreationRoundBlockHash: expiration.CreationRoundBlockHash.Bytes()}},
 		Auth:         e.authToken(manifest, time.Now().Add(time.Hour).Unix())}
+	encoded := wire.EncodeOrchestratorInfo(info)
+	challenge := paymentChallenge(appID, manifest, service, encoded)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := snapshot.Validate(); err != nil {
@@ -137,8 +139,8 @@ func (e *PaymentEngine) makeChallenge(ctx context.Context, appID, manifest strin
 	} else if current.appID != appID || current.registration != registration || current.payer != payer || current.price != priceInfo || current.unit != unit {
 		return Challenge{}, errors.New("payment session scope conflict")
 	}
-	current.info, current.updated = wire.EncodeOrchestratorInfo(info), time.Now()
-	return paymentChallenge(appID, manifest, service, current.info), nil
+	current.info, current.updated = encoded, time.Now()
+	return challenge, nil
 }
 
 func paymentChallenge(appID, manifest, service string, info []byte) Challenge {
@@ -276,6 +278,34 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 		}
 		return ethcommon.Address{}, nil, pm.ErrPayerUnavailable
 	}
+	batchNonces := make(map[uint32]bool, len(payment.PayerParams))
+	batchCredit := new(big.Rat)
+	var winners []*pm.SignedTicket
+	validator := pm.NewValidator(pm.DefaultSigVerifier{})
+	for _, sp := range payment.PayerParams {
+		if sp.TicketNonce == 0 || sp.TicketNonce >= 600 || len(sp.Sig) != 65 || batchNonces[sp.TicketNonce] {
+			return ethcommon.Address{}, nil, ErrInvalidPayment
+		}
+		ticket := pm.NewTicket(&params, params.ExpirationParams, payer, sp.TicketNonce)
+		if err := validator.ValidateTicket(e.recipient, ticket, sp.Sig, recipientRand); err != nil {
+			return ethcommon.Address{}, nil, ErrInvalidPayment
+		}
+		batchNonces[sp.TicketNonce] = true
+		batchCredit.Add(batchCredit, ticket.EV())
+		if validator.IsWinningTicket(ticket, sp.Sig, recipientRand) {
+			winners = append(winners, &pm.SignedTicket{Ticket: ticket, Sig: sp.Sig, RecipientRand: recipientRand})
+		}
+	}
+
+	// Record accepted credit after unlocking; credit is returned only on success.
+	defer func() {
+		if credit != nil {
+			e.metrics.Add("payment_credit_eth_total", observability.ETH(batchCredit), labels)
+			e.metrics.Add("payment_tickets_total", float64(len(batchNonces)), labels.With("kind", "accepted"))
+			e.metrics.Add("payment_tickets_total", float64(len(winners)), labels.With("kind", "winning"))
+		}
+	}()
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	// Store winning tickets before publishing in-memory replay guards and credit.
@@ -295,27 +325,12 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 	}
 	randKey := recipientRand.String()
 	previous := e.ticketNonces[randKey]
-	batchNonces := make(map[uint32]bool, len(payment.PayerParams))
-	var winners []*pm.SignedTicket
-	balance := new(big.Rat).Set(session.balance)
-	validator := pm.NewValidator(pm.DefaultSigVerifier{})
-	for _, sp := range payment.PayerParams {
-		if sp.TicketNonce == 0 || sp.TicketNonce >= 600 || len(sp.Sig) != 65 {
+	for nonce := range batchNonces {
+		if previous != nil && previous.nonceSeen[nonce] {
 			return ethcommon.Address{}, nil, ErrInvalidPayment
-		}
-		ticket := pm.NewTicket(&params, params.ExpirationParams, payer, sp.TicketNonce)
-		if err := validator.ValidateTicket(e.recipient, ticket, sp.Sig, recipientRand); err != nil {
-			return ethcommon.Address{}, nil, ErrInvalidPayment
-		}
-		if batchNonces[sp.TicketNonce] || (previous != nil && previous.nonceSeen[sp.TicketNonce]) {
-			return ethcommon.Address{}, nil, ErrInvalidPayment
-		}
-		batchNonces[sp.TicketNonce] = true
-		balance.Add(balance, ticket.EV())
-		if validator.IsWinningTicket(ticket, sp.Sig, recipientRand) {
-			winners = append(winners, &pm.SignedTicket{Ticket: ticket, Sig: sp.Sig, RecipientRand: recipientRand})
 		}
 	}
+	balance := new(big.Rat).Add(session.balance, batchCredit)
 	if err := e.store.storeWinningTickets(ctx, payer, params.RecipientRandHash, snapshot.Round.Int64()-2, new(big.Int).Add(funds.Deposit, funds.Reserve), winners, snapshot); err != nil {
 		return ethcommon.Address{}, nil, err
 	}
@@ -327,9 +342,6 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 		previous.nonceSeen[nonce] = true
 	}
 	e.nonceCount += len(batchNonces)
-	e.metrics.Add("payment_credit_eth_total", observability.ETH(new(big.Rat).Sub(balance, session.balance)), labels)
-	e.metrics.Add("payment_tickets_total", float64(len(batchNonces)), labels.With("kind", "accepted"))
-	e.metrics.Add("payment_tickets_total", float64(len(winners)), labels.With("kind", "winning"))
 	session.balance, session.updated = balance, time.Now()
 	return payer, new(big.Rat).Set(balance), nil
 }

@@ -36,6 +36,8 @@ type RedeemerDB struct {
 	metrics    *observability.Metrics
 	readiness  *paidReadiness
 	db         *sql.DB
+	admission  *sql.Stmt
+	liability  *sql.Stmt
 	recoveryMu sync.Mutex
 	recovery   *redemptionRecovery
 }
@@ -54,7 +56,21 @@ func OpenRedeemerDB(path string) (*RedeemerDB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize redeemer SQLite: %w", err)
 	}
-	return &RedeemerDB{db: db}, nil
+	store := &RedeemerDB{db: db}
+	for _, check := range []struct {
+		stmt  **sql.Stmt
+		query string
+	}{
+		{&store.admission, receiptAdmissionQuery},
+		{&store.liability, receiptLiabilityQuery},
+	} {
+		*check.stmt, err = db.PrepareContext(ctx, check.query)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("prepare payment admission checks: %w", err)
+		}
+	}
+	return store, nil
 }
 
 func openRedeemerDB(ctx context.Context, path string, create bool) (*sql.DB, error) {
@@ -126,6 +142,14 @@ func (s *RedeemerDB) StoreWinningTicket(t *pm.SignedTicket) error {
 	return err
 }
 
+const (
+	receiptAdmissionQuery = `SELECT m.number,m.hash,EXISTS(SELECT 1 FROM winning_tickets w JOIN redemption_attempts a ON a.sig=w.sig WHERE w.recipient_rand_hash=? AND (a.phase!='expired' OR EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=w.sig)))
+ FROM (SELECT 1) LEFT JOIN collateral_watermark m ON m.id=1`
+	receiptLiabilityQuery = `SELECT face_value FROM winning_tickets WHERE payer_address=? AND redeemed_at IS NULL AND (
+ (creation_round>=? AND sig NOT IN (SELECT sig FROM redemption_attempts WHERE phase IN ('used','invalid','expired','reverted')))
+ OR EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=winning_tickets.sig AND t.phase NOT IN ('confirmed','reverted','superseded')))`
+)
+
 // storeWinningTickets commits a validated receipt batch before the payment
 // engine publishes replay guards or credit. Check exposure and liability in the
 // same transaction so redemption and concurrent receipts cannot race these gates.
@@ -137,19 +161,17 @@ func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Ad
 	defer tx.Rollback()
 	// A singleton durable floor prevents old collateral being reused after any
 	// settlement releases liability. It is deliberately conservative across payers.
-	var number int64
-	var hash string
-	if err := tx.QueryRowContext(ctx, `SELECT number,hash FROM collateral_watermark WHERE id=1`).Scan(&number, &hash); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var number sql.NullInt64
+	var hash sql.NullString
+	var exposed int
+	if err := tx.StmtContext(ctx, s.admission).QueryRowContext(ctx, randHash.Hex()).Scan(&number, &hash, &exposed); err != nil {
 		return err
-	} else if err == nil && (snapshot.Number == nil || snapshot.Number.Cmp(big.NewInt(number)) < 0 || (snapshot.Number.Cmp(big.NewInt(number)) == 0 && snapshot.BlockHash.Hex() != hash)) {
+	}
+	if number.Valid && (snapshot.Number == nil || snapshot.Number.Cmp(big.NewInt(number.Int64)) < 0 || (snapshot.Number.Cmp(big.NewInt(number.Int64)) == 0 && snapshot.BlockHash.Hex() != hash.String)) {
 		return pm.ErrPayerUnavailable
 	}
 	// Once redemption can reveal randomness, this epoch must never accept
 	// more tickets, even if a reorg moves the observed L1 clock backwards.
-	var exposed int
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM winning_tickets w JOIN redemption_attempts a ON a.sig=w.sig WHERE w.recipient_rand_hash=? AND (a.phase!='expired' OR EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=w.sig)))`, randHash.Hex()).Scan(&exposed); err != nil {
-		return err
-	}
 	if exposed != 0 {
 		return ErrInvalidPayment
 	}
@@ -162,9 +184,7 @@ func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Ad
 	}
 	// Include every unconfirmed winner, across all sessions for this payer.
 	// Keep uncertain transactions reserved until finalized receipt reconciliation.
-	rows, err := tx.Query(`SELECT face_value FROM winning_tickets WHERE payer_address=? AND redeemed_at IS NULL AND (
- (creation_round>=? AND sig NOT IN (SELECT sig FROM redemption_attempts WHERE phase IN ('used','invalid','expired','reverted')))
- OR EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=winning_tickets.sig AND t.phase NOT IN ('confirmed','reverted','superseded')))`, payer.Hex(), minRound)
+	rows, err := tx.StmtContext(ctx, s.liability).QueryContext(ctx, payer.Hex(), minRound)
 	if err != nil {
 		return err
 	}
