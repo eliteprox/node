@@ -34,9 +34,10 @@ conflicting tags or published assets fail without replacement. If artifacts
 have expired, rerun all jobs to rebuild before retrying publication.
 
 For tested snapshot bundles without publication, run
-[Build](../.github/workflows/build.yml) manually. Eligible PRs also build bundles;
-main pushes automatically test and publish snapshot Docker images. Exported
-images are retained as workflow artifacts for one day.
+[Build](../.github/workflows/build.yml) manually. Eligible PRs also build bundles.
+Successful `main` builds publish Linux amd64/arm64 images as
+`ghcr.io/livepeer/node:sha-<full-commit-sha>`. Exported images are retained as
+workflow artifacts for one day.
 
 ## PR Docker images
 
