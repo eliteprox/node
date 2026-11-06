@@ -60,37 +60,39 @@ func (c PaymentChain) activeAt(ctx context.Context, address, recipient ethcommon
 	return bonding.IsActiveTranscoder(&bind.CallOpts{Context: ctx}, recipient)
 }
 
-// Receipt reports a submitted redemption without retrying or resubmitting it.
-func (c PaymentChain) Receipt(ctx context.Context, hash ethcommon.Hash) (confirmed, reverted bool, err error) {
+// FinalizedReceipt retains canonical inclusion evidence for durable collateral admission.
+func (c PaymentChain) FinalizedReceipt(ctx context.Context, hash ethcommon.Hash) (*types.Receipt, error) {
 	receipt, err := c.Contracts.RPC.TransactionReceipt(ctx, hash)
 	if errors.Is(err, ethereum.NotFound) {
-		return false, false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, false, err
+		return nil, err
 	}
 	finalized, err := c.Contracts.RPC.header(ctx, "finalized")
 	if err != nil {
-		return false, false, err
+		return nil, err
 	}
 	if finalized.Number == nil {
-		return false, false, errors.New("invalid finalized header")
+		return nil, errors.New("invalid finalized header")
 	}
 	if (*big.Int)(finalized.Number).Cmp(receipt.BlockNumber) < 0 {
-		return false, false, nil
+		return nil, nil
 	}
 	canonical, err := c.Contracts.RPC.header(ctx, hexutil.EncodeBig(receipt.BlockNumber))
 	if err != nil {
-		return false, false, err
+		return nil, err
 	}
 	if canonical.Hash != receipt.BlockHash {
-		return false, false, nil
+		return nil, nil
 	}
-	return receipt.Status == types.ReceiptStatusSuccessful, receipt.Status == types.ReceiptStatusFailed, nil
+	return receipt, nil
 }
 
 type ChainSnapshot struct {
 	Block           *big.Int // Protocol L1 block, including on Arbitrum.
+	Number          *big.Int // Execution-chain height, distinct from the L1 clock.
+	BlockHash       ethcommon.Hash
 	Round           *big.Int // Last initialized round.
 	RoundHash       ethcommon.Hash
 	CurrentRound    *big.Int // Protocol round; may exceed the initialized Round.
@@ -158,7 +160,7 @@ func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader, curren
 	if hash == ([32]byte{}) {
 		return ChainSnapshot{}, errors.New("invalid round block hash")
 	}
-	snapshot := ChainSnapshot{Block: block, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref, addresses: addresses}
+	snapshot := ChainSnapshot{Block: block, Number: new(big.Int).Set((*big.Int)(header.Number)), BlockHash: header.Hash, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref, addresses: addresses}
 	if currentRound {
 		snapshot.CurrentRound, err = rounds.CurrentRound(opts)
 		if err != nil {
@@ -183,10 +185,20 @@ type SenderInfo struct {
 }
 
 func (c PaymentChain) SenderInfo(ctx context.Context, sender, recipient ethcommon.Address) (SenderInfo, error) {
+	if c.Observer != nil {
+		if c.Contracts != c.Observer.chain.Contracts {
+			return SenderInfo{}, errors.New("payment observer belongs to another contract client")
+		}
+		return c.Observer.senderInfo(ctx, sender, recipient)
+	}
 	snapshot, err := c.Snapshot(ctx)
 	if err != nil {
 		return SenderInfo{}, err
 	}
+	return c.senderInfoAt(ctx, sender, recipient, snapshot)
+}
+
+func (c PaymentChain) senderInfoAt(ctx context.Context, sender, recipient ethcommon.Address, snapshot ChainSnapshot) (SenderInfo, error) {
 	address, err := c.Contracts.paymentAddress(ctx, snapshot, "ticketBroker")
 	if err != nil {
 		return SenderInfo{}, err
@@ -276,29 +288,32 @@ func (c PaymentChain) SubmitRedemption(ctx context.Context, nonces *NonceManager
 	return nil
 }
 
-// IsUsedTicket is ported from go-livepeer/eth/client_ticketbroker.go. The block
-// argument also supports the finalized observation needed for node settlement.
-func (c PaymentChain) IsUsedTicket(ctx context.Context, hash ethcommon.Hash, block string) (bool, error) {
+// TicketUse adapts go-livepeer/eth/client_ticketbroker.go's IsUsedTicket.
+// It returns the pinned finalized identity alongside ticket-use evidence.
+func (c PaymentChain) TicketUse(ctx context.Context, hash ethcommon.Hash, block string) (bool, ChainSnapshot, error) {
 	var ref any = block
+	var observation ChainSnapshot
 	if block == "finalized" {
 		header, err := c.Contracts.RPC.header(ctx, "finalized")
 		if err != nil {
-			return false, err
+			return false, ChainSnapshot{}, err
 		}
 		if header.Hash == (ethcommon.Hash{}) || header.Number == nil {
-			return false, errors.New("invalid finalized header")
+			return false, ChainSnapshot{}, errors.New("invalid finalized header")
 		}
 		ref = map[string]any{"blockHash": header.Hash, "requireCanonical": true}
+		observation = ChainSnapshot{Number: new(big.Int).Set((*big.Int)(header.Number)), BlockHash: header.Hash}
 	}
 	address, err := c.Contracts.ResolveAt(ctx, ref, "ticketBroker")
 	if err != nil {
-		return false, err
+		return false, ChainSnapshot{}, err
 	}
 	broker, err := contracts.NewTicketBrokerCaller(address, c.Contracts.callerAt(ref))
 	if err != nil {
-		return false, err
+		return false, ChainSnapshot{}, err
 	}
-	return broker.UsedTickets(&bind.CallOpts{Context: ctx}, hash)
+	used, err := broker.UsedTickets(&bind.CallOpts{Context: ctx}, hash)
+	return used, observation, err
 }
 
 // FinalizedNonce pins account state to the same canonical finalized reference

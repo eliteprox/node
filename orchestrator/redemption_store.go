@@ -227,12 +227,29 @@ func signedIdentity(tx *types.Transaction) (eth.SignedTransaction, error) {
 }
 
 // finishTicket never discards transaction history or the epoch exposure marker.
-func (s *RedeemerDB) finishTicket(ctx context.Context, sig []byte, phase string, hash string) error {
+func (s *RedeemerDB) finishTicket(ctx context.Context, sig []byte, phase string, hash string, observation ...eth.ChainSnapshot) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if phase == "confirmed" || phase == "used" {
+		if len(observation) != 1 || observation[0].Number == nil || !observation[0].Number.IsInt64() || observation[0].Number.Sign() < 0 || observation[0].BlockHash == (ethcommon.Hash{}) {
+			return errors.New("settlement block evidence required")
+		}
+		block := observation[0]
+		if _, err := tx.ExecContext(ctx, `INSERT INTO collateral_watermark(id,number,hash) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET number=excluded.number,hash=excluded.hash WHERE number<excluded.number`, block.Number.Int64(), block.BlockHash.Hex()); err != nil {
+			return err
+		}
+		var number int64
+		var hash string
+		if err := tx.QueryRowContext(ctx, `SELECT number,hash FROM collateral_watermark WHERE id=1`).Scan(&number, &hash); err != nil {
+			return err
+		}
+		if number == block.Number.Int64() && hash != block.BlockHash.Hex() {
+			return errors.New("conflicting finalized settlement block")
+		}
+	}
 	var retried []string
 	commit := func() error {
 		if err := tx.Commit(); err != nil {

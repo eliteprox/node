@@ -272,15 +272,20 @@ func TestSignerOrchestratorWebhookSecrets(t *testing.T) {
 }
 
 func TestSignerReadiness(t *testing.T) {
-	for _, fixedRate := range []bool{true, false} {
-		t.Run(fmt.Sprintf("fixedRate=%v", fixedRate), func(t *testing.T) {
+	for _, tc := range []struct {
+		fixedRate bool
+		failure   int32
+	}{{true, 0}, {false, 0}, {true, 1}, {true, 2}, {true, 3}, {true, 4}} {
+		fixedRate := tc.fixedRate
+		t.Run(fmt.Sprintf("fixedRate=%v/failure=%d", fixedRate, tc.failure), func(t *testing.T) {
 			p := validParams(t)
 			if !fixedRate {
 				p.WeiPerUSD, p.ETHUSDMaxAge = nil, time.Hour
 			}
 			key, keyFile, passwordPath := testSignerKey(t)
 			p.KeystoreFile, p.KeystorePasswordFile = keyFile, passwordPath
-			var failure atomic.Int32
+			var failure, collateralReads atomic.Int32
+			failure.Store(tc.failure)
 			webhookCalled := make(chan struct{}, 1)
 			rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/list" {
@@ -321,6 +326,7 @@ func TestSignerReadiness(t *testing.T) {
 					case selector("blockHashForRound(uint256)"):
 						result = ethcommon.HexToHash("0x1234").Hex()
 					case selector("getSenderInfo(address)"):
+						collateralReads.Add(1)
 						deposit, reserve, withdraw := 1000, 1000, 0
 						switch failure.Load() {
 						case 2:
@@ -389,21 +395,16 @@ func TestSignerReadiness(t *testing.T) {
 				defer response.Body.Close()
 				return response.StatusCode
 			}
-			if !fixedRate {
-				require.Eventually(t, func() bool { return get("/readyz") == 503 }, 3*time.Second, 10*time.Millisecond)
+			if !fixedRate || tc.failure != 0 {
+				require.Eventually(t, func() bool { return get("/readyz") == 503 && (tc.failure == 1 || collateralReads.Load() > 0) }, 3*time.Second, 10*time.Millisecond)
 				require.Equal(t, 200, get("/healthz"))
 				return
 			}
 			require.Eventually(t, func() bool { return get("/readyz") == 200 }, 3*time.Second, 10*time.Millisecond)
-			for _, state := range []int32{1, 2, 3, 4, 0} {
-				failure.Store(state)
-				want := 503
-				if state == 0 {
-					want = 200
-				}
-				require.Equal(t, want, get("/readyz"))
-				require.Equal(t, 200, get("/healthz"))
-			}
+			failure.Store(1)
+			require.Equal(t, 200, get("/readyz"), "warm readiness retains a fresh observation during an RPC outage")
+			require.Equal(t, 200, get("/healthz"))
+			failure.Store(0)
 			_, err := outbox.enqueue(t.Context(), testEvent())
 			require.NoError(t, err)
 			require.Equal(t, 503, get("/readyz"), "a full outbox must make the signer unready")

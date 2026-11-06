@@ -8,12 +8,15 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/require"
 )
@@ -32,17 +35,21 @@ type ChainRPC struct {
 }
 
 type ChainState struct {
-	Number, L1Block, Timestamp uint64
-	ChainID                    uint64
-	Hash, Parent, RoundHash    common.Hash
-	Round, CurrentRound        uint64
-	Recipient                  common.Address
-	Activation, Deactivation   uint64
-	OmitL1, OmitTimestamp      bool
-	Fail                       string
-	Before                     func(context.Context, string)
-	Contracts                  map[string]common.Address
-	Results                    map[ChainCall]string
+	Number, L1Block, Timestamp                 uint64
+	ChainID                                    uint64
+	Hash, Parent, RoundHash                    common.Hash
+	Round, CurrentRound                        uint64
+	Recipient                                  common.Address
+	Activation, Deactivation                   uint64
+	OmitL1, OmitTimestamp                      bool
+	Fail                                       string
+	Before                                     func(context.Context, string)
+	Contracts                                  map[string]common.Address
+	Results                                    map[ChainCall]string
+	Logs                                       []types.Log
+	LogsBloom                                  any
+	Deposit, Reserve, Claimable, WithdrawRound uint64
+	FailPayer                                  common.Address
 }
 
 type ChainCall struct {
@@ -51,14 +58,16 @@ type ChainCall struct {
 }
 
 type ChainRPCStats struct {
-	RoundTrips int
-	Calls      map[string]int
+	RoundTrips   int
+	Calls        map[string]int
+	LogAddresses []common.Address
 }
 
 func NewChainRPC(t testing.TB) *ChainRPC {
 	t.Helper()
 	c := &ChainRPC{Controller: common.HexToAddress("0xc001"), stats: ChainRPCStats{Calls: map[string]int{}}}
 	c.state = ChainState{Number: 0x100000, L1Block: 50, Timestamp: uint64(time.Now().Unix()), Hash: common.HexToHash("0xabcd"), RoundHash: common.HexToHash("0x1234"), Round: 5, CurrentRound: 5, Deactivation: ^uint64(0)}
+	c.state.Deposit, c.state.Reserve, c.state.Claimable = 1e18, 1e18, 1e18
 	word := func(value string) string { return strings.Repeat("0", 64-len(value)) + value }
 	contractNames := map[string]string{}
 	c.state.Contracts = map[string]common.Address{}
@@ -113,6 +122,40 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		}
 		var result any
 		switch request.Method {
+		case "eth_getLogs":
+			var query struct {
+				BlockHash          common.Hash
+				FromBlock, ToBlock string
+				Address            []common.Address
+			}
+			require.NoError(t, json.Unmarshal(request.Params[0], &query))
+			from, to := uint64(0), state.Number
+			if query.BlockHash == (common.Hash{}) {
+				var err error
+				from, err = hexutil.DecodeUint64(query.FromBlock)
+				require.NoError(t, err)
+				to, err = hexutil.DecodeUint64(query.ToBlock)
+				require.NoError(t, err)
+			} else if _, ok := c.stateAt(query.BlockHash.Hex()); !ok {
+				fail()
+				return
+			}
+			logs := []types.Log{}
+			c.mu.Lock()
+			c.stats.LogAddresses = query.Address
+			for _, frame := range c.history {
+				for _, log := range frame.Logs {
+					matches := query.BlockHash == log.BlockHash
+					if query.BlockHash == (common.Hash{}) {
+						matches = log.BlockNumber >= from && log.BlockNumber <= to
+					}
+					if matches && slices.Contains(query.Address, log.Address) {
+						logs = append(logs, log)
+					}
+				}
+			}
+			c.mu.Unlock()
+			result = logs
 		case "eth_chainId":
 			result = quantity(state.ChainID)
 		case "eth_getBlockByNumber":
@@ -126,6 +169,9 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 				}
 			}
 			header := map[string]any{"number": quantity(state.Number), "hash": state.Hash, "parentHash": state.Parent}
+			if state.LogsBloom != nil {
+				header["logsBloom"] = state.LogsBloom
+			}
 			if !state.OmitTimestamp {
 				header["timestamp"] = quantity(state.Timestamp)
 			}
@@ -163,9 +209,13 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 					result = "0x" + word("1")
 				}
 			case "TicketBroker.getSenderInfo":
-				result = "0x" + word("de0b6b3a7640000") + word("0") + word("de0b6b3a7640000") + word("0")
+				if state.FailPayer != (common.Address{}) && common.HexToAddress(call.Input[10:74]) == state.FailPayer {
+					fail()
+					return
+				}
+				result = "0x" + word(quantity(state.Deposit)[2:]) + word(quantity(state.WithdrawRound)[2:]) + word(quantity(state.Reserve)[2:]) + word("0")
 			case "TicketBroker.claimableReserve":
-				result = "0x" + word("de0b6b3a7640000")
+				result = "0x" + word(quantity(state.Claimable)[2:])
 			case "TicketBroker.usedTickets":
 				result = "0x" + word("0")
 			default:
@@ -222,7 +272,7 @@ func quantity(n uint64) string { return fmt.Sprintf("0x%x", n) }
 func (c *ChainRPC) Stats() ChainRPCStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return ChainRPCStats{RoundTrips: c.stats.RoundTrips, Calls: maps.Clone(c.stats.Calls)}
+	return ChainRPCStats{RoundTrips: c.stats.RoundTrips, Calls: maps.Clone(c.stats.Calls), LogAddresses: append([]common.Address(nil), c.stats.LogAddresses...)}
 }
 
 func (c *ChainRPC) Reset() {
