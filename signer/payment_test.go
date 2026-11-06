@@ -200,4 +200,56 @@ func TestPaidRequestDirectRPCBudget(t *testing.T) {
 		"RoundsManager.lastInitializedRound": 3, "RoundsManager.blockHashForRound": 3,
 		"BondingManager.isActiveTranscoder": 2, "TicketBroker.getSenderInfo": 2, "TicketBroker.claimableReserve": 2,
 	}, stats.Calls)
+
+	// A signer's retained observation cannot prove that the recipient is behind
+	// expiry. The recipient must still enforce its own clock at the boundary.
+	_, err = engine.MakeChallenge(t.Context(), "runner", "divergent", s.key.Address(), 9, "fixed", "https://orch.example")
+	require.NoError(t, err)
+	info, err = engine.ChallengeInfo("divergent")
+	require.NoError(t, err)
+	older, err := direct.PayerFunds(t.Context(), s.key.Address(), recipient)
+	require.NoError(t, err)
+	s.SetPaymentChain(payerChainFunc(func(context.Context, ethcommon.Address, ethcommon.Address) (pm.PayerFunds, error) { return older, nil }))
+	rpc.Update(func(state *test.ChainState) {
+		state.L1Block = new(big.Int).SetBytes(info.TicketParams.ExpirationBlock).Uint64()
+		state.Number++
+		state.Hash = ethcommon.HexToHash("0xeeee")
+	})
+	response = postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
+	require.Equal(t, 200, response.Code, response.Body.String())
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &signed))
+	_, _, err = engine.Receive(t.Context(), "runner", "divergent", signed.Payment, signed.SegCreds)
+	require.ErrorIs(t, err, orchestrator.ErrInvalidPayment)
+
+	const manifest = "invalidated-signing"
+	_, err = engine.MakeChallenge(t.Context(), "runner", manifest, s.key.Address(), 9, "fixed", "https://orch.example")
+	require.NoError(t, err)
+	info, err = engine.ChallengeInfo(manifest)
+	require.NoError(t, err)
+	for _, during := range []bool{false, true} {
+		observer := eth.NewPaymentObserver(direct.Client, false)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() { observer.Run(ctx); close(done) }()
+		stop := func() { cancel(); <-done }
+		defer stop()
+		require.Eventually(t, func() bool { _, err := observer.Snapshot(ctx); return err == nil }, time.Second, time.Millisecond)
+		observed := direct
+		observed.Client.Observer = observer
+		s.SetPaymentChain(observed)
+		draft, err := s.preparePayment(t.Context(), "fixed", manifest, info, paymentState{}, -1, time.Now())
+		require.NoError(t, err)
+		key := &failingPaymentSigner{TicketSigner: s.key}
+		if during {
+			key.before = stop
+		} else {
+			stop()
+		}
+		payment, err := draft.Sign(t.Context(), key, s.metrics)
+		require.ErrorIs(t, err, eth.ErrObservationUnavailable)
+		require.Empty(t, payment)
+		if !during {
+			require.Zero(t, key.calls.Load(), "invalidated observations must not produce signatures")
+		}
+	}
 }

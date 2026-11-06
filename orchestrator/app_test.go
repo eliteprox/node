@@ -95,7 +95,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32000, "message": "ticket estimation unavailable"}})
 					return
 				case "eth_getBlockByNumber":
-					result = map[string]string{"number": "0x32", "hash": ethcommon.HexToHash("0xabcd").Hex()}
+					result = map[string]string{"number": "0x32", "hash": ethcommon.HexToHash("0xabcd").Hex(), "timestamp": fmt.Sprintf("0x%x", time.Now().Unix())}
 				case "eth_call":
 					// Reuse the 32-byte encoding of 1 for calls returning an address, round, hash, or bool.
 					result = fmt.Sprintf("0x%064x", 1)
@@ -164,8 +164,17 @@ func TestPaidHTTPStartup(t *testing.T) {
 			request, err := http.NewRequest(http.MethodPost, address+"/external/apps/r/session", nil)
 			require.NoError(t, err)
 			request.Header.Set("Livepeer-Payer-Address", payer.Address().Hex())
-			response, err = http.DefaultClient.Do(request)
-			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				response, err = http.DefaultClient.Do(request)
+				if err != nil {
+					return false
+				}
+				if response.StatusCode == http.StatusPaymentRequired {
+					return true
+				}
+				response.Body.Close()
+				return false
+			}, 3*time.Second, 10*time.Millisecond)
 			defer response.Body.Close()
 			require.Equal(t, http.StatusPaymentRequired, response.StatusCode)
 			var challenge Challenge

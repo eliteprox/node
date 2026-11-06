@@ -251,6 +251,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	var engine *PaymentEngine
 	var redeemerDB *RedeemerDB
 	var paymentChain eth.PaymentChain
+	var observedChain eth.PaymentChain
 	var redeemerKey *eth.Key
 	var paymentChainID *big.Int
 	if p.paymentsRequested() {
@@ -282,6 +283,8 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 			contracts.MaxFeePerGas = p.RedeemerMaxFeePerGas.ToBig()
 		}
 		paymentChain = eth.PaymentChain{Contracts: contracts}
+		observedChain = paymentChain
+		observedChain.Observer = eth.NewPaymentObserver(paymentChain, p.Network == nodeconfig.Mainnet)
 		if p.ETHUSDFeed != nil {
 			rate, until, err := contracts.WeiPerUSD(parent, *p.ETHUSDFeed, p.PriceMaxAge)
 			if err != nil {
@@ -295,7 +298,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		if p.OrchestratorAddress != nil {
 			recipient = *p.OrchestratorAddress
 		}
-		engine, err = NewPaymentEngine(redeemerDB, pm.EthereumChain{Client: paymentChain}, recipient, p.TicketFaceValue.ToBig(), p.TicketWinProb.ToBig())
+		engine, err = NewPaymentEngine(redeemerDB, pm.EthereumChain{Client: observedChain}, recipient, p.TicketFaceValue.ToBig(), p.TicketWinProb.ToBig())
 		if err != nil {
 			return fmt.Errorf("initialize payment engine (check --account, --ticket-face-value and --ticket-win-prob): %w", err)
 		}
@@ -315,6 +318,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		registry.metrics.Gauge("redemption_last_success_timestamp_seconds", nil).Set(0)
 		registry.metrics.Gauge("redemption_worker_last_completed_timestamp_seconds", nil).Set(0)
 		readiness.account = redeemerKey.Address()
+		readiness.observer = observedChain.Observer
 		redeemerDB.readiness = readiness
 	}
 	mainListener, err := net.Listen("tcp", p.Listen.String())
@@ -376,8 +380,9 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	startWorker(p.HeartbeatInterval, time.Second, func(context.Context) { registry.Expire() })
 	workers.Go(func() { app.runO2RKeepalives(ctx, 10*time.Second) })
 	if engine != nil {
+		workers.Go(func() { observedChain.Observer.Run(ctx) })
 		startWorker(p.HeartbeatInterval, 30*time.Second, func(ctx context.Context) {
-			readiness.check(ctx, redeemerDB, paymentChain, engine, registry.metrics, logger)
+			readiness.check(ctx, redeemerDB, observedChain, engine, registry.metrics, logger)
 		})
 		if p.ETHUSDFeed != nil {
 			startWorker(time.Hour, 30*time.Second, func(ctx context.Context) {

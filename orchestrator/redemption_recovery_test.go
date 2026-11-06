@@ -694,11 +694,11 @@ func TestTerminalAttemptRetainsUnresolvedSibling(t *testing.T) {
 			// stops retrying, but cannot release its collateral based on one failed hash.
 			next := nextRecoveryTicket(ticket, 12)
 			next.CreationRound = max(ticket.CreationRound, tc.minRound)
-			require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, tc.minRound, big.NewInt(1000), []*pm.SignedTicket{next}), pm.ErrPayerUnavailable)
+			require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, tc.minRound, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), pm.ErrPayerUnavailable)
 			f.mine(sent[0], true)
 			tickRecovery(t, s, c, key)
 			require.Equal(t, "confirmed", ticketPhase(t, s, ticket.Sig))
-			require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, tc.minRound, big.NewInt(1000), []*pm.SignedTicket{next}))
+			require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, tc.minRound, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}))
 		})
 	}
 }
@@ -771,7 +771,7 @@ func TestExpiredAttemptDoesNotReopenRandomness(t *testing.T) {
 	next := nextRecoveryTicket(ticket, 17)
 	next.RecipientRandHash = ticket.RecipientRandHash
 	next.TicketNonce = 2
-	require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{next}), ErrInvalidPayment)
+	require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), ErrInvalidPayment)
 }
 
 func recoveryReplacement(t *testing.T, key *eth.Key, first *types.Transaction) *types.Transaction {
@@ -870,7 +870,7 @@ func TestRevertedReplacementReleasesSameNonceLiability(t *testing.T) {
 	require.NotEmpty(t, ReconcileSubmitted(t.Context(), s, c))
 	require.Equal(t, "reverted", ticketPhase(t, s, ticket.Sig))
 	next := nextRecoveryTicket(ticket, 21)
-	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}), "a finalized replacement consumes every sibling with the same sender and nonce")
+	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), "a finalized replacement consumes every sibling with the same sender and nonce")
 }
 
 func TestManualRetryFailureKeepsActiveMonitor(t *testing.T) {
@@ -942,7 +942,7 @@ func TestConsumedNonceResolvesOtherTicketHistory(t *testing.T) {
 	require.EqualValues(t, 1, test.MetricSum(t, s.metrics.Registry, "redemption_settlements_total", nil))
 	require.NoError(t, s.setTicketPhase(t.Context(), sibling.Sig, "invalid"))
 	next := nextRecoveryTicket(a, 105)
-	require.NoError(t, s.storeWinningTickets(t.Context(), a.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}), "B consumed nonce zero and A's nonce one failed; A has no remaining liability")
+	require.NoError(t, s.storeWinningTickets(t.Context(), a.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), "B consumed nonce zero and A's nonce one failed; A has no remaining liability")
 }
 
 func TestMultipleFinalizedFailuresResolveEveryGroup(t *testing.T) {
@@ -973,7 +973,7 @@ func TestMultipleFinalizedFailuresResolveEveryGroup(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, history, 4)
 	next := nextRecoveryTicket(ticket, 107)
-	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}), "both finalized failed nonces must resolve their replacement siblings")
+	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), "both finalized failed nonces must resolve their replacement siblings")
 }
 
 func TestLiveAcknowledgementRestoresNonce(t *testing.T) {
@@ -1038,7 +1038,7 @@ func TestUsedTransitionRecoversAfterStorageFailure(t *testing.T) {
 		t.Errorf("summary=%s but redeemed_at remains NULL even after restart and retry", ticketPhase(t, s, ticket.Sig))
 	}
 	next := nextRecoveryTicket(ticket, 223)
-	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}), "a finalized-used ticket must not strand collateral")
+	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), "a finalized-used ticket must not strand collateral")
 }
 
 func TestRejectedReplacementKeepsPredecessorReconcilable(t *testing.T) {

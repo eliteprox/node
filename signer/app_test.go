@@ -299,9 +299,13 @@ func TestSignerReadiness(t *testing.T) {
 					result = "0x1"
 				case "eth_getBlockByNumber":
 					if failure.Load() != 1 {
-						result = map[string]string{"number": "0x32", "hash": ethcommon.HexToHash("0x1234").Hex()}
+						result = map[string]string{"number": "0x32", "hash": ethcommon.HexToHash("0x1234").Hex(), "timestamp": fmt.Sprintf("0x%x", time.Now().Unix())}
 					}
 				case "eth_call":
+					if failure.Load() == 1 {
+						_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "error": map[string]any{"code": -32000}})
+						return
+					}
 					var call struct {
 						Data string `json:"input"`
 					}
@@ -312,7 +316,7 @@ func TestSignerReadiness(t *testing.T) {
 					switch {
 					case selector("getContract(bytes32)"):
 						result = fmt.Sprintf("0x%064x", 1)
-					case selector("lastInitializedRound()"):
+					case selector("lastInitializedRound()"), selector("currentRound()"):
 						result = fmt.Sprintf("0x%064x", 5)
 					case selector("blockHashForRound(uint256)"):
 						result = ethcommon.HexToHash("0x1234").Hex()

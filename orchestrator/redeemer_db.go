@@ -129,7 +129,7 @@ func (s *RedeemerDB) StoreWinningTicket(t *pm.SignedTicket) error {
 // storeWinningTickets commits a validated receipt batch before the payment
 // engine publishes replay guards or credit. Check exposure and liability in the
 // same transaction so redemption and concurrent receipts cannot race these gates.
-func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Address, randHash ethcommon.Hash, minRound int64, collateral *big.Int, tickets []*pm.SignedTicket) error {
+func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Address, randHash ethcommon.Hash, minRound int64, collateral *big.Int, tickets []*pm.SignedTicket, snapshot pm.ChainSnapshot) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -175,6 +175,9 @@ func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Ad
 	}
 	if pending.Cmp(collateral) > 0 {
 		return pm.ErrPayerUnavailable
+	}
+	if err := snapshot.Validate(); err != nil {
+		return paymentObservation{err, "error"}
 	}
 	return tx.Commit()
 }

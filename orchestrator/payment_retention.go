@@ -48,6 +48,9 @@ func (e *PaymentEngine) PruneControlState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := snapshot.Validate(); err != nil {
+		return err
+	}
 	if snapshot.Block != nil {
 		e.observeBlock(snapshot.Block)
 	}

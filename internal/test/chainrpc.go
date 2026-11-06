@@ -1,14 +1,17 @@
 package test
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -17,13 +20,25 @@ import (
 
 // Adapted from BlueClawNetwork/livepeer-node internal/test/chainrpc.go,
 // 285eda984d7cce4e3030ef0510d63ae142534dd7, by Mike Zupper (MIT; see LICENSE).
-// ChainRPC serves the payment read methods at one canonical block. Other tests
+// ChainRPC serves payment reads at canonical blocks. Other tests
 // can extend this fixture without duplicating the payment RPC protocol.
 type ChainRPC struct {
 	URL        string
 	Controller common.Address
 	mu         sync.Mutex
 	stats      ChainRPCStats
+	state      ChainState
+	history    map[common.Hash]ChainState
+}
+
+type ChainState struct {
+	Number, L1Block, Timestamp uint64
+	ChainID                    uint64
+	Hash, Parent, RoundHash    common.Hash
+	Round, CurrentRound        uint64
+	OmitL1, OmitTimestamp      bool
+	Fail                       string
+	Before                     func(context.Context, string)
 }
 
 type ChainRPCStats struct {
@@ -34,7 +49,8 @@ type ChainRPCStats struct {
 func NewChainRPC(t testing.TB) *ChainRPC {
 	t.Helper()
 	c := &ChainRPC{Controller: common.HexToAddress("0xc001"), stats: ChainRPCStats{Calls: map[string]int{}}}
-	blockHash := common.HexToHash("0xabcd").Hex()
+	c.state = ChainState{Number: 0x100000, L1Block: 50, Timestamp: uint64(time.Now().Unix()), Hash: common.HexToHash("0xabcd"), RoundHash: common.HexToHash("0x1234"), Round: 5, CurrentRound: 5}
+	c.history = map[common.Hash]ChainState{c.state.Hash: c.state}
 	word := func(value string) string { return strings.Repeat("0", 64-len(value)) + value }
 	addresses := map[string]string{}
 	for name, address := range map[string]string{"RoundsManager": "a1", "BondingManager": "a2", "TicketBroker": "a3"} {
@@ -43,6 +59,7 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 	methods := map[string]string{}
 	for signature, name := range map[string]string{
 		"getContract(bytes32)": "Controller.getContract", "lastInitializedRound()": "RoundsManager.lastInitializedRound",
+		"currentRound()":             "RoundsManager.currentRound",
 		"blockHashForRound(uint256)": "RoundsManager.blockHashForRound", "isActiveTranscoder(address)": "BondingManager.isActiveTranscoder",
 		"getSenderInfo(address)": "TicketBroker.getSenderInfo", "claimableReserve(address,address)": "TicketBroker.claimableReserve",
 	} {
@@ -56,27 +73,71 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		}
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
 		name := request.Method
-		var result any
-		switch request.Method {
-		case "eth_getBlockByNumber":
-			result = map[string]string{"number": "0x100000", "l1BlockNumber": "0x32", "hash": blockHash}
-		case "eth_call":
+		var call struct{ Input string }
+		if name == "eth_call" {
 			require.Len(t, request.Params, 2)
-			var ref map[string]any
-			require.NoError(t, json.Unmarshal(request.Params[1], &ref))
-			require.Equal(t, map[string]any{"blockHash": blockHash, "requireCanonical": true}, ref)
-			var call struct{ Input string }
 			require.NoError(t, json.Unmarshal(request.Params[0], &call))
 			require.GreaterOrEqual(t, len(call.Input), 10)
 			name = methods[call.Input[2:10]]
+		}
+		c.mu.Lock()
+		c.stats.RoundTrips++
+		c.stats.Calls[name]++
+		before := c.state.Before
+		c.mu.Unlock()
+		if before != nil {
+			before(r.Context(), name)
+		}
+		state := c.State()
+		fail := func() {
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32000}})
+		}
+		if state.Fail == name {
+			fail()
+			return
+		}
+		var result any
+		switch request.Method {
+		case "eth_chainId":
+			result = quantity(state.ChainID)
+		case "eth_getBlockByNumber":
+			var ref string
+			require.NoError(t, json.Unmarshal(request.Params[0], &ref))
+			if ref != "latest" {
+				var ok bool
+				state, ok = c.stateAt(ref)
+				if !ok {
+					break
+				}
+			}
+			header := map[string]any{"number": quantity(state.Number), "hash": state.Hash, "parentHash": state.Parent}
+			if !state.OmitTimestamp {
+				header["timestamp"] = quantity(state.Timestamp)
+			}
+			if !state.OmitL1 {
+				header["l1BlockNumber"] = quantity(state.L1Block)
+			}
+			result = header
+		case "eth_call":
+			var ref map[string]any
+			require.NoError(t, json.Unmarshal(request.Params[1], &ref))
+			require.Equal(t, true, ref["requireCanonical"])
+			var ok bool
+			state, ok = c.stateAt(ref["blockHash"].(string))
+			if !ok {
+				fail()
+				return
+			}
 			switch name {
 			case "Controller.getContract":
 				require.Contains(t, addresses, call.Input[10:])
 				result = "0x" + addresses[call.Input[10:]]
 			case "RoundsManager.lastInitializedRound":
-				result = "0x" + word("5")
+				result = "0x" + word(quantity(state.Round)[2:])
+			case "RoundsManager.currentRound":
+				result = "0x" + word(quantity(state.CurrentRound)[2:])
 			case "RoundsManager.blockHashForRound":
-				result = common.HexToHash("0x1234").Hex()
+				result = state.RoundHash.Hex()
 			case "BondingManager.isActiveTranscoder":
 				result = "0x" + word("1")
 			case "TicketBroker.getSenderInfo":
@@ -89,10 +150,6 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		default:
 			t.Errorf("unexpected payment RPC method %q", request.Method)
 		}
-		c.mu.Lock()
-		c.stats.RoundTrips++
-		c.stats.Calls[name]++
-		c.mu.Unlock()
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result}))
 	}))
 	t.Cleanup(server.Close)
@@ -100,8 +157,45 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 	return c
 }
 
+func (c *ChainRPC) State() ChainState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state
+}
+
+func (c *ChainRPC) Update(update func(*ChainState)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	update(&c.state)
+	for h, state := range c.history {
+		if state.Number >= c.state.Number {
+			delete(c.history, h)
+		}
+	}
+	c.history[c.state.Hash] = c.state
+}
+
+func (c *ChainRPC) stateAt(ref string) (ChainState, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, state := range c.history {
+		if ref == state.Hash.Hex() || ref == quantity(state.Number) {
+			return state, true
+		}
+	}
+	return ChainState{}, false
+}
+
+func quantity(n uint64) string { return fmt.Sprintf("0x%x", n) }
+
 func (c *ChainRPC) Stats() ChainRPCStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return ChainRPCStats{RoundTrips: c.stats.RoundTrips, Calls: maps.Clone(c.stats.Calls)}
+}
+
+func (c *ChainRPC) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stats = ChainRPCStats{Calls: map[string]int{}}
 }

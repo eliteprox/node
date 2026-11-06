@@ -26,9 +26,10 @@ const maxRPCResponse = 1 << 20
 
 // RPC applies bounded HTTP transport and error redaction to geth's client.
 type RPC struct {
-	ethereum *ethclient.Client
-	http     *http.Client
-	observer func(string, time.Duration, error)
+	ethereum  *ethclient.Client
+	http      *http.Client
+	observer  func(string, time.Duration, error)
+	requireL1 bool // Set by the startup chain-ID check, before concurrent use.
 }
 
 // SetObserver installs a hook before the client is used. Observations contain
@@ -219,10 +220,12 @@ func (r *RPC) TransactionReceipt(ctx context.Context, hash ethcommon.Hash) (*typ
 // miniHeader retains the RPC hash and Arbitrum's L1 clock, which geth's Header
 // does not expose. All quantities use geth's JSON decoders.
 type miniHeader struct {
-	Number        *hexutil.Big   `json:"number"`
-	BaseFee       *hexutil.Big   `json:"baseFeePerGas"`
-	L1BlockNumber *hexutil.Big   `json:"l1BlockNumber"`
-	Hash          ethcommon.Hash `json:"hash"`
+	Number        *hexutil.Big    `json:"number"`
+	BaseFee       *hexutil.Big    `json:"baseFeePerGas"`
+	L1BlockNumber *hexutil.Big    `json:"l1BlockNumber"`
+	Hash          ethcommon.Hash  `json:"hash"`
+	ParentHash    ethcommon.Hash  `json:"parentHash"`
+	Timestamp     *hexutil.Uint64 `json:"timestamp"`
 }
 
 func (r *RPC) header(ctx context.Context, block any) (*miniHeader, error) {
@@ -244,6 +247,12 @@ func (r *RPC) CheckChainID(ctx context.Context, expected *big.Int) error {
 	}
 	if expected != nil && id.Cmp(expected) != 0 {
 		return errors.New("RPC chain ID does not match configured chain-id")
+	}
+	if id.IsUint64() {
+		switch id.Uint64() {
+		case 42161, 42170, 421613, 421614: // Arbitrum One, Nova, Goerli, Sepolia.
+			r.requireL1 = true
+		}
 	}
 	return nil
 }
