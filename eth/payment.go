@@ -36,7 +36,7 @@ func (c PaymentChain) IsActiveAt(ctx context.Context, recipient ethcommon.Addres
 	if snapshot.blockReference == nil {
 		return false, errors.New("canonical snapshot required")
 	}
-	address, err := c.Contracts.ResolveAt(ctx, snapshot.blockReference, "bondingManager")
+	address, err := c.Contracts.paymentAddress(ctx, snapshot, "bondingManager")
 	if err != nil {
 		return false, err
 	}
@@ -86,6 +86,7 @@ type ChainSnapshot struct {
 	RoundHash      ethcommon.Hash
 	CurrentRound   *big.Int // Protocol round; may exceed the initialized Round.
 	blockReference map[string]any
+	addresses      paymentContracts
 	observer       *PaymentObserver
 	generation     uint64
 	observedAt     time.Time
@@ -117,11 +118,17 @@ func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader, curren
 	block := new(big.Int).Set((*big.Int)(clock))
 	// Bind every read to the canonical block, including Controller resolution.
 	ref := map[string]any{"blockHash": header.Hash.Hex(), "requireCanonical": true}
-	address, err := c.Contracts.ResolveAt(ctx, ref, "roundsManager")
+	var addresses paymentContracts
+	var err error
+	if currentRound { // Observer candidates confirm the complete registry first.
+		addresses, err = c.Contracts.paymentContractsAt(ctx, ref)
+	} else {
+		addresses.rounds, err = c.Contracts.ResolveAt(ctx, ref, "roundsManager")
+	}
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
-	rounds, err := contracts.NewRoundsManagerCaller(address, c.Contracts.callerAt(ref))
+	rounds, err := contracts.NewRoundsManagerCaller(addresses.rounds, c.Contracts.callerAt(ref))
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
@@ -140,7 +147,7 @@ func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader, curren
 	if hash == ([32]byte{}) {
 		return ChainSnapshot{}, errors.New("invalid round block hash")
 	}
-	snapshot := ChainSnapshot{Block: block, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref}
+	snapshot := ChainSnapshot{Block: block, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref, addresses: addresses}
 	if currentRound {
 		snapshot.CurrentRound, err = rounds.CurrentRound(opts)
 		if err != nil {
@@ -169,7 +176,7 @@ func (c PaymentChain) SenderInfo(ctx context.Context, sender, recipient ethcommo
 	if err != nil {
 		return SenderInfo{}, err
 	}
-	address, err := c.Contracts.ResolveAt(ctx, snapshot.blockReference, "ticketBroker")
+	address, err := c.Contracts.paymentAddress(ctx, snapshot, "ticketBroker")
 	if err != nil {
 		return SenderInfo{}, err
 	}
