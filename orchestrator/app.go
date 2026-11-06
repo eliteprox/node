@@ -284,7 +284,6 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		}
 		paymentChain = eth.PaymentChain{Contracts: contracts}
 		observedChain = paymentChain
-		observedChain.Observer = eth.NewPaymentObserver(paymentChain, p.Network == nodeconfig.Mainnet)
 		if p.ETHUSDFeed != nil {
 			rate, until, err := contracts.WeiPerUSD(parent, *p.ETHUSDFeed, p.PriceMaxAge)
 			if err != nil {
@@ -298,6 +297,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		if p.OrchestratorAddress != nil {
 			recipient = *p.OrchestratorAddress
 		}
+		observedChain.Observer = eth.NewPaymentObserver(paymentChain, p.Network == nodeconfig.Mainnet, recipient)
 		engine, err = NewPaymentEngine(redeemerDB, pm.EthereumChain{Client: observedChain}, recipient, p.TicketFaceValue.ToBig(), p.TicketWinProb.ToBig())
 		if err != nil {
 			return fmt.Errorf("initialize payment engine (check --account, --ticket-face-value and --ticket-win-prob): %w", err)

@@ -101,6 +101,9 @@ func TestPaidHTTPStartup(t *testing.T) {
 					result = fmt.Sprintf("0x%064x", 1)
 					var call struct{ Input string }
 					require.NoError(t, json.Unmarshal(req.Params[0], &call))
+					if strings.HasPrefix(call.Input, fmt.Sprintf("0x%x", crypto.Keccak256([]byte("isActiveTranscoder(address)"))[:4])) {
+						require.True(t, strings.HasSuffix(call.Input, fmt.Sprintf("%064x", recipient.Bytes())), "observe the configured ticket recipient, including a separate wallet")
+					}
 					if strings.HasPrefix(call.Input, fmt.Sprintf("0x%x", crypto.Keccak256([]byte("usedTickets(bytes32)"))[:4])) {
 						result = fmt.Sprintf("0x%064x", 0)
 					}

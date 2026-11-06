@@ -40,7 +40,7 @@ func TestPaidReadinessUsesCurrentPublication(t *testing.T) {
 	defer rpc.Close()
 	contracts, err := eth.NewContracts(rpc, f.Controller)
 	require.NoError(t, err)
-	o := eth.NewPaymentObserver(eth.PaymentChain{Contracts: contracts}, true)
+	o := eth.NewPaymentObserver(eth.PaymentChain{Contracts: contracts}, true, common.HexToAddress("0x1234"))
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() { o.Run(ctx); close(done) }()

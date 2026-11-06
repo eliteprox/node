@@ -36,6 +36,8 @@ type ChainState struct {
 	ChainID                    uint64
 	Hash, Parent, RoundHash    common.Hash
 	Round, CurrentRound        uint64
+	Recipient                  common.Address
+	Activation, Deactivation   uint64
 	OmitL1, OmitTimestamp      bool
 	Fail                       string
 	Before                     func(context.Context, string)
@@ -56,7 +58,7 @@ type ChainRPCStats struct {
 func NewChainRPC(t testing.TB) *ChainRPC {
 	t.Helper()
 	c := &ChainRPC{Controller: common.HexToAddress("0xc001"), stats: ChainRPCStats{Calls: map[string]int{}}}
-	c.state = ChainState{Number: 0x100000, L1Block: 50, Timestamp: uint64(time.Now().Unix()), Hash: common.HexToHash("0xabcd"), RoundHash: common.HexToHash("0x1234"), Round: 5, CurrentRound: 5}
+	c.state = ChainState{Number: 0x100000, L1Block: 50, Timestamp: uint64(time.Now().Unix()), Hash: common.HexToHash("0xabcd"), RoundHash: common.HexToHash("0x1234"), Round: 5, CurrentRound: 5, Deactivation: ^uint64(0)}
 	word := func(value string) string { return strings.Repeat("0", 64-len(value)) + value }
 	contractNames := map[string]string{}
 	c.state.Contracts = map[string]common.Address{}
@@ -153,7 +155,13 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 			case "RoundsManager.blockHashForRound":
 				result = state.RoundHash.Hex()
 			case "BondingManager.isActiveTranscoder":
-				result = "0x" + word("1")
+				if state.Recipient != (common.Address{}) {
+					require.Equal(t, word(hex.EncodeToString(state.Recipient.Bytes())), call.Input[10:])
+				}
+				result = "0x" + word("0")
+				if state.Activation <= state.CurrentRound && state.CurrentRound < state.Deactivation {
+					result = "0x" + word("1")
+				}
 			case "TicketBroker.getSenderInfo":
 				result = "0x" + word("de0b6b3a7640000") + word("0") + word("de0b6b3a7640000") + word("0")
 			case "TicketBroker.claimableReserve":
