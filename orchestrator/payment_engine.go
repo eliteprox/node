@@ -122,6 +122,9 @@ func (e *PaymentEngine) makeChallenge(ctx context.Context, appID, manifest strin
 		Auth:         e.authToken(manifest, time.Now().Add(time.Hour).Unix())}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := snapshot.Validate(); err != nil {
+		return Challenge{}, err
+	}
 	e.observeBlock(snapshot.Block)
 	current := e.sessions[manifest]
 	if current == nil {
@@ -277,6 +280,9 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 	if e.sessions[manifest] != session {
 		return ethcommon.Address{}, nil, ErrMissingChallenge
 	}
+	if err := snapshot.Validate(); err != nil {
+		return ethcommon.Address{}, nil, paymentObservation{err, "error"}
+	}
 	e.observeBlock(snapshot.Block)
 	if params.ExpirationBlock.Cmp(e.lastSeenBlock) <= 0 {
 		return ethcommon.Address{}, nil, ErrInvalidPayment
@@ -307,7 +313,7 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 			winners = append(winners, &pm.SignedTicket{Ticket: ticket, Sig: sp.Sig, RecipientRand: recipientRand})
 		}
 	}
-	if err := e.store.storeWinningTickets(ctx, payer, params.RecipientRandHash, snapshot.Round.Int64()-2, new(big.Int).Add(funds.Deposit, funds.Reserve), winners); err != nil {
+	if err := e.store.storeWinningTickets(ctx, payer, params.RecipientRandHash, snapshot.Round.Int64()-2, new(big.Int).Add(funds.Deposit, funds.Reserve), winners, snapshot); err != nil {
 		return ethcommon.Address{}, nil, err
 	}
 	if previous == nil {

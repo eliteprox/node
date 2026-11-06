@@ -134,7 +134,7 @@ func TestFinalizedExternalNonceRetiresOnlyMissingTransactions(t *testing.T) {
 			require.Empty(t, ReconcileSubmitted(t.Context(), s, c))
 			next := nextRecoveryTicket(ticket, 235)
 			next.CreationRound = 5
-			require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}), pm.ErrPayerUnavailable)
+			require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), pm.ErrPayerUnavailable)
 			f.mu.Lock()
 			f.finalizedNonce = 1
 			f.finalizedNonceReads = 0
@@ -153,10 +153,10 @@ func TestFinalizedExternalNonceRetiresOnlyMissingTransactions(t *testing.T) {
 			if observation == "missing" {
 				require.Empty(t, items)
 				require.Equal(t, "expired", ticketPhase(t, s, ticket.Sig))
-				require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}))
+				require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}))
 				oldEpoch := nextRecoveryTicket(ticket, 236)
 				oldEpoch.RecipientRandHash = ticket.RecipientRandHash
-				require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{oldEpoch}), ErrInvalidPayment)
+				require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{oldEpoch}, pm.ChainSnapshot{}), ErrInvalidPayment)
 			} else {
 				require.Len(t, items, 1, "uncertain or unfinalized receipts retain liability")
 			}
@@ -191,7 +191,7 @@ func TestFinalizedExternalNoncePreservesHigherAttempt(t *testing.T) {
 	require.Equal(t, 1, reads)
 	next := nextRecoveryTicket(ticket, 238)
 	next.CreationRound = 5
-	require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}), pm.ErrPayerUnavailable)
+	require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), pm.ErrPayerUnavailable)
 	// Finalized state advances beyond both attempts while the pending endpoint
 	// stays stale. New signing must use that observed count, not the saved floor.
 	f.mu.Lock()

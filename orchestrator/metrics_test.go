@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -16,12 +17,84 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/internal/test"
+	"github.com/livepeer/node/pm"
 	"github.com/livepeer/node/pm/wire"
 	"github.com/stretchr/testify/require"
 )
+
+type snapshotReader struct {
+	pm.PaymentChain
+	read func(context.Context) (pm.ChainSnapshot, error)
+}
+
+func (c snapshotReader) Snapshot(ctx context.Context) (pm.ChainSnapshot, error) { return c.read(ctx) }
+
+func TestPaidReadinessUsesCurrentPublication(t *testing.T) {
+	f := test.NewChainRPC(t)
+	rpc, err := eth.OpenRPC(f.URL)
+	require.NoError(t, err)
+	defer rpc.Close()
+	contracts, err := eth.NewContracts(rpc, f.Controller)
+	require.NoError(t, err)
+	o := eth.NewPaymentObserver(eth.PaymentChain{Contracts: contracts}, true)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { o.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	var snapshot eth.ChainSnapshot
+	require.Eventually(t, func() bool { snapshot, err = o.Snapshot(ctx); return err == nil }, time.Second, time.Millisecond)
+	p := &paidReadiness{chain: true, active: true, storage: true, completed: time.Now(), workerCompleted: time.Now(), observer: o, snapshot: snapshot}
+	registry := NewRegistry("", "http://localhost", time.Second, time.Minute)
+	f.Update(func(s *test.ChainState) {
+		s.L1Block++
+		s.Hash = common.HexToHash("0xeeee")
+		s.Timestamp = uint64(time.Now().Unix())
+	})
+	require.Eventually(t, func() bool { return o.Status().ObservedAt.After(snapshot.ObservedAt()) }, 7*time.Second, 10*time.Millisecond)
+	require.ErrorIs(t, snapshot.Validate(), eth.ErrObservationUnavailable)
+	require.True(t, p.ready(registry), "an older heartbeat must not conceal a healthy completed backfill")
+	_, store, ticket, chain, _ := newRecoveryTest(t, 15)
+	store.readiness = p
+	stats, err := store.redemptionStats(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.tickets["unknown"], "a healthy current observer cannot authorize a saved orphaned queue clock")
+	ticket.Sig = []byte{99, 2, 3}
+	require.ErrorIs(t, store.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{ticket}, snapshot), eth.ErrObservationUnavailable)
+	count, err := store.WinningTicketCount(ticket.PayerAddress, 0)
+	require.NoError(t, err)
+	require.Equal(t, 1, count, "invalidated admission must roll back its ticket insert")
+	captured := make(chan struct{})
+	e := &PaymentEngine{lastSeenBlock: new(big.Int).Set(snapshot.Block), nonceCount: 1, ticketNonces: map[string]*recipientNonces{"r": {nonceSeen: map[uint32]bool{1: true}, expirationBlock: new(big.Int).Add(snapshot.Block, big.NewInt(1))}}}
+	e.chain = snapshotReader{read: func(ctx context.Context) (pm.ChainSnapshot, error) {
+		s, err := o.Snapshot(ctx)
+		close(captured)
+		return s, err
+	}}
+	e.mu.Lock()
+	pruned := make(chan error, 1)
+	go func() { pruned <- e.PruneControlState(t.Context()) }()
+	select {
+	case <-captured:
+	case <-time.After(time.Second):
+		e.mu.Unlock()
+		t.Fatal("pruner did not capture snapshot")
+	}
+	cancel()
+	<-done
+	e.mu.Unlock()
+	require.ErrorIs(t, <-pruned, eth.ErrObservationUnavailable)
+	require.Equal(t, snapshot.Block, e.lastSeenBlock)
+	require.Len(t, e.ticketNonces, 1)
+	require.Equal(t, 1, e.nonceCount)
+	chain.Observer = o
+	p.check(t.Context(), store, chain, &PaymentEngine{recipient: ticket.Recipient}, observability.New("orchestrator"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.True(t, p.storage, "chain unavailability must not mark healthy storage unavailable")
+	require.False(t, p.ready(registry))
+}
 
 func TestRunnerCapacityOutcomes(t *testing.T) {
 	for _, paid := range []bool{false, true} {
