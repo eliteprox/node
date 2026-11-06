@@ -303,6 +303,46 @@ func TestRecipientRestartRotatesSecretsAndPreservesWinningTickets(t *testing.T) 
 	require.NoError(t, receiveRecipientPayment(t, restarted, key, fresh, 1))
 }
 
+func TestRecipientConcurrentReplay(t *testing.T) {
+	e, _, key, _ := newRecipientTestEngine(t)
+	e.metrics = observability.New("orchestrator")
+	info := issueRecipientParams(t, e, key)
+	payment, segment := recipientPayment(t, key, info, 1, 2)
+	paymentHeader := base64.StdEncoding.EncodeToString(wire.EncodePayment(payment))
+	segmentHeader := base64.StdEncoding.EncodeToString(wire.EncodeSegData(segment))
+	start := make(chan struct{})
+	results := make(chan error, 32)
+	for range cap(results) {
+		go func() {
+			<-start
+			_, _, err := e.Receive(t.Context(), "runner", "session", paymentHeader, segmentHeader)
+			results <- err
+		}()
+	}
+	close(start)
+	accepted := 0
+	for range cap(results) {
+		if err := <-results; err == nil {
+			accepted++
+		} else {
+			require.ErrorIs(t, err, ErrInvalidPayment)
+		}
+	}
+	require.Equal(t, 1, accepted)
+	require.EqualValues(t, 2, test.MetricSum(t, e.metrics.Registry, "payment_tickets_total", map[string]string{"kind": "accepted"}))
+	require.EqualValues(t, 2, test.MetricSum(t, e.metrics.Registry, "payment_tickets_total", map[string]string{"kind": "winning"}))
+	require.Positive(t, test.MetricSum(t, e.metrics.Registry, "payment_credit_eth_total", nil))
+	require.Equal(t, 2, e.nonceCount)
+	count, err := e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey), 0)
+	require.NoError(t, err)
+	require.Equal(t, 2, count)
+	balance, err := e.Balance("session")
+	require.NoError(t, err)
+	expected := new(big.Rat).Mul(new(big.Rat).SetFrac(e.faceValue, maxWinProb), new(big.Rat).SetInt(e.winProb))
+	expected.Mul(expected, big.NewRat(2, 1))
+	require.Zero(t, balance.Cmp(expected), "concurrent replays must credit the batch once")
+}
+
 func TestInactiveOrchestratorDoesNotIssuePaidChallenge(t *testing.T) {
 	e, chain, key, _ := newRecipientTestEngine(t)
 	chain.active = false
@@ -345,6 +385,8 @@ func TestRecipientStorageFailureDoesNotPublishCreditOrConsumeNonces(t *testing.T
 	require.NoError(t, err)
 	require.Zero(t, balance.Sign())
 	require.Zero(t, e.nonceCount)
+	require.Zero(t, test.MetricSum(t, e.metrics.Registry, "payment_tickets_total", nil))
+	require.Zero(t, test.MetricSum(t, e.metrics.Registry, "payment_credit_eth_total", nil))
 	_, err = e.store.db.Exec(`DROP TRIGGER reject_second_ticket`)
 	require.NoError(t, err)
 	require.NoError(t, receiveRecipientPayment(t, e, key, info, 1, 2), "storage failure must leave both nonces retryable")
