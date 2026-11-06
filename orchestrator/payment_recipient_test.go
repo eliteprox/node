@@ -252,6 +252,8 @@ func TestRecipientBatchReplayAndExpiry(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, challenges, test.MetricSum(t, e.metrics.Registry, "payment_operations_total", map[string]string{"operation": "challenge"}))
 	require.EqualValues(t, 1, test.MetricSum(t, e.metrics.Registry, "payment_operations_total", map[string]string{"operation": "refresh", "outcome": "success"}))
+	require.EqualValues(t, 1, test.MetricSum(t, e.metrics.Registry, "payment_operation_duration_seconds", map[string]string{"operation": "refresh"}))
+	require.Equal(t, challenges, test.MetricSum(t, e.metrics.Registry, "payment_operation_duration_seconds", map[string]string{"operation": "challenge"}))
 	// A newer valid auth token cannot reset nonce tracking for old PM params.
 	info.Auth = e.authToken("session", time.Now().Add(2*time.Hour).Unix())
 	require.ErrorIs(t, receiveRecipientPayment(t, e, key, info, 1), ErrInvalidPayment)
@@ -444,9 +446,11 @@ func TestPaidFailureOutcomes(t *testing.T) {
 				request = request.WithContext(ctx)
 			}
 			response := httptest.NewRecorder()
+			beforeDuration := test.MetricSum(t, e.metrics.Registry, "payment_operation_duration_seconds", map[string]string{"operation": operation})
 			server.ServeHTTP(response, request)
 			require.Equal(t, status, response.Code, response.Body.String())
 			require.EqualValues(t, 1, test.MetricSum(t, e.metrics.Registry, "payment_operations_total", map[string]string{"operation": operation, "outcome": outcome}))
+			require.Equal(t, beforeDuration+1, test.MetricSum(t, e.metrics.Registry, "payment_operation_duration_seconds", map[string]string{"operation": operation}))
 			require.EqualValues(t, 1, test.MetricSum(t, e.metrics.Registry, "app_calls_total", map[string]string{"outcome": appOutcome}))
 			require.Zero(t, test.MetricSum(t, e.metrics.Registry, "upstream_requests_total", nil))
 		})
@@ -477,31 +481,8 @@ func TestLiveChargeObservesOnlyDebitAttempts(t *testing.T) {
 // Copyright (c) 2017 Livepeer; MIT notice in LICENSE.
 func TestPaymentsAndReadinessUseObservedRecipient(t *testing.T) {
 	e, _, key, _ := newRecipientTestEngine(t)
-	f := test.NewChainRPC(t)
-	f.Update(func(s *test.ChainState) { s.Recipient = e.recipient })
-	rpc, err := eth.OpenRPC(f.URL)
-	require.NoError(t, err)
-	t.Cleanup(rpc.Close)
-	contracts, err := eth.NewContracts(rpc, f.Controller)
-	require.NoError(t, err)
-	chain := eth.PaymentChain{Contracts: contracts}
-	chain.Observer = eth.NewPaymentObserver(chain, true, e.recipient)
-	e.chain = pm.EthereumChain{Client: chain}
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	go func() { chain.Observer.Run(ctx); close(done) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("recipient observation did not stop")
-		}
-	})
-	require.Eventually(t, func() bool {
-		_, err := chain.Snapshot(t.Context())
-		return err == nil
-	}, time.Second, time.Millisecond)
+	f, chain, _ := newObservedPaymentChain(t, e.recipient)
+	e.chain = chain
 	registry := NewRegistry("", "https://orch.example", time.Second, time.Minute)
 	ready := &paidReadiness{storage: true, completed: time.Now(), workerCompleted: time.Now(), observer: chain.Observer}
 	f.Reset()

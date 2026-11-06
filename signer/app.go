@@ -187,8 +187,9 @@ func serve(parent context.Context, p Params) error {
 	}
 	chain := eth.PaymentChain{Contracts: contracts}
 	observer := eth.NewPaymentObserver(chain, p.Network == nodeconfig.Mainnet, ethcommon.Address{})
+	service.metrics.PaymentObserver(observer, slog.With("component", "signer"))
 	chain.Observer = observer
-	service.SetPaymentChain(pm.EthereumChain{Client: chain})
+	service.SetPaymentChain(chain)
 	policy, _ := newPricePolicy(p.MaxHourlyPrice, p.MaxFixedPrice)
 	policy.metrics = service.metrics
 	if p.WeiPerUSD == nil {
@@ -240,7 +241,7 @@ func serve(parent context.Context, p Params) error {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 	metricsMux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(eth.WithRPCWork(r.Context(), "background"), 5*time.Second)
 		defer cancel()
 		funds, err := service.paymentChain.PayerFunds(ctx, key.Address(), ethcommon.Address{})
 		if err == nil {
@@ -269,7 +270,7 @@ func serve(parent context.Context, p Params) error {
 	workers.Go(func() { service.RunDiscovery(ctx) })
 	if p.WeiPerUSD == nil {
 		workers.Go(func() {
-			refreshPriceFeed(ctx, time.Hour, service.pricePolicy, func(readCtx context.Context) (*big.Rat, time.Time, error) {
+			refreshPriceFeed(eth.WithRPCWork(ctx, "background"), time.Hour, service.pricePolicy, func(readCtx context.Context) (*big.Rat, time.Time, error) {
 				return contracts.WeiPerUSD(readCtx, p.ETHUSDFeed, p.ETHUSDMaxAge)
 			})
 		})

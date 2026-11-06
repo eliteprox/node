@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/felixge/httpsnoop"
 	"github.com/livepeer/node/cmd/version"
+	"github.com/livepeer/node/eth"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -205,10 +207,64 @@ func ErrorKind(err error) string {
 	return "error"
 }
 
-func (m *Metrics) RPC(method string, elapsed time.Duration, err error) {
-	labels := Labels{"method": method}
-	m.Add("rpc_requests_total", 1, labels.With("outcome", ErrorKind(err)))
-	m.Observe("rpc_request_duration_seconds", elapsed.Seconds(), labels)
+// Contract/refresh metrics adapt Mike Zupper's BlueClawNetwork/livepeer-node
+// internal/observability/metrics.go at 2c2ce3cf8a51f5464ce4961bbb6c2e640f348ae0 (MIT; see LICENSE).
+func (m *Metrics) RPC(o eth.RPCObservation) {
+	labels := Labels{"method": o.Method}
+	m.Add("rpc_requests_total", 1, labels.With("outcome", ErrorKind(o.Err)))
+	m.Observe("rpc_request_duration_seconds", o.Elapsed.Seconds(), labels)
+	m.Add("rpc_work_total", 1, Labels{"work": o.Work, "kind": "transport"})
+	if o.Method == "eth_call" {
+		m.Add("rpc_contract_calls_total", 1, Labels{"contract": o.Contract, "function": o.Function})
+		m.Add("rpc_work_total", 1, Labels{"work": o.Work, "kind": "contract_call"})
+	}
+}
+
+// PaymentObserver collects authoritative memory-only state. The callback only
+// remembers the last logged health transition; it does not decide freshness.
+func (m *Metrics) PaymentObserver(o *eth.PaymentObserver, logger *slog.Logger) {
+	last := ""
+	o.OnRefresh = func(elapsed time.Duration, err error) {
+		s := o.Status()
+		outcome := ErrorKind(err)
+		if err == nil && (s.RecipientFailed || s.PayerFailures > 0) {
+			outcome = "partial"
+		}
+		m.Add("chain_view_refreshes_total", 1, Labels{"outcome": outcome})
+		m.Observe("chain_view_refresh_duration_seconds", elapsed.Seconds(), nil)
+		state := "unavailable"
+		if s.Healthy {
+			state = "healthy"
+			if err != nil || s.RecipientFailed || s.PayerFailures > 0 {
+				state = "degraded"
+			}
+		}
+		if state != last && logger != nil {
+			logger.Info("chain observation state changed", "event", "chain_view", "operation", "refresh", "outcome", state, "error_kind", outcome)
+		}
+		last = state
+	}
+	m.Snapshot(func(emit Emit) {
+		s := o.Status()
+		if !s.ObservedAt.IsZero() {
+			emit("chain_view_age_seconds", max(0, time.Since(s.ObservedAt).Seconds()), nil)
+		}
+		for name, at := range map[string]time.Time{
+			"chain_view_last_contact_timestamp_seconds":  s.ContactAt,
+			"chain_view_head_progress_timestamp_seconds": s.HeadProgressAt,
+			"chain_view_l1_progress_timestamp_seconds":   s.L1ProgressAt,
+		} {
+			if !at.IsZero() {
+				emit(name, float64(at.Unix()), nil)
+			}
+		}
+		emit("chain_view_healthy", Bool(s.Healthy), nil)
+		emit("chain_view_tracked_entries", float64(s.PayerEntries), Labels{"kind": "payer"})
+		emit("chain_view_failed_entries", float64(s.PayerFailures), Labels{"kind": "payer"})
+		emit("chain_view_payer_reads_in_flight", float64(s.PayerReads), nil)
+		emit("chain_view_tracked_entries", Bool(s.RecipientTracked), Labels{"kind": "recipient"})
+		emit("chain_view_failed_entries", Bool(s.RecipientFailed), Labels{"kind": "recipient"})
+	})
 }
 
 func (m *Metrics) Discovery(source int, elapsed time.Duration, err error) {
@@ -390,7 +446,7 @@ func httpMethod(method string) string {
 // httpsnoop preserves the exact optional ResponseWriter interfaces.
 func (m *Metrics) HTTP(w http.ResponseWriter, r *http.Request, serve http.HandlerFunc) {
 	s := &Request{metrics: m, Operation: "unknown", Protocol: "http", started: time.Now()}
-	r = r.WithContext(context.WithValue(r.Context(), requestKey{}, s))
+	r = r.WithContext(eth.WithRPCWork(context.WithValue(r.Context(), requestKey{}, s), "foreground"))
 	if r.Body != nil {
 		r.Body = reader{r.Body, s}
 	}

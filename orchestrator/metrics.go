@@ -258,3 +258,9 @@ func (e *PaymentEngine) recordPayment(operation string, err error, labels observ
 		e.store.logger.Info("payment observed", "event", "payment", "operation", operation, "outcome", outcome, "app", labels["app"], "runner_id", labels["runner_id"], "app_id", labels["app_id"])
 	}
 }
+
+// Adapted from Mike Zupper's BlueClawNetwork/livepeer-node orchestrator/metrics.go,
+// commit 2c2ce3cf8a51f5464ce4961bbb6c2e640f348ae0 (MIT; see LICENSE).
+func (e *PaymentEngine) observeDuration(operation string, start time.Time, labels observability.Labels) {
+	e.metrics.Observe("payment_operation_duration_seconds", time.Since(start).Seconds(), labels.With("operation", operation))
+}

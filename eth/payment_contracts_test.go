@@ -57,7 +57,7 @@ func TestObserverConfirmedPaymentContracts(t *testing.T) {
 			chain.Observer = o
 			f.Reset()
 			for range 3 {
-				funds, err := chain.SenderInfo(t.Context(), common.HexToAddress("0x2000"), common.HexToAddress("0x3000"))
+				funds, err := chain.PayerFunds(t.Context(), common.HexToAddress("0x2000"), common.HexToAddress("0x3000"))
 				require.NoError(t, err)
 				require.Equal(t, after, funds.Snapshot)
 				active, err := chain.IsActiveAt(t.Context(), common.HexToAddress("0x3000"), funds.Snapshot)

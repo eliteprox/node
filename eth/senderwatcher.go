@@ -99,7 +99,8 @@ func (o *PaymentObserver) senderInfo(ctx context.Context, payer, recipient commo
 			o.mu.Unlock()
 			return SenderInfo{}, ErrObservationUnavailable
 		}
-		read, cancel := context.WithTimeout(o.lifecycle, 15*time.Second)
+		work, _ := ctx.Value(rpcWorkKey{}).(string)
+		read, cancel := context.WithTimeout(WithRPCWork(o.lifecycle, work), 15*time.Second)
 		job = &payerRead{done: make(chan struct{}), cancel: cancel}
 		entry.job = job
 		o.activeReads++
@@ -164,7 +165,6 @@ func (o *PaymentObserver) readPayer(ctx context.Context, key payerKey, entry *pa
 
 func (o *PaymentObserver) invalidate() {
 	o.mu.Lock()
-	o.invalid = true
 	o.generation++
 	o.mu.Unlock()
 }

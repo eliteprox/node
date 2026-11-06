@@ -45,7 +45,7 @@ func (c PaymentChain) IsActiveAt(ctx context.Context, recipient ethcommon.Addres
 	if snapshot.blockReference == nil {
 		return false, errors.New("canonical snapshot required")
 	}
-	address, err := c.Contracts.paymentAddress(ctx, snapshot, "bondingManager")
+	address, err := c.Contracts.ResolveAt(ctx, snapshot.blockReference, "bondingManager")
 	if err != nil {
 		return false, err
 	}
@@ -88,6 +88,14 @@ func (c PaymentChain) FinalizedReceipt(ctx context.Context, hash ethcommon.Hash)
 	}
 	return receipt, nil
 }
+
+// Address retention adapts livepeer/go-livepeer eth/client.go setContracts at
+// 597f882cb9f4d42ad8430b0f592afd5929af4a6b (Nico Vergauwen, 829cd9047c46aef03ff5bf07b3e34be810694b74;
+// Rafał Leszko, 3209dd946bb0376308044055b6caf262fd25cf61). Confirmation before
+// dependent reads adapts Mike Zupper's BlueClawNetwork/livepeer-node
+// eth/chainview.go, 2d95d40b8aa4699c7ca40838b6a9c312704c93db.
+// Copyright (c) 2017 Livepeer; MIT notice in LICENSE.
+type paymentContracts struct{ rounds, broker, bonding ethcommon.Address }
 
 type ChainSnapshot struct {
 	Block           *big.Int // Protocol L1 block, including on Arbitrum.
@@ -132,14 +140,19 @@ func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader, curren
 	// Bind every read to the canonical block, including Controller resolution.
 	ref := map[string]any{"blockHash": header.Hash.Hex(), "requireCanonical": true}
 	var addresses paymentContracts
-	var err error
-	if currentRound { // Observer candidates confirm the complete registry first.
-		addresses, err = c.Contracts.paymentContractsAt(ctx, ref)
-	} else {
-		addresses.rounds, err = c.Contracts.ResolveAt(ctx, ref, "roundsManager")
+	registry := []struct {
+		name string
+		to   *ethcommon.Address
+	}{{"roundsManager", &addresses.rounds}, {"ticketBroker", &addresses.broker}, {"bondingManager", &addresses.bonding}}
+	if !currentRound {
+		registry = registry[:1]
 	}
-	if err != nil {
-		return ChainSnapshot{}, err
+	for _, entry := range registry { // Confirm the complete scope before dependent reads.
+		address, err := c.Contracts.ResolveAt(ctx, ref, entry.name)
+		if err != nil {
+			return ChainSnapshot{}, err
+		}
+		*entry.to = address
 	}
 	rounds, err := contracts.NewRoundsManagerCaller(addresses.rounds, c.Contracts.callerAt(ref))
 	if err != nil {
@@ -184,7 +197,7 @@ type SenderInfo struct {
 	Deposit, Reserve, WithdrawRound *big.Int
 }
 
-func (c PaymentChain) SenderInfo(ctx context.Context, sender, recipient ethcommon.Address) (SenderInfo, error) {
+func (c PaymentChain) PayerFunds(ctx context.Context, sender, recipient ethcommon.Address) (SenderInfo, error) {
 	if c.Observer != nil {
 		if c.Contracts != c.Observer.chain.Contracts {
 			return SenderInfo{}, errors.New("payment observer belongs to another contract client")
@@ -199,9 +212,13 @@ func (c PaymentChain) SenderInfo(ctx context.Context, sender, recipient ethcommo
 }
 
 func (c PaymentChain) senderInfoAt(ctx context.Context, sender, recipient ethcommon.Address, snapshot ChainSnapshot) (SenderInfo, error) {
-	address, err := c.Contracts.paymentAddress(ctx, snapshot, "ticketBroker")
-	if err != nil {
-		return SenderInfo{}, err
+	address := snapshot.addresses.broker
+	if snapshot.observer == nil {
+		var err error
+		address, err = c.Contracts.ResolveAt(ctx, snapshot.blockReference, "ticketBroker")
+		if err != nil {
+			return SenderInfo{}, err
+		}
 	}
 	broker, err := contracts.NewTicketBrokerCaller(address, c.Contracts.callerAt(snapshot.blockReference))
 	if err != nil {

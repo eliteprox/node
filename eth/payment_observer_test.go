@@ -3,7 +3,6 @@ package eth
 import (
 	"context"
 	"math/big"
-	"sync"
 	"testing"
 	"time"
 
@@ -130,8 +129,12 @@ func TestObserverInvalidHeaders(t *testing.T) {
 }
 
 func TestObserverRejectedHeadersInvalidateConflictingIdentity(t *testing.T) {
-	for _, metadata := range []string{"stale", "missing timestamp", "missing L1"} {
-		for _, mode := range []string{"replacement", "rollback", "parent", "gap", "same"} {
+	for metadata, change := range map[string]func(*test.ChainState, time.Time){
+		"stale":             func(s *test.ChainState, now time.Time) { s.Timestamp = uint64(now.Add(-31 * time.Second).Unix()) },
+		"missing timestamp": func(s *test.ChainState, _ time.Time) { s.OmitTimestamp = true },
+		"missing L1":        func(s *test.ChainState, _ time.Time) { s.OmitL1 = true },
+	} {
+		for mode, distance := range map[string]int64{"replacement": 0, "rollback": -1, "parent": 1, "gap": 10, "same": 0} {
 			t.Run(metadata+"/"+mode, func(t *testing.T) {
 				f, o, now := newTestObserver(t)
 				require.NoError(t, o.refresh(t.Context()))
@@ -141,22 +144,8 @@ func TestObserverRejectedHeadersInvalidateConflictingIdentity(t *testing.T) {
 					if mode != "same" {
 						s.Hash, s.Parent = common.HexToHash("0xdead"), common.HexToHash("0xbad")
 					}
-					switch mode {
-					case "rollback":
-						s.Number--
-					case "parent":
-						s.Number++
-					case "gap":
-						s.Number += 10
-					}
-					switch metadata {
-					case "stale":
-						s.Timestamp = uint64(now.Add(-31 * time.Second).Unix())
-					case "missing timestamp":
-						s.OmitTimestamp = true
-					case "missing L1":
-						s.OmitL1 = true
-					}
+					s.Number = uint64(int64(s.Number) + distance)
+					change(s, *now)
 				})
 				f.Reset()
 				require.ErrorIs(t, o.refresh(t.Context()), ErrObservationUnavailable)
@@ -239,11 +228,10 @@ func TestObserverPinnedBackfillAndReorg(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, old.Round, s.Round, "failed candidates publish no partial round state")
 	f.Update(func(s *test.ChainState) { s.Number += 10; s.Hash = common.HexToHash("0xbeef"); s.Fail = "" })
-	var once sync.Once
 	f.Update(func(s *test.ChainState) {
 		s.Before = func(_ context.Context, name string) {
 			if name == "RoundsManager.blockHashForRound" {
-				once.Do(func() { f.Update(func(s *test.ChainState) { s.Hash = common.HexToHash("0xbad") }) })
+				f.Update(func(s *test.ChainState) { s.Hash = common.HexToHash("0xbad") })
 			}
 		}
 	})
@@ -293,10 +281,7 @@ func TestObserverGapKeepsCanonicalStateAvailable(t *testing.T) {
 	for _, mode := range []string{"gap", "replacement", "parent"} {
 		old, err := o.Snapshot(t.Context())
 		require.NoError(t, err)
-		entered, unblock := make(chan struct{}), make(chan struct{})
-		notify := sync.OnceFunc(func() { close(entered) })
-		release := sync.OnceFunc(func() { close(unblock) })
-		t.Cleanup(release)
+		checked := false
 		f.Update(func(s *test.ChainState) {
 			if mode == "gap" {
 				s.Number += 10
@@ -312,31 +297,23 @@ func TestObserverGapKeepsCanonicalStateAvailable(t *testing.T) {
 			}
 			s.Before = func(_ context.Context, name string) {
 				if name == "RoundsManager.lastInitializedRound" {
-					notify()
-					<-unblock
+					checked = true
+					if mode != "gap" {
+						require.ErrorIs(t, old.Validate(), ErrObservationUnavailable)
+						require.False(t, o.Status().Healthy)
+						require.Equal(t, 1, f.Stats().Calls["eth_getBlockByNumber"], "proven reorgs must invalidate before any anchor probe")
+					} else {
+						require.NoError(t, old.Validate())
+						require.True(t, o.Status().Healthy)
+						_, err := o.Snapshot(t.Context())
+						require.NoError(t, err)
+					}
 				}
 			}
 		})
 		f.Reset()
-		result := make(chan error, 1)
-		go func() { result <- o.refresh(t.Context()) }()
-		select {
-		case <-entered:
-		case <-time.After(time.Second):
-			t.Fatal("backfill did not start")
-		}
-		if mode != "gap" {
-			require.ErrorIs(t, old.Validate(), ErrObservationUnavailable)
-			require.False(t, o.Status().Healthy)
-			require.Equal(t, 1, f.Stats().Calls["eth_getBlockByNumber"], "proven reorgs must invalidate before any anchor probe")
-		} else {
-			require.NoError(t, old.Validate())
-			require.True(t, o.Status().Healthy)
-			_, err = o.Snapshot(t.Context())
-			require.NoError(t, err)
-		}
-		release()
-		require.NoError(t, <-result)
+		require.NoError(t, o.refresh(t.Context()))
+		require.True(t, checked, "availability must be checked before the dependent read completes")
 		f.Update(func(s *test.ChainState) { s.Before = nil })
 		if mode == "replacement" {
 			require.Equal(t, int64(4), o.current.Round.Int64(), "removed round state is backfilled")
@@ -392,7 +369,7 @@ func TestObserverRecipientActivity(t *testing.T) {
 	f.Update(func(s *test.ChainState) { s.Fail = "BondingManager.isActiveTranscoder" })
 	require.NoError(t, o.refresh(t.Context()), "a recipient failure must not reject unrelated chain state")
 	require.True(t, o.Status().Healthy)
-	_, err = c.SenderInfo(t.Context(), common.HexToAddress("0x2000"), o.recipient)
+	_, err = c.PayerFunds(t.Context(), common.HexToAddress("0x2000"), o.recipient)
 	require.NoError(t, err)
 	_, err = c.IsActive(t.Context(), o.recipient)
 	require.Error(t, err, "unknown must remain distinct from known inactive")

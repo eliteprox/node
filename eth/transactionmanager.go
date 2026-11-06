@@ -87,7 +87,7 @@ type transactionReceipt struct {
 }
 
 func NewTransactionManager(eth transactionSenderReader, gpm feeCeiling, signer transactionSigner, txTimeout time.Duration, maxReplacements int) *TransactionManager {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(WithRPCWork(context.Background(), "background"))
 	return &TransactionManager{
 		ctx: ctx, cancel: cancel,
 		cond:            sync.NewCond(&sync.Mutex{}),

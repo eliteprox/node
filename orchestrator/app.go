@@ -26,7 +26,6 @@ import (
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/nodeconfig"
 	"github.com/livepeer/node/nodeconfig/migrations"
-	"github.com/livepeer/node/pm"
 	"github.com/spf13/cobra"
 )
 
@@ -298,7 +297,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 			recipient = *p.OrchestratorAddress
 		}
 		observedChain.Observer = eth.NewPaymentObserver(paymentChain, p.Network == nodeconfig.Mainnet, recipient)
-		engine, err = NewPaymentEngine(redeemerDB, pm.EthereumChain{Client: observedChain}, recipient, p.TicketFaceValue.ToBig(), p.TicketWinProb.ToBig())
+		engine, err = NewPaymentEngine(redeemerDB, observedChain, recipient, p.TicketFaceValue.ToBig(), p.TicketWinProb.ToBig())
 		if err != nil {
 			return fmt.Errorf("initialize payment engine (check --account, --ticket-face-value and --ticket-win-prob): %w", err)
 		}
@@ -311,6 +310,9 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	}
 	app := NewServer(registry, runnerPolicy, proxyPolicy, logger)
 	logger = app.logger
+	if engine != nil {
+		registry.metrics.PaymentObserver(observedChain.Observer, logger)
+	}
 	defer app.Close()
 	app.SetPayment(engine)
 	readiness := &paidReadiness{interval: p.HeartbeatInterval}
@@ -348,7 +350,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	ctx, cancel := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	if engine != nil {
-		if err := StartRedemptionRecovery(ctx, redeemerDB, paymentChain, redeemerKey, RedemptionOptions{Timeout: p.RedeemerTxTimeout, MaxReplacements: p.RedeemerMaxTxReplacements}); err != nil {
+		if err := StartRedemptionRecovery(eth.WithRPCWork(ctx, "background"), redeemerDB, paymentChain, redeemerKey, RedemptionOptions{Timeout: p.RedeemerTxTimeout, MaxReplacements: p.RedeemerMaxTxReplacements}); err != nil {
 			return err
 		}
 	}
@@ -370,7 +372,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					tickCtx, done := context.WithTimeout(ctx, timeout)
+					tickCtx, done := context.WithTimeout(eth.WithRPCWork(ctx, "background"), timeout)
 					work(tickCtx)
 					done()
 				}

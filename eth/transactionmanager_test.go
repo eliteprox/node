@@ -29,6 +29,7 @@ type stubTransactionSenderReader struct {
 	callsToTxByHash int
 	lookupErrors    []error
 	minedAfter      int
+	checkContext    func(context.Context)
 }
 
 func (stm *stubTransactionSenderReader) SendTransaction(ctx context.Context, tx *types.Transaction) error {
@@ -48,6 +49,9 @@ func (stm *stubTransactionSenderReader) TransactionByHash(ctx context.Context, t
 }
 
 func (stm *stubTransactionSenderReader) TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
+	if stm.checkContext != nil {
+		stm.checkContext(ctx)
+	}
 	if stm.receipt == nil {
 		return nil, ethereum.NotFound
 	}
@@ -89,8 +93,9 @@ func TestTransactionManager_Wait(t *testing.T) {
 		assert := assert.New(t)
 
 		eth := &stubTransactionSenderReader{
-			err:     make(map[string]error),
-			pending: true,
+			err:          make(map[string]error),
+			pending:      true,
+			checkContext: func(ctx context.Context) { assert.Equal("background", ctx.Value(rpcWorkKey{})) },
 		}
 		tm := NewTransactionManager(eth, nil, nil, 2*time.Second, 0)
 		defer tm.Stop()

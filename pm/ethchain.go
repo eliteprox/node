@@ -23,24 +23,4 @@ type PaymentChain interface {
 
 type PayerFunds = eth.SenderInfo
 
-// EthereumChain adapts retained Ethereum contract reads to the payment
-// engine's interface. Contract ABI and RPC logic remain in eth.
-type EthereumChain struct{ Client eth.PaymentChain }
-
-func (c EthereumChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
-	state, err := c.Client.Snapshot(ctx)
-	if err != nil {
-		return ChainSnapshot{}, err
-	}
-	return state, nil
-}
-
-func (c EthereumChain) PayerFunds(ctx context.Context, payer, recipient ethcommon.Address) (PayerFunds, error) {
-	return c.Client.SenderInfo(ctx, payer, recipient)
-}
-
-func (c EthereumChain) IsActiveAt(ctx context.Context, recipient ethcommon.Address, snapshot ChainSnapshot) (bool, error) {
-	return c.Client.IsActiveAt(ctx, recipient, snapshot)
-}
-
-var _ PaymentChain = EthereumChain{}
+var _ PaymentChain = eth.PaymentChain{}
