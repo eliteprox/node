@@ -25,7 +25,7 @@ func newTestObserver(t *testing.T) (*test.ChainRPC, *PaymentObserver, *time.Time
 	t.Cleanup(rpc.Close)
 	c, err := NewContracts(rpc, f.Controller)
 	require.NoError(t, err)
-	o := NewPaymentObserver(PaymentChain{Contracts: c}, true)
+	o := NewPaymentObserver(PaymentChain{Contracts: c}, true, common.Address{})
 	now := time.Now().Truncate(time.Second)
 	o.now = func() time.Time { return now }
 	return f, o, &now
@@ -69,13 +69,13 @@ func TestObserverExplicitArbitrumChainIDRequiresL1(t *testing.T) {
 	f.Update(func(s *test.ChainState) { s.ChainID, s.OmitL1 = 42161, true })
 	rpc := original.chain.Contracts.RPC
 	require.NoError(t, rpc.CheckChainID(t.Context(), big.NewInt(42161)))
-	o := NewPaymentObserver(original.chain, false) // No named network preset.
+	o := NewPaymentObserver(original.chain, false, common.Address{}) // No named network preset.
 	require.ErrorIs(t, o.refresh(t.Context()), ErrObservationUnavailable)
 	// A non-Arbitrum custom chain continues to use its native block clock.
 	f.Update(func(s *test.ChainState) { s.ChainID = 1 })
 	rpc.requireL1 = false
 	require.NoError(t, rpc.CheckChainID(t.Context(), big.NewInt(1)))
-	o = NewPaymentObserver(original.chain, false)
+	o = NewPaymentObserver(original.chain, false, common.Address{})
 	require.NoError(t, o.refresh(t.Context()))
 }
 
@@ -336,4 +336,75 @@ func TestObserverGapKeepsCanonicalStateAvailable(t *testing.T) {
 			require.Equal(t, int64(4), o.current.Round.Int64(), "removed round state is backfilled")
 		}
 	}
+}
+
+// Round boundary/removal cases adapt Nico Vergauwen's go-livepeer
+// eth/watchers/orchestratorwatcher_test.go at 597f882cb9f4d42ad8430b0f592afd5929af4a6b.
+// Local/pinned failure isolation adapts Mike Zupper's PR #1 eth/chainview_test.go
+// at bbe126e5eddbf59f9cc9f94d3c37703215c26850. MIT notice in LICENSE.
+func TestObserverRecipientActivity(t *testing.T) {
+	f, o, now := newTestObserver(t)
+	o.recipient = common.HexToAddress("0x1234")
+	c := PaymentChain{Contracts: o.chain.Contracts, Observer: o}
+	f.Update(func(s *test.ChainState) { s.Recipient, s.Activation, s.Deactivation = o.recipient, 6, 8 })
+	_, err := c.IsActive(t.Context(), o.recipient)
+	require.ErrorIs(t, err, ErrObservationUnavailable)
+	for _, step := range []struct {
+		round  uint64
+		active bool
+	}{{5, false}, {6, true}, {7, true}, {8, false}} {
+		f.Update(func(s *test.ChainState) { s.CurrentRound = step.round })
+		require.NoError(t, o.refresh(t.Context()))
+		snapshot, err := c.Snapshot(t.Context())
+		require.NoError(t, err)
+		require.EqualValues(t, 5, snapshot.Round.Int64(), "activity uses current round even before initialization")
+		before := f.Stats()
+		active, err := c.IsActiveAt(t.Context(), o.recipient, snapshot)
+		require.NoError(t, err)
+		require.Equal(t, step.active, active)
+		_, err = c.IsActiveAt(t.Context(), common.HexToAddress("0x9999"), snapshot)
+		require.ErrorIs(t, err, ErrObservationUnavailable)
+		unowned := snapshot
+		unowned.observer = nil
+		_, err = c.IsActiveAt(t.Context(), o.recipient, unowned)
+		require.ErrorIs(t, err, ErrObservationUnavailable)
+		cancelled, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err = c.IsActiveAt(cancelled, o.recipient, snapshot)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, before, f.Stats(), "local checks cannot start activity or lookup RPCs")
+		advanceObserver(f, *now)
+		f.Update(func(s *test.ChainState) { s.Deactivation = 0 })
+		require.NoError(t, o.refresh(t.Context()))
+		active, err = c.IsActiveAt(t.Context(), o.recipient, snapshot)
+		require.NoError(t, err)
+		require.Equal(t, step.active, active, "a newer activity result cannot change a held funds observation")
+		advanceObserver(f, *now)
+		f.Update(func(s *test.ChainState) { s.Deactivation = 8 })
+	}
+
+	f.Update(func(s *test.ChainState) { s.Fail = "BondingManager.isActiveTranscoder" })
+	require.NoError(t, o.refresh(t.Context()), "a recipient failure must not reject unrelated chain state")
+	require.True(t, o.Status().Healthy)
+	_, err = c.SenderInfo(t.Context(), common.HexToAddress("0x2000"), o.recipient)
+	require.NoError(t, err)
+	_, err = c.IsActive(t.Context(), o.recipient)
+	require.Error(t, err, "unknown must remain distinct from known inactive")
+	advanceObserver(f, *now)
+	f.Update(func(s *test.ChainState) { s.Fail, s.CurrentRound, s.Deactivation = "", 6, 8 })
+	require.NoError(t, o.refresh(t.Context()))
+	old, err := c.Snapshot(t.Context())
+	require.NoError(t, err)
+	f.Update(func(s *test.ChainState) {
+		s.Hash, s.Parent, s.Deactivation = common.HexToHash("0xdead"), common.Hash{}, 6
+	})
+	require.NoError(t, o.refresh(t.Context()))
+	_, err = c.IsActiveAt(t.Context(), o.recipient, old)
+	require.ErrorIs(t, err, ErrObservationUnavailable)
+	active, err := c.IsActive(t.Context(), o.recipient)
+	require.NoError(t, err)
+	require.False(t, active, "removed activation state is replaced from the canonical block")
+	*now = now.Add(30 * time.Second)
+	_, err = c.IsActive(t.Context(), o.recipient)
+	require.ErrorIs(t, err, ErrObservationUnavailable)
 }

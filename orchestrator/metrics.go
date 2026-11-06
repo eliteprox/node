@@ -131,10 +131,11 @@ type paidReadiness struct {
 func (p *paidReadiness) ready(registry *Registry) bool {
 	p.mu.Lock()
 	limit := max(time.Minute, 3*p.interval)
-	ok := p.chain && p.active && p.storage && !p.completed.IsZero() && time.Since(p.completed) <= limit && !p.workerCompleted.IsZero() && time.Since(p.workerCompleted) <= limit
+	chainReady := p.chain && p.active
 	if p.observer != nil {
-		ok = ok && p.observer.Status().Healthy
+		chainReady = p.observer.Status().RecipientActive
 	}
+	ok := chainReady && p.storage && !p.completed.IsZero() && time.Since(p.completed) <= limit && !p.workerCompleted.IsZero() && time.Since(p.workerCompleted) <= limit
 	p.mu.Unlock()
 	registry.mu.Lock()
 	fresh := registry.rateUntil.IsZero() || time.Now().Before(registry.rateUntil)

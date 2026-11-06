@@ -79,7 +79,7 @@ func TestRedemptionSubmission(t *testing.T) {
 	require.Equal(t, sentHash, hash)
 	// Redemption resolves the live broker independently of an uninitialized observer.
 	broker = common.HexToAddress("0x2001")
-	chain := PaymentChain{Contracts: contracts, Observer: NewPaymentObserver(PaymentChain{Contracts: contracts}, false)}
+	chain := PaymentChain{Contracts: contracts, Observer: NewPaymentObserver(PaymentChain{Contracts: contracts}, false, common.Address{})}
 	hash, err = chain.Redeem(t.Context(), key, big.NewInt(1), ticket)
 	require.NoError(t, err)
 	require.Equal(t, sentHash, hash)

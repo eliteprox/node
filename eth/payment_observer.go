@@ -34,11 +34,12 @@ type PaymentObserver struct {
 	contact, progress time.Time
 	l1Progress        time.Time
 	l1HighWater       *big.Int
+	recipient         common.Address
 }
 
-func NewPaymentObserver(chain PaymentChain, requireL1 bool) *PaymentObserver {
+func NewPaymentObserver(chain PaymentChain, requireL1 bool, recipient common.Address) *PaymentObserver {
 	chain.Observer = nil
-	return &PaymentObserver{chain: chain, interval: 5 * time.Second, maxAge: 30 * time.Second, now: time.Now, requireL1: requireL1 || chain.Contracts.RPC.requireL1}
+	return &PaymentObserver{chain: chain, interval: 5 * time.Second, maxAge: 30 * time.Second, now: time.Now, requireL1: requireL1 || chain.Contracts.RPC.requireL1, recipient: recipient}
 }
 
 // Run has one service-owned caller. Every RPC inherits the service lifetime.
@@ -62,13 +63,14 @@ func (o *PaymentObserver) Run(ctx context.Context) {
 // A single provider cannot establish an absolute bound on protocol L1 lag.
 type ObserverStatus struct {
 	ObservedAt, ContactAt, HeadProgressAt, L1ProgressAt time.Time
-	Healthy                                             bool
+	Healthy, RecipientActive                            bool
 }
 
 func (o *PaymentObserver) Status() ObserverStatus {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	return ObserverStatus{o.current.observedAt, o.contact, o.progress, o.l1Progress, o.validate(o.current) == nil}
+	healthy := o.validate(o.current) == nil
+	return ObserverStatus{o.current.observedAt, o.contact, o.progress, o.l1Progress, healthy, healthy && o.recipient != (common.Address{}) && o.current.recipientErr == nil && o.current.recipientActive}
 }
 
 func (o *PaymentObserver) Snapshot(ctx context.Context) (ChainSnapshot, error) {
@@ -179,6 +181,14 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 	s, err := o.chain.snapshotAt(ctx, head, true)
 	if err != nil {
 		return err
+	}
+	// Local admission follows go-livepeer/core/orchestrator.go isActive at
+	// 597f882c (Nico Vergauwen, 5bfee8f7; MIT, see LICENSE). Retain node's
+	// canonical contract predicate rather than duplicating round arithmetic.
+	// Per-entry failure isolation adapts Mike Zupper's PR #1 eth/chainview.go,
+	// 68c7834921c7218d16dbd883e2b7e87f6d7804d5 (MIT, see LICENSE).
+	if o.recipient != (common.Address{}) {
+		s.recipientActive, s.recipientErr = o.chain.activeAt(ctx, s.addresses.bonding, o.recipient, s)
 	}
 	if err := ctx.Err(); err != nil {
 		return err

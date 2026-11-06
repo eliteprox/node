@@ -227,7 +227,7 @@ func TestPaidRequestDirectRPCBudget(t *testing.T) {
 	info, err = engine.ChallengeInfo(manifest)
 	require.NoError(t, err)
 	for _, during := range []bool{false, true} {
-		observer := eth.NewPaymentObserver(direct.Client, false)
+		observer := eth.NewPaymentObserver(direct.Client, false, ethcommon.Address{})
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan struct{})
 		go func() { observer.Run(ctx); close(done) }()

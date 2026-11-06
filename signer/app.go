@@ -186,7 +186,7 @@ func serve(parent context.Context, p Params) error {
 		return fmt.Errorf("initialize signer contract bindings: %w", err)
 	}
 	chain := eth.PaymentChain{Contracts: contracts}
-	observer := eth.NewPaymentObserver(chain, p.Network == nodeconfig.Mainnet)
+	observer := eth.NewPaymentObserver(chain, p.Network == nodeconfig.Mainnet, ethcommon.Address{})
 	chain.Observer = observer
 	service.SetPaymentChain(pm.EthereumChain{Client: chain})
 	policy, _ := newPricePolicy(p.MaxHourlyPrice, p.MaxFixedPrice)
