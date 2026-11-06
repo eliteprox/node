@@ -132,7 +132,7 @@ func TestObserverRegistryScopeAndFinalizedReads(t *testing.T) {
 	})
 	chain := o.chain
 	chain.Observer = o // Its retained registry is deliberately still the old one.
-	used, err := chain.IsUsedTicket(t.Context(), common.HexToHash("0x9999"), "finalized")
+	used, _, err := chain.TicketUse(t.Context(), common.HexToHash("0x9999"), "finalized")
 	require.NoError(t, err)
 	require.False(t, used, "finalized settlement resolves its own canonical registry")
 	require.Equal(t, 1, f.Stats().Calls["Controller.getContract"])

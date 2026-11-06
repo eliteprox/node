@@ -56,6 +56,14 @@ type recoveryRPC struct {
 	server                                  *httptest.Server
 }
 
+// collateralSnapshot is the same canonical execution identity served by the fixture.
+func (f *recoveryRPC) collateralSnapshot() eth.ChainSnapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	header := &types.Header{Number: big.NewInt(f.block), Difficulty: new(big.Int), BaseFee: big.NewInt(100)}
+	return eth.ChainSnapshot{Number: header.Number, BlockHash: header.Hash()}
+}
+
 func newRecoveryRPC(t *testing.T) *recoveryRPC {
 	t.Helper()
 	f := &recoveryRPC{pool: map[uint64]*types.Transaction{}, receipts: map[common.Hash]*types.Receipt{}, used: map[common.Hash]bool{}, finalized: true, block: 100, round: 1, receiptHeader: &types.Header{Number: big.NewInt(10), Difficulty: new(big.Int), BaseFee: big.NewInt(100)}}
@@ -694,11 +702,11 @@ func TestTerminalAttemptRetainsUnresolvedSibling(t *testing.T) {
 			// stops retrying, but cannot release its collateral based on one failed hash.
 			next := nextRecoveryTicket(ticket, 12)
 			next.CreationRound = max(ticket.CreationRound, tc.minRound)
-			require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, tc.minRound, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), pm.ErrPayerUnavailable)
+			require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, tc.minRound, big.NewInt(1000), []*pm.SignedTicket{next}, f.collateralSnapshot()), pm.ErrPayerUnavailable)
 			f.mine(sent[0], true)
 			tickRecovery(t, s, c, key)
 			require.Equal(t, "confirmed", ticketPhase(t, s, ticket.Sig))
-			require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, tc.minRound, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}))
+			require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, tc.minRound, big.NewInt(1000), []*pm.SignedTicket{next}, f.collateralSnapshot()))
 		})
 	}
 }
@@ -771,7 +779,7 @@ func TestExpiredAttemptDoesNotReopenRandomness(t *testing.T) {
 	next := nextRecoveryTicket(ticket, 17)
 	next.RecipientRandHash = ticket.RecipientRandHash
 	next.TicketNonce = 2
-	require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), ErrInvalidPayment)
+	require.ErrorIs(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{next}, f.collateralSnapshot()), ErrInvalidPayment)
 }
 
 func recoveryReplacement(t *testing.T, key *eth.Key, first *types.Transaction) *types.Transaction {
@@ -843,7 +851,7 @@ func TestTerminalTicketKeepsUnresolvedReceipts(t *testing.T) {
 				tickRecovery(t, s, c, key)
 				s = reopenRecoveryStore(t, s)
 				f.mine(f.transactions()[included], true)
-				require.NoError(t, s.setTicketPhase(t.Context(), ticket.Sig, phase))
+				require.NoError(t, s.setTicketPhase(t.Context(), ticket.Sig, phase, f.collateralSnapshot()))
 				require.Empty(t, ReconcileSubmitted(t.Context(), s, c))
 				require.Equal(t, phase, ticketPhase(t, s, ticket.Sig), "unfinalized inclusion must not settle a terminal ticket")
 				f.mu.Lock()
@@ -870,7 +878,7 @@ func TestRevertedReplacementReleasesSameNonceLiability(t *testing.T) {
 	require.NotEmpty(t, ReconcileSubmitted(t.Context(), s, c))
 	require.Equal(t, "reverted", ticketPhase(t, s, ticket.Sig))
 	next := nextRecoveryTicket(ticket, 21)
-	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), "a finalized replacement consumes every sibling with the same sender and nonce")
+	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, f.collateralSnapshot()), "a finalized replacement consumes every sibling with the same sender and nonce")
 }
 
 func TestManualRetryFailureKeepsActiveMonitor(t *testing.T) {
@@ -937,12 +945,12 @@ func TestConsumedNonceResolvesOtherTicketHistory(t *testing.T) {
 	require.Equal(t, "retryable", ticketPhase(t, s, sibling.Sig))
 	require.EqualValues(t, 2, test.MetricSum(t, s.metrics.Registry, "redemption_transitions_total", map[string]string{"event": "retryable"}))
 	require.EqualValues(t, 1, test.MetricSum(t, s.metrics.Registry, "redemption_settlements_total", nil))
-	require.NoError(t, s.finishTicket(t.Context(), b.Sig, "confirmed", b0.Hash.Hex()))
+	require.NoError(t, s.finishTicket(t.Context(), b.Sig, "confirmed", b0.Hash.Hex(), f.collateralSnapshot()))
 	require.EqualValues(t, 2, test.MetricSum(t, s.metrics.Registry, "redemption_transitions_total", map[string]string{"event": "retryable"}))
 	require.EqualValues(t, 1, test.MetricSum(t, s.metrics.Registry, "redemption_settlements_total", nil))
 	require.NoError(t, s.setTicketPhase(t.Context(), sibling.Sig, "invalid"))
 	next := nextRecoveryTicket(a, 105)
-	require.NoError(t, s.storeWinningTickets(t.Context(), a.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), "B consumed nonce zero and A's nonce one failed; A has no remaining liability")
+	require.NoError(t, s.storeWinningTickets(t.Context(), a.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, f.collateralSnapshot()), "B consumed nonce zero and A's nonce one failed; A has no remaining liability")
 }
 
 func TestMultipleFinalizedFailuresResolveEveryGroup(t *testing.T) {
@@ -973,7 +981,7 @@ func TestMultipleFinalizedFailuresResolveEveryGroup(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, history, 4)
 	next := nextRecoveryTicket(ticket, 107)
-	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), "both finalized failed nonces must resolve their replacement siblings")
+	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, f.collateralSnapshot()), "both finalized failed nonces must resolve their replacement siblings")
 }
 
 func TestLiveAcknowledgementRestoresNonce(t *testing.T) {
@@ -1038,7 +1046,7 @@ func TestUsedTransitionRecoversAfterStorageFailure(t *testing.T) {
 		t.Errorf("summary=%s but redeemed_at remains NULL even after restart and retry", ticketPhase(t, s, ticket.Sig))
 	}
 	next := nextRecoveryTicket(ticket, 223)
-	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, pm.ChainSnapshot{}), "a finalized-used ticket must not strand collateral")
+	require.NoError(t, s.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, big.NewInt(1000), []*pm.SignedTicket{next}, f.collateralSnapshot()), "a finalized-used ticket must not strand collateral")
 }
 
 func TestRejectedReplacementKeepsPredecessorReconcilable(t *testing.T) {
@@ -1177,4 +1185,38 @@ func TestRedemptionCallbackObservations(t *testing.T) {
 			require.EqualValues(t, 1, test.MetricSum(t, s.metrics.Registry, "redemption_settlements_total", nil))
 		})
 	}
+}
+
+func TestCollateralWatermarkSurvivesSettlementAndRestart(t *testing.T) {
+	f, store, ticket, _, _ := newRecoveryTest(t, 243)
+	captured := f.collateralSnapshot()
+	settled := eth.ChainSnapshot{Number: new(big.Int).Add(captured.Number, big.NewInt(1)), BlockHash: common.HexToHash("0x101")}
+	next := nextRecoveryTicket(ticket, 244)
+	admit := func(snapshot eth.ChainSnapshot) error {
+		return store.storeWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 0, new(big.Int).Set(ticket.FaceValue), []*pm.SignedTicket{next}, snapshot)
+	}
+	require.ErrorContains(t, store.finishTicket(t.Context(), ticket.Sig, "used", ""), "block evidence required")
+	_, err := store.db.Exec(`CREATE TRIGGER fail_settlement BEFORE UPDATE OF redeemed_at ON winning_tickets BEGIN SELECT RAISE(ABORT,'storage failure'); END`)
+	require.NoError(t, err)
+	require.Error(t, store.finishTicket(t.Context(), ticket.Sig, "used", "", settled))
+	var floors, redeemed int
+	require.NoError(t, store.db.QueryRow(`SELECT count(*) FROM collateral_watermark`).Scan(&floors))
+	require.Zero(t, floors, "failed settlement cannot advance its watermark")
+	require.NoError(t, store.db.QueryRow(`SELECT count(*) FROM winning_tickets WHERE redeemed_at IS NOT NULL`).Scan(&redeemed))
+	require.Zero(t, redeemed)
+	require.ErrorIs(t, admit(captured), pm.ErrPayerUnavailable, "failed settlement retains liability")
+	_, err = store.db.Exec(`DROP TRIGGER fail_settlement`)
+	require.NoError(t, err)
+	// The funds observation was captured while the old winner still reserved its
+	// face value. Settlement can release it before this admission transaction starts.
+	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "used", "", settled))
+	require.ErrorIs(t, admit(captured), pm.ErrPayerUnavailable)
+	store = reopenRecoveryStore(t, store)
+	require.ErrorIs(t, admit(captured), pm.ErrPayerUnavailable)
+	wrongFork := settled
+	wrongFork.BlockHash = common.HexToHash("0xbad")
+	require.ErrorIs(t, admit(wrongFork), pm.ErrPayerUnavailable)
+	require.ErrorContains(t, store.finishTicket(t.Context(), ticket.Sig, "used", "", wrongFork), "conflicting finalized")
+	require.NoError(t, admit(settled), "post-settlement collateral can cover the next winner")
+	require.Error(t, admit(settled), "durable settlement must retain signature replay protection")
 }

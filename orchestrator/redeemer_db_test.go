@@ -10,6 +10,7 @@ import (
 	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/nodeconfig/migrations"
 	"github.com/livepeer/node/pm"
@@ -18,8 +19,15 @@ import (
 
 type receiptFixture struct{ confirmed, reverted bool }
 
-func (r receiptFixture) Receipt(context.Context, ethcommon.Hash) (bool, bool, error) {
-	return r.confirmed, r.reverted, nil
+func (r receiptFixture) FinalizedReceipt(context.Context, ethcommon.Hash) (*types.Receipt, error) {
+	if !r.confirmed && !r.reverted {
+		return nil, nil
+	}
+	status := uint64(types.ReceiptStatusFailed)
+	if r.confirmed {
+		status = types.ReceiptStatusSuccessful
+	}
+	return &types.Receipt{Status: status, BlockNumber: big.NewInt(10), BlockHash: ethcommon.HexToHash("0x10")}, nil
 }
 
 func TestRedeemerSQLiteFilePermissions(t *testing.T) {
@@ -121,6 +129,7 @@ func TestRedemptionMigrationHistoryAndRollback(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
+	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	// Seed a genuine v1 database, then upgrade without changing its ticket identity.
 	prepared, err := c.PrepareRedemption(t.Context(), key, big.NewInt(1), redeemTicket(ticket))
 	require.NoError(t, err)
@@ -141,6 +150,7 @@ func TestRedemptionMigrationHistoryAndRollback(t *testing.T) {
 	// A lossless rollback remains possible with the original representable state.
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
+	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Up(t.Context(), s.db, files))
 	_, err = s.db.Exec("UPDATE redemption_attempts SET phase='retryable' WHERE sig=?", ticket.Sig)
 	require.NoError(t, err)
@@ -148,6 +158,7 @@ func TestRedemptionMigrationHistoryAndRollback(t *testing.T) {
 	next.Hash = ethcommon.HexToHash("0xabcdef")
 	next.Nonce = 1
 	require.NoError(t, s.recordPrepared(t.Context(), ticket, next))
+	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.ErrorContains(t, migrations.Down(t.Context(), s.db, files), "cannot_downgrade_redemption_transaction_history")
 	history, err = s.Redemptions()
@@ -169,6 +180,7 @@ func TestRedemptionRollbackPreservesTransactionProgress(t *testing.T) {
 			require.EqualValues(t, 1, floor)
 			files, err := fs.Sub(redeemerMigrationFiles, "migrations")
 			require.NoError(t, err)
+			require.NoError(t, migrations.Down(t.Context(), s.db, files))
 			require.NoError(t, migrations.Down(t.Context(), s.db, files))
 			require.ErrorContains(t, migrations.Down(t.Context(), s.db, files), "cannot_downgrade_redemption_transaction_history")
 			floor, err = s.SavedNonceFloor(t.Context(), key.Address())

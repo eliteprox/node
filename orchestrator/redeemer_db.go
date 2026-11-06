@@ -135,6 +135,15 @@ func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Ad
 		return err
 	}
 	defer tx.Rollback()
+	// A singleton durable floor prevents old collateral being reused after any
+	// settlement releases liability. It is deliberately conservative across payers.
+	var number int64
+	var hash string
+	if err := tx.QueryRowContext(ctx, `SELECT number,hash FROM collateral_watermark WHERE id=1`).Scan(&number, &hash); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	} else if err == nil && (snapshot.Number == nil || snapshot.Number.Cmp(big.NewInt(number)) < 0 || (snapshot.Number.Cmp(big.NewInt(number)) == 0 && snapshot.BlockHash.Hex() != hash)) {
+		return pm.ErrPayerUnavailable
+	}
 	// Once redemption can reveal randomness, this epoch must never accept
 	// more tickets, even if a reorg moves the observed L1 clock backwards.
 	var exposed int

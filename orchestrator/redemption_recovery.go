@@ -362,17 +362,18 @@ func (r *redemptionRecovery) reconcileUsed(ctx context.Context) []error {
 			failures = append(failures, err)
 			continue
 		}
-		used, err := r.chain.IsUsedTicket(ctx, ticket.Hash(), "latest")
+		used, _, err := r.chain.TicketUse(ctx, ticket.Hash(), "latest")
 		if err != nil {
 			failures = append(failures, err)
 			continue
 		}
 		phase := "retryable"
+		var observation eth.ChainSnapshot
 		if !used && item.phase != "awaiting_finality" {
 			continue
 		}
 		if used {
-			finalized, err := r.chain.IsUsedTicket(ctx, ticket.Hash(), "finalized")
+			finalized, evidence, err := r.chain.TicketUse(ctx, ticket.Hash(), "finalized")
 			if err != nil {
 				failures = append(failures, err)
 				continue
@@ -380,9 +381,9 @@ func (r *redemptionRecovery) reconcileUsed(ctx context.Context) []error {
 			if !finalized {
 				continue
 			}
-			phase = "used"
+			phase, observation = "used", evidence
 		}
-		if err := r.store.setTicketPhase(ctx, sig, phase); err != nil {
+		if err := r.store.setTicketPhase(ctx, sig, phase, observation); err != nil {
 			failures = append(failures, err)
 		}
 	}
