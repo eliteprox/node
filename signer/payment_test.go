@@ -158,3 +158,46 @@ func TestRecipientReservesWinningLiabilityAcrossConcurrentSessions(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, 2, count, "rejected batches must roll back tickets and credit")
 }
+
+// Adapted from BlueClawNetwork/livepeer-node signer/payment_test.go,
+// 285eda984d7cce4e3030ef0510d63ae142534dd7, by Mike Zupper (MIT; see LICENSE).
+func TestPaidRequestDirectRPCBudget(t *testing.T) {
+	s, _ := testService(t)
+	defer s.Close()
+	rpc := test.NewChainRPC(t)
+	client, err := eth.OpenRPC(rpc.URL)
+	require.NoError(t, err)
+	defer client.Close()
+	contracts, err := eth.NewContracts(client, rpc.Controller)
+	require.NoError(t, err)
+	// Explicitly use the direct adapter: cached configurations can do less work.
+	direct := pm.EthereumChain{Client: eth.PaymentChain{Contracts: contracts}}
+	s.SetPaymentChain(direct)
+	store, err := orchestrator.OpenRedeemerDB(filepath.Join(t.TempDir(), "payments.sqlite"))
+	require.NoError(t, err)
+	defer store.Close()
+	recipient := ethcommon.HexToAddress("0x1234")
+	maximum := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	engine, err := orchestrator.NewPaymentEngine(store, direct, recipient, big.NewInt(1e12), new(big.Int).Quo(maximum, big.NewInt(1e5)))
+	require.NoError(t, err)
+	_, err = engine.MakeChallenge(t.Context(), "runner", "manifest", s.key.Address(), 9, "fixed", "https://orch.example")
+	require.NoError(t, err)
+	info, err := engine.ChallengeInfo("manifest")
+	require.NoError(t, err)
+	require.Equal(t, 6, rpc.Stats().RoundTrips, "challenge: snapshot (4) + activity (2)")
+
+	response := postPayment(t, s, map[string]any{"orchestrator": wire.EncodeOrchestratorInfo(info), "type": "fixed"})
+	require.Equal(t, 200, response.Code, response.Body.String())
+	var signed paymentResponse
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &signed))
+	require.Equal(t, 13, rpc.Stats().RoundTrips, "signer adds one funds observation (7)")
+	_, _, err = engine.Receive(t.Context(), "runner", "manifest", signed.Payment, signed.SegCreds)
+	require.NoError(t, err)
+	stats := rpc.Stats()
+	require.Equal(t, 22, stats.RoundTrips, "receipt adds funds (7) + activity (2); baseline was 29")
+	require.Equal(t, map[string]int{
+		"eth_getBlockByNumber": 3, "Controller.getContract": 7,
+		"RoundsManager.lastInitializedRound": 3, "RoundsManager.blockHashForRound": 3,
+		"BondingManager.isActiveTranscoder": 2, "TicketBroker.getSenderInfo": 2, "TicketBroker.claimableReserve": 2,
+	}, stats.Calls)
+}

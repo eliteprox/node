@@ -227,7 +227,7 @@ example `"X-List: a,b",Authorization: Bearer credential`.
 | 480 | Refresh payment parameters or orchestrator authentication. |
 | 481 | The price exceeds a ceiling or the initial session price. |
 | 482 | No tickets are needed; skip this payment cycle. |
-| 500 | Payment generation or signing failed, including payer funds/chain failures detected after precheck. |
+| 500 | Payment generation or signing failed. |
 | 502 | Restore the authorization webhook or correct its response. |
 | 503 | Retry after payment dependencies, discovery sources, or accounting storage recover. |
 
