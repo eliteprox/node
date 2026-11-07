@@ -140,3 +140,18 @@ func TestProtoTicket(t *testing.T) {
 	pTicket := protoTicket(ogTicket)
 	assert.Equal(t, ogTicket, pmTicket(pTicket))
 }
+
+func TestRedeemerServer_QueueTicket_IncompleteTicket(t *testing.T) {
+	r := &Redeemer{}
+	tickets := map[string]*net.Ticket{
+		"empty":                     {},
+		"missing sender params":     {TicketParams: &net.TicketParams{}, ExpirationParams: &net.TicketExpirationParams{}},
+		"missing expiration params": {TicketParams: &net.TicketParams{}, SenderParams: &net.TicketSenderParams{}},
+	}
+	for name, ticket := range tickets {
+		t.Run(name, func(t *testing.T) {
+			_, err := r.QueueTicket(context.Background(), ticket)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+		})
+	}
+}

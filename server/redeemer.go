@@ -1,4 +1,7 @@
 func (r *Redeemer) QueueTicket(ctx context.Context, ticket *net.Ticket) (*net.QueueTicketRes, error) {
+	if ticket.GetTicketParams() == nil || ticket.GetSenderParams() == nil || ticket.GetExpirationParams() == nil {
+		return nil, status.Error(codes.InvalidArgument, "incomplete ticket")
+	}
 	t := pmTicket(ticket)
 	if r.recipient != t.Recipient {
 		return nil, status.Error(codes.PermissionDenied, fmt.Sprintf("invalid ticket recipient 0x%x, expected %v", ticket.TicketParams.Recipient, r.recipient.Hex()))
