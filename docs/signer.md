@@ -57,7 +57,9 @@ and configure TLS termination at the proxy.
 
 Set `Orchestrators` to orchestrator or standalone [discovery](discovery.md)
 base URLs to query. Both expose the same inventory API. Local or private sources
-also need [destination grants](configuration.md#destination-grants). For example:
+also need [destination grants](configuration.md#destination-grants). To keep a
+fixed orchestrator list on discovery and give the signer one source, follow
+[static orchestrator list](static-orchestrator-list.md). For example:
 
 ```toml
 Orchestrators = ["http://127.0.0.1:8935"]

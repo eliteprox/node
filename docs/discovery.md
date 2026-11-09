@@ -72,4 +72,6 @@ DiscoveryGrants = ["127.0.0.1:8939"]
 ```
 
 The signer's existing application and GPU filters apply. Returned runner URLs
-continue to point to the owning orchestrator.
+continue to point to the owning orchestrator. A full walkthrough that keeps
+the static list on discovery is in
+[static orchestrator list](static-orchestrator-list.md).
