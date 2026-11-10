@@ -1,7 +1,7 @@
 // Winning-ticket store operations follow livepeer/go-livepeer/common/db.go,
 // by Elad Mallel and Nico Vergauwen (404d24a9455cd0997af1be6d18faa998702cce69).
 // The redemption recovery schema and transaction state are implemented here.
-package orchestrator
+package redemption
 
 import (
 	"context"
@@ -17,9 +17,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
+	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/nodeconfig/migrations"
 	"github.com/livepeer/node/pm"
@@ -27,27 +28,42 @@ import (
 )
 
 //go:embed migrations/*.sql
-var redeemerMigrationFiles embed.FS
+var MigrationFiles embed.FS
 
-// RedeemerDB owns the orchestrator redeemer's durable winning-ticket queue,
+var redeemerMigrationFiles = MigrationFiles
+
+// RedeemerDB owns the shared durable winning-ticket queue,
 // redemption lifecycle, and chain activity observations.
 type RedeemerDB struct {
-	logger     *slog.Logger
-	metrics    *observability.Metrics
-	readiness  *paidReadiness
-	db         *sql.DB
-	admission  *sql.Stmt
-	liability  *sql.Stmt
-	recoveryMu sync.Mutex
-	recovery   *redemptionRecovery
+	logger         *slog.Logger
+	metrics        *observability.Metrics
+	snapshot       func() (eth.ChainSnapshot, bool)
+	db             *sql.DB
+	admission      *sql.Stmt
+	liability      *sql.Stmt
+	recoveryMu     sync.Mutex
+	recovery       *redemptionRecovery
+	binding        *Binding
+	limits         Limits
+	worker         *Worker
+	receiptCursor  atomic.Int64
+	recoveryCursor atomic.Int64
+	path           string
 }
 
 func OpenRedeemerDB(path string) (*RedeemerDB, error) {
 	ctx := context.Background()
-	db, err := openRedeemerDB(ctx, path, true)
+	db, err := OpenDatabase(ctx, path, true)
 	if err != nil {
 		return nil, err
 	}
+	return NewStore(db)
+}
+
+// NewStore takes ownership of db and initializes the shared migration catalog.
+func NewStore(db *sql.DB) (*RedeemerDB, error) {
+	ctx := context.Background()
+	var err error
 	files, err := fs.Sub(redeemerMigrationFiles, "migrations")
 	if err == nil {
 		err = migrations.Up(ctx, db, files)
@@ -57,6 +73,12 @@ func OpenRedeemerDB(path string) (*RedeemerDB, error) {
 		return nil, fmt.Errorf("initialize redeemer SQLite: %w", err)
 	}
 	store := &RedeemerDB{db: db}
+	var seq int
+	var name string
+	if err := db.QueryRowContext(ctx, "PRAGMA database_list").Scan(&seq, &name, &store.path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	for _, check := range []struct {
 		stmt  **sql.Stmt
 		query string
@@ -70,10 +92,21 @@ func OpenRedeemerDB(path string) (*RedeemerDB, error) {
 			return nil, fmt.Errorf("prepare payment admission checks: %w", err)
 		}
 	}
+	if err := store.backfill(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if b, e := store.Binding(ctx); e == nil {
+		store.binding = &b
+		store.limits = DefaultLimits
+	} else if !errors.Is(e, sql.ErrNoRows) {
+		_ = db.Close()
+		return nil, e
+	}
 	return store, nil
 }
 
-func openRedeemerDB(ctx context.Context, path string, create bool) (*sql.DB, error) {
+func OpenDatabase(ctx context.Context, path string, create bool) (*sql.DB, error) {
 	if path == "" {
 		return nil, errors.New("redeemer SQLite path is required")
 	}
@@ -134,16 +167,23 @@ func (s *RedeemerDB) StoreWinningTicket(t *pm.SignedTicket) error {
 	if err := validStoredTicket(t); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`INSERT INTO winning_tickets
-		(payer_address,recipient,face_value,win_prob,ticket_nonce,recipient_rand,recipient_rand_hash,sig,creation_round,creation_round_block_hash,params_expiration_block,enqueued_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, t.PayerAddress.Hex(), t.Recipient.Hex(), t.FaceValue.Bytes(), t.WinProb.Bytes(),
-		t.TicketNonce, t.RecipientRand.Bytes(), t.RecipientRandHash.Hex(), t.Sig, t.CreationRound,
-		t.CreationRoundBlockHash.Hex(), t.ParamsExpirationBlock.String(), time.Now().UTC().Format(time.RFC3339Nano))
-	return err
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = s.capacity(context.Background(), tx, t.Recipient, 1); err != nil {
+		return err
+	}
+	if err = insertTicket(context.Background(), tx, t); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const (
-	receiptAdmissionQuery = `SELECT m.number,m.hash,EXISTS(SELECT 1 FROM winning_tickets w JOIN redemption_attempts a ON a.sig=w.sig WHERE w.recipient_rand_hash=? AND (a.phase!='expired' OR EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=w.sig)))
+	receiptAdmissionQuery = `SELECT m.number,m.hash,EXISTS(SELECT 1 FROM winning_tickets w JOIN redemption_attempts a ON a.sig=w.sig WHERE w.recipient_rand_hash=?1 AND (a.phase!='expired' OR EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=w.sig)))
+ OR EXISTS(SELECT 1 FROM winning_tickets w JOIN ticket_state t ON t.hash=w.ticket_hash WHERE w.recipient_rand_hash=?1 AND t.exposed=1)
  FROM (SELECT 1) LEFT JOIN collateral_watermark m ON m.id=1`
 	receiptLiabilityQuery = `SELECT face_value FROM winning_tickets WHERE payer_address=? AND redeemed_at IS NULL AND (
  (creation_round>=? AND sig NOT IN (SELECT sig FROM redemption_attempts WHERE phase IN ('used','invalid','expired','reverted')))
@@ -153,7 +193,7 @@ const (
 // storeWinningTickets commits a validated receipt batch before the payment
 // engine publishes replay guards or credit. Check exposure and liability in the
 // same transaction so redemption and concurrent receipts cannot race these gates.
-func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Address, randHash ethcommon.Hash, minRound int64, collateral *big.Int, tickets []*pm.SignedTicket, snapshot pm.ChainSnapshot) error {
+func (s *RedeemerDB) StoreWinningTickets(ctx context.Context, payer ethcommon.Address, randHash ethcommon.Hash, minRound int64, collateral *big.Int, tickets []*pm.SignedTicket, snapshot pm.ChainSnapshot) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -173,15 +213,32 @@ func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Ad
 	// Once redemption can reveal randomness, this epoch must never accept
 	// more tickets, even if a reorg moves the observed L1 clock backwards.
 	if exposed != 0 {
-		return ErrInvalidPayment
+		return ErrExposedRandomness
 	}
-	for _, ticket := range tickets {
-		_, err := tx.Exec(`INSERT INTO winning_tickets(payer_address,recipient,face_value,win_prob,ticket_nonce,recipient_rand,recipient_rand_hash,sig,creation_round,creation_round_block_hash,params_expiration_block,enqueued_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, payer.Hex(), ticket.Recipient.Hex(), ticket.FaceValue.Bytes(), ticket.WinProb.Bytes(), ticket.TicketNonce, ethcommon.LeftPadBytes(ticket.RecipientRand.Bytes(), 32), ticket.RecipientRandHash.Hex(), ticket.Sig, ticket.CreationRound, ticket.CreationRoundBlockHash.Hex(), ticket.ParamsExpirationBlock.String(), time.Now().UTC().Format(time.RFC3339Nano))
-		if err != nil {
+	if len(tickets) > 0 {
+		if err := s.capacity(ctx, tx, tickets[0].Recipient, len(tickets)); err != nil {
 			return err
 		}
 	}
+	for _, ticket := range tickets {
+		if err := insertTicket(ctx, tx, ticket); err != nil {
+			return err
+		}
+	}
+	if s.binding != nil {
+		pending, err := s.unsettledLiability(ctx, tx, payer)
+		if err != nil {
+			return err
+		}
+		if pending.Cmp(collateral) > 0 {
+			return pm.ErrPayerUnavailable
+		}
+		if err := snapshot.Validate(); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
 	// Include every unconfirmed winner, across all sessions for this payer.
 	// Keep uncertain transactions reserved until finalized receipt reconciliation.
 	rows, err := tx.StmtContext(ctx, s.liability).QueryContext(ctx, payer.Hex(), minRound)
@@ -206,7 +263,7 @@ func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer ethcommon.Ad
 		return pm.ErrPayerUnavailable
 	}
 	if err := snapshot.Validate(); err != nil {
-		return paymentObservation{err, "error"}
+		return err
 	}
 	return tx.Commit()
 }
@@ -231,23 +288,12 @@ func (s *RedeemerDB) SelectEarliestWinningTicket(payer ethcommon.Address, minCre
 	return ticket, err
 }
 
-func scanStoredTicket(row *sql.Row) (*pm.SignedTicket, error) {
-	var payer, recipient, randHash, blockHash, expiration string
-	var face, prob, rand, sig []byte
-	var nonce int64
-	var round int64
-	if err := row.Scan(&payer, &recipient, &face, &prob, &nonce, &rand, &randHash, &sig, &round, &blockHash, &expiration); err != nil {
+func scanStoredTicket(row interface{ Scan(...any) error }) (*pm.SignedTicket, error) {
+	var fields ticketFields
+	if err := row.Scan(fields.destinations()...); err != nil {
 		return nil, err
 	}
-	exp, ok := new(big.Int).SetString(expiration, 10)
-	if !ok || nonce < 0 || nonce > 1<<32-1 {
-		return nil, errors.New("corrupt winning ticket")
-	}
-	return &pm.SignedTicket{Ticket: &pm.Ticket{PayerAddress: ethcommon.HexToAddress(payer), Recipient: ethcommon.HexToAddress(recipient),
-		FaceValue: new(big.Int).SetBytes(face), WinProb: new(big.Int).SetBytes(prob), TicketNonce: uint32(nonce),
-		RecipientRandHash: ethcommon.HexToHash(randHash), CreationRound: round,
-		CreationRoundBlockHash: ethcommon.HexToHash(blockHash), ParamsExpirationBlock: exp},
-		Sig: sig, RecipientRand: new(big.Int).SetBytes(rand)}, nil
+	return fields.ticket()
 }
 
 func (s *RedeemerDB) winningTicket(ctx context.Context, sig []byte) (*pm.SignedTicket, error) {
@@ -256,6 +302,11 @@ func (s *RedeemerDB) winningTicket(ctx context.Context, sig []byte) (*pm.SignedT
 }
 
 func (s *RedeemerDB) WinningTicketCount(payer ethcommon.Address, minCreationRound int64) (int, error) {
+	if s.binding != nil {
+		var count int
+		err := s.db.QueryRow(`SELECT count(*) FROM ticket_state t JOIN winning_tickets w ON w.sig=t.sig WHERE w.payer_address=? AND t.settled=0`, payer.Hex()).Scan(&count)
+		return count, err
+	}
 	var count int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM winning_tickets WHERE payer_address=? AND creation_round>=? AND redeemed_at IS NULL AND sig NOT IN (SELECT sig FROM redemption_attempts WHERE phase!='retryable')`, payer.Hex(), minCreationRound).Scan(&count)
 	return count, err
@@ -267,16 +318,27 @@ type SubmittedRedemption struct {
 }
 
 func (s *RedeemerDB) SubmittedRedemptions() ([]SubmittedRedemption, error) {
-	rows, err := s.db.Query(`SELECT t.sig,t.hash FROM redemption_transactions t JOIN redemption_attempts a ON a.sig=t.sig WHERE a.phase NOT IN ('confirmed','used') AND t.phase NOT IN ('confirmed','reverted','superseded') ORDER BY t.rowid`)
+	query := `SELECT t.rowid,t.sig,t.hash FROM redemption_transactions t JOIN redemption_attempts a ON a.sig=t.sig WHERE a.phase NOT IN ('confirmed','used') AND t.phase NOT IN ('confirmed','reverted','superseded')`
+	var args []any
+	if s.binding != nil {
+		query += " AND t.rowid>?"
+		args = append(args, s.receiptCursor.Load())
+	}
+	query += " ORDER BY t.rowid"
+	if s.binding != nil {
+		query += " LIMIT 128"
+	}
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []SubmittedRedemption
 	for rows.Next() {
+		var id int64
 		var item SubmittedRedemption
 		var hash string
-		if err := rows.Scan(&item.Signature, &hash); err != nil {
+		if err = rows.Scan(&id, &item.Signature, &hash); err != nil {
 			return nil, err
 		}
 		if !ethcommon.IsHexHash(hash) {
@@ -284,10 +346,20 @@ func (s *RedeemerDB) SubmittedRedemptions() ([]SubmittedRedemption, error) {
 		}
 		item.Hash = ethcommon.HexToHash(hash)
 		out = append(out, item)
+		if s.binding != nil {
+			s.receiptCursor.Store(id)
+		}
+	}
+	if s.binding != nil && len(out) == 0 {
+		s.receiptCursor.Store(0)
 	}
 	return out, rows.Err()
 }
+
 func (s *RedeemerDB) RemoveWinningTicket(t *pm.SignedTicket) error {
+	if s.binding != nil {
+		return errors.New("bound winning tickets and evidence must be retained")
+	}
 	if t == nil || t.Ticket == nil || len(t.Sig) == 0 {
 		return errors.New("incomplete signed ticket")
 	}
@@ -296,7 +368,11 @@ func (s *RedeemerDB) RemoveWinningTicket(t *pm.SignedTicket) error {
 }
 
 func (s *RedeemerDB) PendingPayers() ([]ethcommon.Address, error) {
-	rows, err := s.db.Query(`SELECT DISTINCT payer_address FROM winning_tickets WHERE redeemed_at IS NULL AND sig NOT IN (SELECT sig FROM redemption_attempts WHERE phase!='retryable')`)
+	query := `SELECT DISTINCT payer_address FROM winning_tickets WHERE redeemed_at IS NULL AND sig NOT IN (SELECT sig FROM redemption_attempts WHERE phase!='retryable')`
+	if s.binding != nil {
+		query = `SELECT DISTINCT w.payer_address FROM ticket_state t JOIN winning_tickets w ON w.sig=t.sig WHERE t.settled=0`
+	}
+	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -316,3 +392,10 @@ func (s *RedeemerDB) PendingPayers() ([]ethcommon.Address, error) {
 }
 
 var _ pm.TicketStore = (*RedeemerDB)(nil)
+
+var ErrExposedRandomness = errors.New("ticket randomness is already exposed")
+
+// Configure installs observation hooks before starting workers.
+func (s *RedeemerDB) Configure(logger *slog.Logger, metrics *observability.Metrics, snapshot func() (eth.ChainSnapshot, bool)) {
+	s.logger, s.metrics, s.snapshot = logger, metrics, snapshot
+}

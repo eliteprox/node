@@ -1,4 +1,4 @@
-package orchestrator
+package redemption
 
 import (
 	"encoding/json"
@@ -17,7 +17,7 @@ import (
 type redemptionParams struct {
 	ConfigFile string `name:"config" configfile:"optional-default" basepath:"source" default:"config.toml" boa:"noconfig" descr:"Configuration file; empty disables discovery"`
 	nodeconfig.Settings
-	RedeemerDB string          `file:"true" default:"payments.sqlite" descr:"Existing recipient SQLite database"`
+	RedeemerDB string          `file:"true"  descr:"Existing recipient SQLite database"`
 	Retry      *ethcommon.Hash `name:"retry-transaction" boa:"noconfig" descr:"Rebroadcast the exact stored bytes for this transaction hash"`
 	Submit     bool            `optional:"true" boa:"noconfig,noenv" descr:"Explicitly authorize rebroadcast"`
 	RPCURL     *url.URL        `name:"rpc-url" secret:"true" optional:"true"`
@@ -42,11 +42,14 @@ func (p redemptionParams) validateRetry() error {
 	return nil
 }
 
-func redemptionCommand() *cobra.Command {
+func Command(component, defaultDB string) *cobra.Command {
 	params := new(redemptionParams)
-	return nodeconfig.Command("orchestrator", nodeconfig.Mainnet, boa.Cmd[redemptionParams]{
+	return nodeconfig.Command(component, nodeconfig.Mainnet, boa.Cmd[redemptionParams]{
 		Use: "redemptions", Short: "Inspect recipient redemption state or explicitly retry stored transaction bytes",
-		Params: params, Args: cobra.NoArgs,
+		Params: params, PostConfigFuncCtx: func(ctx *boa.HookContext, p *redemptionParams, _ *cobra.Command, _ []string) error {
+			nodeconfig.Default(ctx, &p.RedeemerDB, defaultDB)
+			return nil
+		}, Args: cobra.NoArgs,
 		InitFuncCtx: func(ctx *boa.HookContext, p *redemptionParams, _ *cobra.Command) error {
 			retry := func() bool { return ctx.HasValue(&p.Retry) }
 			boa.Param(ctx, &p.RPCURL).SetIsEnabledFn(retry)
@@ -84,7 +87,22 @@ func redemptionCommand() *cobra.Command {
 			}
 			defer store.Close()
 			if p.Retry != nil {
-				err = RetryRedemption(cmd.Context(), store, &eth.Contracts{RPC: rpc}, *p.Retry)
+				contracts := &eth.Contracts{RPC: rpc}
+				if component == "redeemer" {
+					binding, err := store.Binding(cmd.Context())
+					if err != nil {
+						return err
+					}
+					if binding.Role != "redeemer" || binding.ChainID != new(big.Int).SetUint64(*p.ChainID).String() {
+						return errors.New("redemption database deployment or role mismatch")
+					}
+					contracts, err = eth.NewContracts(rpc, binding.Controller)
+					if err != nil {
+						return err
+					}
+					contracts.BeforeBroadcast = StandalonePolicy(eth.PaymentChain{Contracts: contracts}, new(big.Int).SetUint64(*p.ChainID))
+				}
+				err = RetryRedemption(cmd.Context(), store, contracts, *p.Retry)
 				if err != nil {
 					return err
 				}

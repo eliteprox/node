@@ -115,7 +115,7 @@ func (o *PaymentObserver) Snapshot(ctx context.Context) (ChainSnapshot, error) {
 }
 
 func (s ChainSnapshot) clone() ChainSnapshot {
-	for _, value := range []**big.Int{&s.Block, &s.Number, &s.Round, &s.CurrentRound} {
+	for _, value := range []**big.Int{&s.Block, &s.Number, &s.Round, &s.CurrentRound, &s.TicketValidityPeriod} {
 		*value = new(big.Int).Set(*value)
 	}
 	return s
@@ -208,7 +208,7 @@ func (o *PaymentObserver) refresh(ctx context.Context) error {
 			o.invalidate()
 		}
 	}
-	s, err := o.chain.snapshotAt(ctx, head, true)
+	s, err := o.chain.snapshotAt(ctx, head)
 	if err != nil {
 		return err
 	}

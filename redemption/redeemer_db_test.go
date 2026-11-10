@@ -1,4 +1,4 @@
-package orchestrator
+package redemption
 
 import (
 	"context"
@@ -98,7 +98,7 @@ func TestRedemptionReceiptSettlesAttempt(t *testing.T) {
 			ticket := &pm.SignedTicket{Ticket: &pm.Ticket{PayerAddress: payer, Recipient: ethcommon.HexToAddress("0x5678"), FaceValue: big.NewInt(1), WinProb: big.NewInt(1), TicketNonce: 1, RecipientRandHash: ethcommon.HexToHash("0xabcd"), CreationRound: 1, ParamsExpirationBlock: big.NewInt(10)}, Sig: []byte{1, 2, 3}, RecipientRand: big.NewInt(4)}
 			require.NoError(t, store.StoreWinningTicket(ticket))
 			hash := ethcommon.HexToHash("0x1234")
-			require.NoError(t, store.recordPrepared(t.Context(), ticket, eth.SignedTransaction{Hash: hash, Raw: []byte{1}, From: ticket.Recipient, Nonce: 1}))
+			require.NoError(t, store.RecordPrepared(t.Context(), ticket, eth.SignedTransaction{Hash: hash, Raw: []byte{1}, From: ticket.Recipient, Nonce: 1}))
 			submitted, err := store.SubmittedRedemptions()
 			require.NoError(t, err)
 			require.Equal(t, []SubmittedRedemption{{Signature: ticket.Sig, Hash: hash}}, submitted)
@@ -130,6 +130,7 @@ func TestRedemptionMigrationHistoryAndRollback(t *testing.T) {
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
+	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	// Seed a genuine v1 database, then upgrade without changing its ticket identity.
 	prepared, err := c.PrepareRedemption(t.Context(), key, big.NewInt(1), redeemTicket(ticket))
 	require.NoError(t, err)
@@ -151,13 +152,15 @@ func TestRedemptionMigrationHistoryAndRollback(t *testing.T) {
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
+	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Up(t.Context(), s.db, files))
 	_, err = s.db.Exec("UPDATE redemption_attempts SET phase='retryable' WHERE sig=?", ticket.Sig)
 	require.NoError(t, err)
 	next := prepared
 	next.Hash = ethcommon.HexToHash("0xabcdef")
 	next.Nonce = 1
-	require.NoError(t, s.recordPrepared(t.Context(), ticket, next))
+	require.NoError(t, s.RecordPrepared(t.Context(), ticket, next))
+	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.NoError(t, migrations.Down(t.Context(), s.db, files))
 	require.ErrorContains(t, migrations.Down(t.Context(), s.db, files), "cannot_downgrade_redemption_transaction_history")
@@ -180,6 +183,7 @@ func TestRedemptionRollbackPreservesTransactionProgress(t *testing.T) {
 			require.EqualValues(t, 1, floor)
 			files, err := fs.Sub(redeemerMigrationFiles, "migrations")
 			require.NoError(t, err)
+			require.NoError(t, migrations.Down(t.Context(), s.db, files))
 			require.NoError(t, migrations.Down(t.Context(), s.db, files))
 			require.NoError(t, migrations.Down(t.Context(), s.db, files))
 			require.ErrorContains(t, migrations.Down(t.Context(), s.db, files), "cannot_downgrade_redemption_transaction_history")

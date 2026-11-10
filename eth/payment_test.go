@@ -14,6 +14,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRedemptionSnapshotRequiresArbitrumClock(t *testing.T) {
+	fixture := test.NewChainRPC(t)
+	fixture.Update(func(s *test.ChainState) { s.ChainID = 42161; s.OmitL1 = true })
+	rpc, err := OpenRPC(fixture.URL)
+	require.NoError(t, err)
+	defer rpc.Close()
+	require.NoError(t, rpc.CheckChainID(t.Context(), big.NewInt(42161)))
+	contracts, err := NewContracts(rpc, fixture.Controller)
+	require.NoError(t, err)
+	chain := PaymentChain{Contracts: contracts}
+	_, err = chain.RedemptionSnapshot(t.Context(), "latest")
+	require.ErrorIs(t, err, ErrObservationUnavailable)
+	fixture.Update(func(s *test.ChainState) { s.OmitL1 = false })
+	snapshot, err := chain.RedemptionSnapshot(t.Context(), "latest")
+	require.NoError(t, err)
+	require.EqualValues(t, 50, snapshot.Block.Int64())
+	require.EqualValues(t, 3, snapshot.TicketValidityPeriod.Int64())
+	require.True(t, snapshot.ValidTicketRound(5))
+	require.True(t, snapshot.TicketExpired(2))
+	snapshot.TicketValidityPeriod = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	require.False(t, snapshot.ValidTicketRound(5), "Solidity uint256 expiry arithmetic must not overflow")
+}
+
 func TestCanonicalPaymentSnapshotAndCollateral(t *testing.T) {
 	for _, l2 := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ethereum", true: "arbitrum"}[l2], func(t *testing.T) {

@@ -1,13 +1,13 @@
-package orchestrator
+package redemption
 
 import (
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	ethereum "github.com/ethereum/go-ethereum"
 	"strconv"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
@@ -108,7 +108,23 @@ func (s *RedeemerDB) reconcileFinalizedNonces(ctx context.Context, chain finaliz
 	if len(pending) == 0 {
 		return nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT t.hash,t.redeemer_address,t.nonce FROM redemption_transactions t JOIN redemption_attempts a ON a.sig=t.sig WHERE a.phase NOT IN ('confirmed','used') AND t.phase NOT IN ('confirmed','reverted','superseded')`)
+	query := `SELECT t.hash,t.redeemer_address,t.nonce FROM redemption_transactions t JOIN redemption_attempts a ON a.sig=t.sig WHERE a.phase NOT IN ('confirmed','used') AND t.phase NOT IN ('confirmed','reverted','superseded')`
+	var args []any
+	if s.binding != nil {
+		query += " AND t.hash IN ("
+		first := true
+		for hash := range pending {
+			if !first {
+				query += ","
+			}
+			query += "?"
+			args = append(args, hash.Hex())
+			first = false
+		}
+		query += ")"
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+
 	if err != nil {
 		return []error{err}
 	}

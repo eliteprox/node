@@ -54,8 +54,10 @@ func freeTCPPort(t *testing.T) int {
 }
 
 func TestPaidHTTPStartup(t *testing.T) {
-	for _, separate := range []bool{false, true} {
-		t.Run(fmt.Sprintf("separate-wallet=%t", separate), func(t *testing.T) {
+	for _, mode := range []string{"wallet", "separate", "remote"} {
+		t.Run(mode, func(t *testing.T) {
+			separate := mode != "wallet"
+			remote := mode == "remote"
 			client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 			mainPort, metricsPort := freeTCPPort(t), freeTCPPort(t)
 			address := fmt.Sprintf("http://127.0.0.1:%d", mainPort)
@@ -89,6 +91,14 @@ func TestPaidHTTPStartup(t *testing.T) {
 			})
 			defer releaseDependencies()
 			p.RPCURL, p.Controller = mustURL(t, rpc.URL), &rpc.Controller
+			if remote {
+				p.RedeemerURL = mustURL(t, "http://127.0.0.1:1")
+				p.RedeemerGrants = []string{"127.0.0.1"}
+				p.KeystoreFile, p.KeystorePasswordFile = "", ""
+				p.KeystorePassword = nil
+				p.Account = nil
+			}
+
 			require.NoError(t, p.Listen.UnmarshalText(fmt.Appendf(nil, "unsafe@0.0.0.0:%d", mainPort)))
 			require.NoError(t, p.MetricsListen.UnmarshalText(fmt.Appendf(nil, "unsafe@0.0.0.0:%d", metricsPort)))
 			metricsURL := fmt.Sprintf("http://127.0.0.1:%d", metricsPort)
@@ -127,7 +137,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 				store, err := OpenRedeemerDB(p.RedeemerDB)
 				require.NoError(t, err)
 				defer store.Close()
-				require.NoError(t, store.StoreWinningTicket(&pm.SignedTicket{Ticket: &pm.Ticket{PayerAddress: recipient, Recipient: recipient, FaceValue: big.NewInt(1000), WinProb: big.NewInt(100), TicketNonce: 1, RecipientRandHash: crypto.Keccak256Hash([]byte("failed ticket")), CreationRound: 1, ParamsExpirationBlock: big.NewInt(0)}, Sig: make([]byte, 65), RecipientRand: big.NewInt(1)}))
+				require.NoError(t, store.StoreWinningTicket(&pm.SignedTicket{Ticket: &pm.Ticket{PayerAddress: recipient, Recipient: recipient, FaceValue: big.NewInt(1000), WinProb: big.NewInt(100), TicketNonce: 1, RecipientRandHash: crypto.Keccak256Hash([]byte("failed ticket")), CreationRound: 1, CreationRoundBlockHash: rpc.State().RoundHash, ParamsExpirationBlock: big.NewInt(0)}, Sig: make([]byte, 65), RecipientRand: big.NewInt(1)}))
 			}
 			releaseDependencies()
 			response, err = client.Get(address + "/external/discovery")
@@ -176,7 +186,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 			response.Body.Close()
 			require.NoError(t, err)
 			require.Equal(t, separate, strings.Contains(string(metrics), "livepeer_redemption_errors_total{"), "readiness must include completion of the first worker pass, including ticket failure")
-			require.Equal(t, separate, rpc.Stats().Calls["eth_estimateGas"] > 0, "the queued ticket reaches the injected estimation failure")
+			require.Equal(t, separate && !remote, rpc.Stats().Calls["eth_estimateGas"] > 0, "the queued ticket reaches the injected estimation failure")
 
 		})
 	}

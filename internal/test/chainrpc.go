@@ -81,8 +81,9 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 		"currentRound()":             "RoundsManager.currentRound",
 		"blockHashForRound(uint256)": "RoundsManager.blockHashForRound", "isActiveTranscoder(address)": "BondingManager.isActiveTranscoder",
 		"getSenderInfo(address)": "TicketBroker.getSenderInfo", "claimableReserve(address,address)": "TicketBroker.claimableReserve",
-		"usedTickets(bytes32)": "TicketBroker.usedTickets",
-		"description()":        "PriceFeed.description",
+		"ticketValidityPeriod()": "TicketBroker.ticketValidityPeriod",
+		"usedTickets(bytes32)":   "TicketBroker.usedTickets",
+		"description()":          "PriceFeed.description",
 		"redeemWinningTicket((address,address,uint256,uint256,uint256,bytes32,bytes),bytes,uint256)": "TicketBroker.redeemWinningTicket",
 	} {
 		methods[hex.EncodeToString(crypto.Keccak256([]byte(signature))[:4])] = name
@@ -191,6 +192,8 @@ func NewChainRPC(t testing.TB) *ChainRPC {
 				result = "0x" + word(state.Contracts[contractNames[call.Input[10:]]].Hex()[2:])
 			case "RoundsManager.lastInitializedRound":
 				result = "0x" + word(quantity(state.Round)[2:])
+			case "TicketBroker.ticketValidityPeriod":
+				result = "0x" + word("3")
 			case "RoundsManager.currentRound":
 				result = "0x" + word(quantity(state.CurrentRound)[2:])
 			case "RoundsManager.blockHashForRound":

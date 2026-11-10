@@ -1,7 +1,7 @@
 // Ticket queue/retry policy ported from go-livepeer/pm/queue.go and
 // pm/sendermonitor.go at 0ff08af1bb4cb268f428d619cc968b5eaee0d093,
 // by Yondon Fu, Nico Vergauwen and Rafal Leszko. MIT notice in LICENSE.
-package orchestrator
+package redemption
 
 import (
 	"context"
@@ -25,6 +25,9 @@ func isNonRetryableTicketErr(err error) bool {
 // RedeemPending adapts handleBlockEvent and redeemWinningTicket to node snapshots.
 // Inclusion/replacement waits run on the service manager, never on this heartbeat.
 func RedeemPending(ctx context.Context, store *RedeemerDB, chain eth.PaymentChain, key *eth.Key, chainID *big.Int, snapshot eth.ChainSnapshot) []error {
+	if store != nil && store.worker != nil {
+		return store.worker.Process(ctx)
+	}
 	if store == nil || key == nil || chainID == nil || chain.Contracts == nil || snapshot.Block == nil || snapshot.Round == nil {
 		return []error{errors.New("redemption is not configured")}
 	}
@@ -88,7 +91,7 @@ func RedeemPending(ctx context.Context, store *RedeemerDB, chain eth.PaymentChai
 			}
 			continue
 		}
-		err = chain.SubmitRedemption(ctx, recovery.nonces, recovery.manager, key, chainID, redeemTicket(ticket), func(tx eth.SignedTransaction) error { return store.recordPrepared(ctx, ticket, tx) })
+		err = chain.SubmitRedemption(ctx, recovery.nonces, recovery.manager, key, chainID, redeemTicket(ticket), func(tx eth.SignedTransaction) error { return store.RecordPrepared(ctx, ticket, tx) })
 		if errors.Is(err, errRecoveringNonce) {
 			continue
 		}
@@ -165,6 +168,9 @@ func ReconcileSubmitted(ctx context.Context, store *RedeemerDB, chain ReceiptRea
 	return failures
 }
 func ProcessRedemptions(ctx context.Context, store *RedeemerDB, chain eth.PaymentChain, key *eth.Key, chainID *big.Int) []error {
+	if store != nil && store.worker != nil {
+		return store.worker.Process(ctx)
+	}
 	if store == nil || key == nil {
 		return nil
 	}

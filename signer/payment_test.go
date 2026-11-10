@@ -102,7 +102,7 @@ func TestDraftPaymentPreservesValues(t *testing.T) {
 type collateralChain struct{ withdraw *big.Int }
 
 func (c collateralChain) Snapshot(context.Context) (pm.ChainSnapshot, error) {
-	return pm.ChainSnapshot{Block: big.NewInt(50), Round: big.NewInt(5), RoundHash: ethcommon.HexToHash("0x1234")}, nil
+	return pm.ChainSnapshot{Block: big.NewInt(50), Round: big.NewInt(5), CurrentRound: big.NewInt(5), TicketValidityPeriod: big.NewInt(3), RoundHash: ethcommon.HexToHash("0x1234")}, nil
 }
 func (c collateralChain) IsActiveAt(context.Context, ethcommon.Address, pm.ChainSnapshot) (bool, error) {
 	return true, nil
@@ -230,17 +230,18 @@ func TestPaidRequestDirectRPCBudget(t *testing.T) {
 	p := newPaidPath(t, false)
 	s, engine, rpc, recipient := p.service, p.engine, p.rpc, p.recipient
 	info := p.challenge(t, t.Context(), "manifest")
-	require.Equal(t, 6, rpc.Stats().RoundTrips, "challenge: snapshot (4) + activity (2)")
+	require.Equal(t, 9, rpc.Stats().RoundTrips, "challenge: coherent snapshot (8) + activity (1)")
 
 	signed := p.sign(t, info)
-	require.Equal(t, 13, rpc.Stats().RoundTrips, "signer adds one funds observation (7)")
+	require.Equal(t, 19, rpc.Stats().RoundTrips, "signer adds one funds observation (10)")
 	_, _, err := engine.Receive(t.Context(), "runner", "manifest", signed.Payment, signed.SegCreds)
 	require.NoError(t, err)
 	stats := rpc.Stats()
-	require.Equal(t, 22, stats.RoundTrips, "receipt adds funds (7) + activity (2); baseline was 29")
+	require.Equal(t, 30, stats.RoundTrips, "receipt adds coherent funds (10) + activity (1)")
 	require.Equal(t, map[string]int{
-		"eth_getBlockByNumber": 3, "Controller.getContract": 7,
+		"eth_getBlockByNumber": 3, "Controller.getContract": 9,
 		"RoundsManager.lastInitializedRound": 3, "RoundsManager.blockHashForRound": 3,
+		"RoundsManager.currentRound": 3, "TicketBroker.ticketValidityPeriod": 3,
 		"BondingManager.isActiveTranscoder": 2, "TicketBroker.getSenderInfo": 2, "TicketBroker.claimableReserve": 2,
 	}, stats.Calls)
 

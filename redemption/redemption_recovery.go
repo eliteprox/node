@@ -1,17 +1,17 @@
 // Recovery adapters for the go-livepeer port at
 // 0ff08af1bb4cb268f428d619cc968b5eaee0d093. These bridge node's durable store
 // and finalized settlement to the upstream nonce/send/wait/replace lifecycle.
-package orchestrator
+package redemption
 
 import (
 	"context"
 	"database/sql"
 	"errors"
+	ethereum "github.com/ethereum/go-ethereum"
 	"math/big"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/livepeer/node/eth"
@@ -135,6 +135,21 @@ func (r *redemptionRecovery) prepareReplacement(ctx context.Context, previous, n
 	if err := r.store.db.QueryRowContext(ctx, "SELECT sig FROM redemption_transactions WHERE hash=?", previous.Hash().Hex()).Scan(&sig); err != nil {
 		return err
 	}
+	if r.chain.Contracts.BeforeBroadcast != nil {
+		if err := r.chain.Contracts.BeforeBroadcast(ctx, next); err != nil {
+			return err
+		}
+	}
+	if r.chain.Contracts.CheckRedemptionCost {
+		ticket, err := r.store.winningTicket(ctx, sig)
+		if err != nil {
+			return err
+		}
+		cost := new(big.Int).Mul(new(big.Int).SetUint64(next.Gas()), next.GasFeeCap())
+		if ticket.FaceValue.Cmp(cost) <= 0 {
+			return eth.ErrUneconomicalRedemption
+		}
+	}
 	return r.store.recordTransaction(ctx, sig, identity, previous.Hash().Hex())
 }
 func (r *redemptionRecovery) restore(ctx context.Context, tx *types.Transaction) (eth.TransactionRecovery, error) {
@@ -244,7 +259,10 @@ func terminalRedemption(phase string) bool {
 // resume first restores each active upstream queue job. Old 'sending' rows are
 // uncertain sends, not permanent blockers. Failed groups remain receipt-visible.
 func (r *redemptionRecovery) resume(ctx context.Context) []error {
-	failures := r.reconcileUsed(ctx)
+	var failures []error
+	if r.store.binding == nil {
+		failures = r.reconcileUsed(ctx)
+	}
 	// Repair old reservations even when no eligible ticket triggers Next. Never
 	// reset the upstream cursor on an ambiguous pending-nonce observation.
 	floor, err := r.store.SavedNonceFloor(ctx, r.key.Address())
@@ -260,11 +278,23 @@ func (r *redemptionRecovery) resume(ctx context.Context) []error {
 	failures = append(failures, r.pendingErrors...)
 	r.pendingErrors = nil
 	r.mu.Unlock()
-	rows, err := r.store.db.QueryContext(ctx, `SELECT t.root_hash,t.raw_transaction,t.phase FROM winning_tickets w JOIN redemption_attempts a ON a.sig=w.sig JOIN redemption_transactions t ON t.hash=w.tx_hash WHERE a.phase IN ('prepared','broadcast','submitted','mined') ORDER BY t.rowid`)
+	query := `SELECT t.rowid,t.root_hash,t.raw_transaction,t.phase FROM winning_tickets w JOIN redemption_attempts a ON a.sig=w.sig JOIN redemption_transactions t ON t.hash=w.tx_hash WHERE a.phase IN ('prepared','broadcast','submitted','mined')`
+	var args []any
+	if r.store.binding != nil {
+		query += " AND t.rowid>?"
+		args = append(args, r.store.recoveryCursor.Load())
+	}
+	query += " ORDER BY t.rowid"
+	if r.store.binding != nil {
+		query += " LIMIT 128"
+	}
+	rows, err := r.store.db.QueryContext(ctx, query, args...)
+
 	if err != nil {
 		return []error{err}
 	}
 	type job struct {
+		id    int64
 		root  common.Hash
 		raw   []byte
 		phase string
@@ -273,7 +303,7 @@ func (r *redemptionRecovery) resume(ctx context.Context) []error {
 	for rows.Next() {
 		var root string
 		var j job
-		if err := rows.Scan(&root, &j.raw, &j.phase); err != nil {
+		if err := rows.Scan(&j.id, &root, &j.raw, &j.phase); err != nil {
 			rows.Close()
 			return []error{err}
 		}
@@ -285,7 +315,14 @@ func (r *redemptionRecovery) resume(ctx context.Context) []error {
 	if err != nil {
 		return []error{err}
 	}
+	if r.store.binding != nil && len(jobs) == 0 {
+		r.store.recoveryCursor.Store(0)
+	}
 	for _, j := range jobs {
+		if r.store.binding != nil {
+			r.store.recoveryCursor.Store(j.id)
+		}
+
 		r.mu.Lock()
 		active := r.tracking[j.root]
 		if !active {
@@ -297,6 +334,22 @@ func (r *redemptionRecovery) resume(ctx context.Context) []error {
 		}
 		tx := new(types.Transaction)
 		err := tx.UnmarshalBinary(j.raw)
+		if err == nil && r.store.binding != nil && j.phase == "mined" {
+			receipt, e := r.chain.InclusionReceipt(ctx, tx.Hash())
+			if e == nil && receipt != nil {
+				r.mu.Lock()
+				delete(r.tracking, j.root)
+				r.mu.Unlock()
+				continue
+			}
+			if e != nil && !errors.Is(e, ethereum.NotFound) {
+				failures = append(failures, e)
+				r.mu.Lock()
+				delete(r.tracking, j.root)
+				r.mu.Unlock()
+				continue
+			}
+		}
 		if err == nil {
 			if j.phase == "prepared" || j.phase == "broadcast" || j.phase == "sending" {
 				// No live sender exists for this group; recover a crash during a send.

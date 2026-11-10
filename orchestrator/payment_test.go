@@ -35,7 +35,7 @@ import (
 type paymentTestChain struct{}
 
 func (paymentTestChain) Snapshot(context.Context) (pm.ChainSnapshot, error) {
-	return pm.ChainSnapshot{Block: big.NewInt(50), Round: big.NewInt(5), RoundHash: ethcommon.HexToHash("0x1234")}, nil
+	return pm.ChainSnapshot{Block: big.NewInt(50), Round: big.NewInt(5), CurrentRound: big.NewInt(5), TicketValidityPeriod: big.NewInt(3), RoundHash: ethcommon.HexToHash("0x1234")}, nil
 }
 func (c paymentTestChain) PayerFunds(ctx context.Context, _, _ ethcommon.Address) (pm.PayerFunds, error) {
 	snapshot, err := c.Snapshot(ctx)
@@ -248,7 +248,7 @@ func pinnedPythonSDK(t *testing.T) (python, export, root string) {
 type advancingPaymentChain struct{ block atomic.Int64 }
 
 func (c *advancingPaymentChain) Snapshot(context.Context) (pm.ChainSnapshot, error) {
-	return pm.ChainSnapshot{Block: big.NewInt(c.block.Load()), Round: big.NewInt(5), RoundHash: ethcommon.HexToHash("0x1234")}, nil
+	return pm.ChainSnapshot{Block: big.NewInt(c.block.Load()), Round: big.NewInt(5), CurrentRound: big.NewInt(5), TicketValidityPeriod: big.NewInt(3), RoundHash: ethcommon.HexToHash("0x1234")}, nil
 }
 func (c *advancingPaymentChain) PayerFunds(ctx context.Context, _, _ ethcommon.Address) (pm.PayerFunds, error) {
 	snapshot, err := c.Snapshot(ctx)

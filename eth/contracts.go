@@ -24,12 +24,14 @@ import (
 // canonical payment snapshots. Protocol addresses come from the Controller;
 // Poll and price-feed addresses are explicit caller inputs.
 type Contracts struct {
-	RPC          *RPC
-	Controller   ethcommon.Address
-	abis         map[string]*abi.ABI
-	MaxFeePerGas *big.Int // Optional ceiling in wei per gas.
-	noncesMu     sync.Mutex
-	nonces       map[ethcommon.Address]*nonceState
+	BeforeBroadcast     func(context.Context, *types.Transaction) error // Optional application policy, installed before workers start.
+	CheckRedemptionCost bool
+	RPC                 *RPC
+	Controller          ethcommon.Address
+	abis                map[string]*abi.ABI
+	MaxFeePerGas        *big.Int // Optional ceiling in wei per gas.
+	noncesMu            sync.Mutex
+	nonces              map[ethcommon.Address]*nonceState
 }
 
 var bindingMetadata = map[string]*bind.MetaData{
@@ -346,6 +348,11 @@ func (c *Contracts) Broadcast(ctx context.Context, tx SignedTransaction) error {
 	var signed types.Transaction
 	if err := signed.UnmarshalBinary(tx.Raw); err != nil || signed.Hash() != tx.Hash {
 		return errors.New("invalid prepared transaction")
+	}
+	if c.BeforeBroadcast != nil {
+		if err := c.BeforeBroadcast(ctx, &signed); err != nil {
+			return err
+		}
 	}
 	var hash ethcommon.Hash
 	if err := c.RPC.ethereum.Client().CallContext(ctx, &hash, "eth_sendRawTransaction", hexutil.Encode(tx.Raw)); err != nil {

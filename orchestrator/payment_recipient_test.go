@@ -75,7 +75,7 @@ type recipientTestChain struct {
 }
 
 func (c *recipientTestChain) Snapshot(context.Context) (pm.ChainSnapshot, error) {
-	return pm.ChainSnapshot{Block: big.NewInt(c.block), Round: big.NewInt(5), RoundHash: ethcommon.HexToHash("0x1234")}, c.snapshotErr
+	return pm.ChainSnapshot{Block: big.NewInt(c.block), Round: big.NewInt(5), CurrentRound: big.NewInt(5), TicketValidityPeriod: big.NewInt(3), RoundHash: ethcommon.HexToHash("0x1234")}, c.snapshotErr
 }
 func (c *recipientTestChain) IsActiveAt(context.Context, ethcommon.Address, pm.ChainSnapshot) (bool, error) {
 	return c.active, c.activeErr
@@ -361,7 +361,7 @@ func TestRecipientRejectsParametersOnceRedemptionPrepared(t *testing.T) {
 	require.NotNil(t, ticket)
 	// A redemption may reveal the randomness even when this recipient's chain
 	// observation still precedes parameter expiry.
-	require.NoError(t, e.store.recordPrepared(t.Context(), ticket, eth.SignedTransaction{Hash: ethcommon.HexToHash("0x1234"), Raw: []byte{1}, From: e.recipient, Nonce: 1}))
+	require.NoError(t, e.store.RecordPrepared(t.Context(), ticket, eth.SignedTransaction{Hash: ethcommon.HexToHash("0x1234"), Raw: []byte{1}, From: e.recipient, Nonce: 1}))
 	require.ErrorIs(t, receiveRecipientPayment(t, e, key, info, 2), ErrInvalidPayment)
 	after, err := e.Balance("session")
 	require.NoError(t, err)
