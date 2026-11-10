@@ -204,8 +204,13 @@ func writeJSON(w http.ResponseWriter, status int, value any) (int, error) {
 	return w.Write(append(body, '\n'))
 }
 
-func fail(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
+func fail(w http.ResponseWriter, status int, message any) {
+	body := map[string]any{"error": fmt.Sprint(message)}
+	var conflict seqConflict
+	if err, ok := message.(error); ok && errors.As(err, &conflict) {
+		body["seq"] = uint64(conflict)
+	}
+	writeJSON(w, status, body)
 }
 
 func failReservation(w http.ResponseWriter, r *http.Request, status int, err error) {
@@ -240,7 +245,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, status, err := s.registry.Heartbeat(req, r.Header.Get("Authorization"))
 	if err != nil {
-		fail(w, status, err.Error())
+		fail(w, status, err)
 		return
 	}
 	if resp.HeartbeatSecret != "" || req.Apps != nil {

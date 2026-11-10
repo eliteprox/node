@@ -81,6 +81,7 @@ type appResponse struct {
 }
 
 type heartbeatRequest struct {
+	Seq        *uint64      `json:"seq,omitempty"`
 	Apps       []appRequest `json:"apps,omitzero"`
 	RunnerID   string       `json:"runner_id"`
 	RunnerURL  string       `json:"runner_url"`
@@ -97,6 +98,7 @@ type heartbeatRequest struct {
 }
 
 type heartbeatResponse struct {
+	Seq               *uint64         `json:"seq,omitempty"`
 	RunnerID          string          `json:"runner_id"`
 	Orchestrator      string          `json:"orchestrator,omitempty"`
 	HeartbeatInterval string          `json:"heartbeat_interval"`
@@ -153,8 +155,13 @@ type runner struct {
 	ID, Version, Credential string
 	Last                    time.Time
 	Static, Confirmed       bool
+	Seq                     *uint64
 	Apps                    map[string]*app
 }
+
+type seqConflict uint64
+
+func (seqConflict) Error() string { return "seq must increase after owner opt-in" }
 
 // appLifetime distinguishes registration instances without retaining their state.
 type appLifetime struct{ _ byte }
@@ -445,6 +452,9 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 		if !equalSecret(auth, current.Credential) {
 			return heartbeatResponse{}, http.StatusUnauthorized, errors.New("invalid runner credential")
 		}
+		if current.Seq != nil && (req.Seq == nil || *req.Seq <= *current.Seq) {
+			return heartbeatResponse{}, http.StatusConflict, seqConflict(*current.Seq)
+		}
 	}
 	if req.Apps == nil {
 		requests[0].ID = current.ID
@@ -486,6 +496,11 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 	// Nothing above this point mutates the registry, including existing prices.
 	current.Version, current.Last = req.Version, time.Now()
 	current.Confirmed = confirm
+	if confirm && req.Seq != nil {
+		accepted := *req.Seq
+		current.Seq = &accepted
+	}
+	resp.Seq = current.Seq
 	r.runners[current.ID] = current
 	resp.RunnerID, resp.Apps = current.ID, make([]appResponse, 0, retained)
 	for i, entry := range requests {

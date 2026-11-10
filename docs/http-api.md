@@ -10,7 +10,7 @@ See [orchestrator setup](orchestrator.md), [signer setup](signer.md), and
 
 | Method and route | Purpose | Auth / envelope |
 | --- | --- | --- |
-| `POST /runners/heartbeat` | Register or reconcile dynamic runner | `Authorization` bootstrap credential on first call, runner-scoped heartbeat credential thereafter; JSON `runner_id`, `version`, and `apps` snapshot; response includes interval, TTL, optional new credential, app reconciliation and `o2r`. |
+| `POST /runners/heartbeat` | Register or reconcile dynamic runner | `Authorization` bootstrap credential on first call, runner-scoped heartbeat credential thereafter; JSON `runner_id`, `version`, `seq`, and `apps` snapshot; response includes interval, TTL, optional new credential, app reconciliation and `o2r`. |
 | `POST /runners/{runner_id}/unregister` | Remove dynamic runner | Scoped heartbeat credential. |
 | `GET /discovery` | Find available runners | JSON discovery entries with app, URL, mode, capacity and price. |
 | `POST /apps/{app_id}/session` | Reserve persistent session | JSON `session_id`, `app_url`, `control_url`; paid mode may first return a payment challenge. |
@@ -34,7 +34,11 @@ has `id`, `app`, `version`, and `runner_url`, plus `mode`, `proxy`, `capacity`,
 `version` is the runner SDK version; `apps[].version` is the application version.
 Capacity defaults to one; price units and currencies are trimmed and lowercased.
 
-Dynamic runners are marked as ready in the heartbeat after registration.
+Runners send a strictly increasing uint64 `seq` after registration with
+each heartbeat. Successful responses echo the `seq`. Rejected `seq` values do
+not update runner state on the orchestrator. A fresh registration or loss of
+orchestrator state starts a new sequence. A reconnecting runner can resume from
+the `seq` returned in a 409 response.
 
 App IDs are unique per node; names may repeat. Omit `id` to generate one, then
 retain the returned ID in later snapshots. Omitted apps finish existing work
@@ -42,6 +46,8 @@ before removal. O2R events use `app_id`.
 See [public URLs](orchestrator.md#public-urls-and-tls) for `RunnerServiceURL`, and
 [sessions and proxies](orchestrator.md#sessions-and-proxies) for pricing, release
 behavior, and proxy routes.
+
+Dynamic runners are marked as ready in the heartbeat after registration.
 
 ## Discovery HTTP
 
