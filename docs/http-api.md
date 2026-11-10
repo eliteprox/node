@@ -41,8 +41,11 @@ orchestrator state starts a new sequence. A reconnecting runner can resume from
 the `seq` returned in a 409 response.
 
 App IDs are unique per node; names may repeat. Omit `id` to generate one, then
-retain the returned ID in later snapshots. Omitted apps finish existing work
-before removal. O2R events use `app_id`.
+retain the returned ID in later snapshots. O2R events use `app_id`.
+Successful full `apps` snapshot responses list all runner registrations,
+including draining apps, and Node's session IDs, including pending payment
+reservations. Absence from a fresh, complete response confirms removal;
+`"apps":[]` means no registrations remain.
 See [public URLs](orchestrator.md#public-urls-and-tls) for `RunnerServiceURL`, and
 [sessions and proxies](orchestrator.md#sessions-and-proxies) for pricing, release
 behavior, and proxy routes.

@@ -10,6 +10,7 @@ RunnerConfig = "/etc/livepeer/runners.toml"
 # operation; omit BootstrapSecretFile for static-only operation.
 HeartbeatInterval = "5s"
 HeartbeatTTL = "30s"
+DrainTimeout = "12h"
 RunnerGrants = []
 SessionProxyGrants = []
 HealthGrants = []

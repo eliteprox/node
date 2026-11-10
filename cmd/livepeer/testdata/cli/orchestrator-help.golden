@@ -42,6 +42,7 @@ Flags:
       --health-grants strings              Private static runner health IP[:port] or CIDR grants (env: LIVEPEER_ORCHESTRATOR_HEALTH_GRANTS)
       --heartbeat-interval duration        Runner heartbeat interval (env: LIVEPEER_ORCHESTRATOR_HEARTBEAT_INTERVAL) (default 5s)
       --heartbeat-ttl duration             Runner heartbeat expiry (env: LIVEPEER_ORCHESTRATOR_HEARTBEAT_TTL) (default 30s)
+      --drain-timeout duration             Maximum app drain time after withdrawal, from 0 to 12h; zero ends work immediately (env: LIVEPEER_ORCHESTRATOR_DRAIN_TIMEOUT) (default 12h0m0s)
       --print-config                       Print audited redacted TOML configuration
   -h, --help                               help for livepeer-orchestrator
   -v, --version                            version for livepeer-orchestrator

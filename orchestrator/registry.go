@@ -176,6 +176,7 @@ type app struct {
 	HealthCode                    int
 	Sessions                      map[string]*session
 	healthFailures                int
+	drainDeadline                 time.Time
 }
 
 type session struct {
@@ -227,6 +228,7 @@ type Registry struct {
 	runnerService string
 	interval      time.Duration
 	ttl           time.Duration
+	drainTimeout  time.Duration
 	onEvent       func(runnerID, appID, event, sessionID, sessionToken string)
 	weiPerUSD     *big.Rat
 	rateUntil     time.Time
@@ -238,10 +240,11 @@ const (
 	maxRunners       = 256
 	maxAppsPerRunner = 128
 	maxApps          = 512
+	maxDrainTimeout  = 12 * time.Hour
 )
 
 func NewRegistry(secret, service string, interval, ttl time.Duration) *Registry {
-	r := &Registry{metrics: observability.New("orchestrator"), runners: make(map[string]*runner), apps: make(map[string]*app), sessions: make(map[string]*app), proxies: make(map[string]*session), secret: secret, service: strings.TrimRight(service, "/"), interval: interval, ttl: ttl}
+	r := &Registry{metrics: observability.New("orchestrator"), runners: make(map[string]*runner), apps: make(map[string]*app), sessions: make(map[string]*app), proxies: make(map[string]*session), secret: secret, service: strings.TrimRight(service, "/"), interval: interval, ttl: ttl, drainTimeout: maxDrainTimeout}
 	r.metrics.Snapshot(r.collectMetrics)
 	r.metrics.Legacy(func(emit observability.Emit) {
 		runners, sessions := r.Counts()
@@ -460,12 +463,17 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 		requests[0].ID = current.ID
 		seen[current.ID] = true
 	}
+	now := time.Now()
 	retained := len(requests)
 	for id, item := range current.Apps {
 		if req.Apps == nil && id != current.ID {
 			return heartbeatResponse{}, http.StatusConflict, errors.New("scalar heartbeat cannot replace other app registrations")
 		}
-		if !seen[id] && len(item.Sessions) != 0 {
+		keep := r.drainTimeout > 0
+		if item.Removing {
+			keep = now.Before(item.drainDeadline)
+		}
+		if !seen[id] && len(item.Sessions) != 0 && keep {
 			retained++
 		}
 	}
@@ -494,7 +502,7 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 		}
 	}
 	// Nothing above this point mutates the registry, including existing prices.
-	current.Version, current.Last = req.Version, time.Now()
+	current.Version, current.Last = req.Version, now
 	current.Confirmed = confirm
 	if confirm && req.Seq != nil {
 		accepted := *req.Seq
@@ -511,15 +519,14 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 			r.runnerEvent(entry.ID, item, "registered")
 		}
 		item.appRequest, item.USDQuote, item.PriceError, item.Removing = entry, quotes[i], false, false
+		item.drainDeadline = time.Time{}
 		resp.Apps = append(resp.Apps, item.response())
 	}
 	for _, id := range slices.Sorted(maps.Keys(current.Apps)) {
 		if !seen[id] {
 			item := current.Apps[id]
-			item.Removing = true
-			if len(item.Sessions) == 0 {
-				r.removeApp(item)
-			} else {
+			r.drainApp(item, now)
+			if current.Apps[id] != nil {
 				resp.Apps = append(resp.Apps, item.response())
 			}
 		}
@@ -528,6 +535,21 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 		resp.SessionIDs, resp.Apps = resp.Apps[0].SessionIDs, nil
 	}
 	return resp, http.StatusOK, nil
+}
+
+// drainApp requires r.mu. Only the first withdrawal starts the drain clock.
+func (r *Registry) drainApp(item *app, now time.Time) {
+	if !item.Removing {
+		item.Removing = true
+		item.drainDeadline = now.Add(r.drainTimeout)
+	}
+	if len(item.Sessions) == 0 {
+		r.removeApp(item)
+	} else if !now.Before(item.drainDeadline) {
+		for sid := range item.Sessions {
+			r.releaseLocked(item.ID, sid, errRunnerUnavailable, "app_drain_expired")
+		}
+	}
 }
 
 func (item *app) response() appResponse {
@@ -929,9 +951,16 @@ func (r *Registry) proxyTarget(proxyID string) (sessionProxy, string, string, st
 func (r *Registry) Expire() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 	for _, current := range r.runners {
-		if !current.Static && time.Since(current.Last) > r.ttl {
+		if !current.Static && now.Sub(current.Last) > r.ttl {
 			r.removeRunner(current, errRunnerUnavailable, "runner_expired", "expired")
+			continue
+		}
+		for _, item := range current.Apps {
+			if item.Removing {
+				r.drainApp(item, now)
+			}
 		}
 	}
 }

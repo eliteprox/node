@@ -111,7 +111,7 @@ func TestRealBinaryOffchainFlow(t *testing.T) {
 	metricsURL := fmt.Sprintf("http://127.0.0.1:%d", metricsPort)
 	secretPath := filepath.Join(t.TempDir(), "bootstrap")
 	require.NoError(t, os.WriteFile(secretPath, []byte("exact-bootstrap"), 0600))
-	cmd := exec.Command(dispatcher, "orchestrator", "--listen", fmt.Sprintf("127.0.0.1:%d", mainPort), "--metrics-listen", fmt.Sprintf("127.0.0.1:%d", metricsPort), "--bootstrap-secret-file", secretPath, "--runner-grants", "127.0.0.0/8", "--session-proxy-grants", strings.TrimPrefix(runner.URL, "http://"))
+	cmd := exec.Command(dispatcher, "orchestrator", "--listen", fmt.Sprintf("127.0.0.1:%d", mainPort), "--metrics-listen", fmt.Sprintf("127.0.0.1:%d", metricsPort), "--bootstrap-secret-file", secretPath, "--runner-grants", "127.0.0.0/8", "--session-proxy-grants", strings.TrimPrefix(runner.URL, "http://"), "--drain-timeout", "0")
 	var log bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &log, &log
 	require.NoError(t, cmd.Start())
@@ -175,6 +175,22 @@ func TestRealBinaryOffchainFlow(t *testing.T) {
 	require.Equal(t, "from-runner", string(data))
 	require.NoError(t, response.Body.Close())
 	testDiscoveryBinary(t, install, serviceURL)
+	request, err = http.NewRequest(http.MethodPost, serviceURL+"/runners/heartbeat", bytes.NewBufferString(`{"runner_id":"`+registered.RunnerID+`","seq":1,"apps":[]}`))
+	require.NoError(t, err)
+	request.Header.Set("Authorization", registered.HeartbeatSecret)
+	response, err = http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	var withdrawn struct {
+		Apps []json.RawMessage `json:"apps"`
+	}
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&withdrawn))
+	require.NoError(t, response.Body.Close())
+	require.Equal(t, []json.RawMessage{}, withdrawn.Apps, "configured zero timeout removes the active registration immediately")
+	response, err = http.Get(serviceURL + "/apps/" + registered.RunnerID + "/session/" + reserved.SessionID + "/app/hello")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNotFound, response.StatusCode)
+	require.NoError(t, response.Body.Close())
 	checkGoSDK(t, root, serviceURL, runner.URL)
 	checkPythonSDK(t, root, serviceURL, runner.URL)
 	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))

@@ -63,6 +63,7 @@ type Params struct {
 	HealthGrants              []string      `optional:"true" descr:"Private static runner health IP[:port] or CIDR grants"`
 	HeartbeatInterval         time.Duration `default:"5s" descr:"Runner heartbeat interval"`
 	HeartbeatTTL              time.Duration `default:"30s" descr:"Runner heartbeat expiry"`
+	DrainTimeout              time.Duration `default:"12h" descr:"Maximum app drain time after withdrawal, from 0 to 12h; zero ends work immediately"`
 	PrintConfig               bool          `optional:"true" boa:"noconfig,noenv" descr:"Print audited redacted TOML configuration"`
 }
 
@@ -130,6 +131,9 @@ func (p Params) Validate() error {
 	if p.HeartbeatInterval <= 0 || p.HeartbeatTTL <= p.HeartbeatInterval {
 		return errors.New("--heartbeat-interval must be positive and --heartbeat-ttl must be greater than --heartbeat-interval")
 	}
+	if p.DrainTimeout < 0 || p.DrainTimeout > maxDrainTimeout {
+		return errors.New("--drain-timeout must be between 0 and 12h")
+	}
 	for _, item := range []struct {
 		purpose string
 		grants  []string
@@ -194,6 +198,7 @@ func printConfig(ctx *boa.HookContext, p *Params, out io.Writer) error {
 		"Listen": &p.Listen, "MetricsListen": &p.MetricsListen,
 		"RunnerGrants": &p.RunnerGrants, "SessionProxyGrants": &p.SessionProxyGrants, "HealthGrants": &p.HealthGrants,
 		"HeartbeatInterval": &p.HeartbeatInterval, "HeartbeatTTL": &p.HeartbeatTTL,
+		"DrainTimeout":      &p.DrainTimeout,
 		"RedeemerTxTimeout": &p.RedeemerTxTimeout, "RedeemerMaxTxReplacements": &p.RedeemerMaxTxReplacements,
 		"RedeemerDB": &p.RedeemerDB, "ChainID": &p.ChainID, "RedeemerMaxFeePerGas": &p.RedeemerMaxFeePerGas,
 		"Controller": &p.Controller, "WeiPerUSD": &p.WeiPerUSD, "ETHUSDFeed": &p.ETHUSDFeed,
@@ -246,6 +251,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		return err
 	}
 	registry := NewRegistry(p.BootstrapSecret, p.ServiceURL.String(), p.HeartbeatInterval, p.HeartbeatTTL)
+	registry.drainTimeout = p.DrainTimeout
 	registry.runnerService = strings.TrimRight(p.RunnerServiceURL.String(), "/")
 	var engine *PaymentEngine
 	var redeemerDB *RedeemerDB

@@ -238,6 +238,47 @@ func TestLocalExampleConfig(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestDrainTimeoutConfig(t *testing.T) {
+	t.Setenv("LIVEPEER_ORCHESTRATOR_BOOTSTRAP_SECRET", "test")
+	path := filepath.Join(t.TempDir(), "config.toml")
+	test.WriteConfig(t, path, `DrainTimeout = "2h"`)
+	for _, tc := range []struct {
+		name, env, want string
+		args            []string
+	}{
+		{name: "default", want: "12h0m0s", args: []string{"--config", ""}},
+		{name: "file", want: "2h0m0s", args: []string{"--config", path}},
+		{name: "environment", env: "1h", want: "1h0m0s", args: []string{"--config", path}},
+		{name: "flag", env: "1h", want: "30m0s", args: []string{"--config", path, "--drain-timeout", "30m"}},
+		{name: "zero", want: "0s", args: []string{"--config", "", "--drain-timeout", "0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LIVEPEER_ORCHESTRATOR_DRAIN_TIMEOUT", tc.env)
+			output, err := execute(t, append(tc.args, "--print-config")...)
+			require.NoError(t, err)
+			var printed map[string]any
+			require.NoError(t, toml.Unmarshal([]byte(output), &printed))
+			require.Equal(t, tc.want, printed["DrainTimeout"])
+		})
+	}
+	for _, value := range []string{"-1ns", "12h1ns"} {
+		_, err := execute(t, "--config", "", "--drain-timeout", value)
+		require.ErrorContains(t, err, "--drain-timeout must be between 0 and 12h")
+		require.True(t, boa.IsUserInputError(err))
+	}
+	// Validate valid boundaries without starting listeners or other resources.
+	p := Params{
+		BootstrapSecret: "test", HeartbeatInterval: time.Second, HeartbeatTTL: time.Minute,
+		Listen:        boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:0")},
+		MetricsListen: boa.HTTPBind{AddrPort: netip.MustParseAddrPort("127.0.0.1:0")},
+		ServiceURL:    boa.Text[*url.URL]{Value: mustURL(t, "http://127.0.0.1:8935")},
+	}
+	for _, timeout := range []time.Duration{0, 12 * time.Hour} {
+		p.DrainTimeout = timeout
+		require.NoError(t, p.Validate())
+	}
+}
+
 func TestConfigErrorRemedies(t *testing.T) {
 	for _, tc := range []struct {
 		name, network, home, config, remedy string

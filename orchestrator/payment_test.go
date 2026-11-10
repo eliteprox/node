@@ -469,9 +469,19 @@ func TestMultiAppPaidIsolationAndDrain(t *testing.T) {
 	require.NoError(t, ctx.Err())
 	require.Positive(t, test.MetricSum(t, registry.metrics.Registry, "payment_charge_eth_total", map[string]string{"runner_id": "owner", "app_id": "live"}))
 	require.EqualValues(t, 1, test.MetricSum(t, registry.metrics.Registry, "payment_fixed_charges_total", map[string]string{"runner_id": "owner", "app_id": "fixed"}))
-	registry.ReleaseBySession(live.ManifestID)
+	registry.apps["live"].drainDeadline = time.Now()
+	registry.Expire()
+	require.ErrorIs(t, context.Cause(ctx), errRunnerUnavailable)
 	require.NotContains(t, registry.apps, "live")
 	require.Contains(t, registry.apps, "fixed")
+	before, err = engine.Balance(live.ManifestID)
+	require.NoError(t, err)
+	server.ChargePaidSessions(t.Context())
+	after, err = engine.Balance(live.ManifestID)
+	require.NoError(t, err)
+	require.Zero(t, before.Cmp(after), "expired sessions stop billing")
+	w = request(http.MethodPost, live.PaymentURL, next, segment)
+	require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
 }
 
 func TestAppIDReuseRejectsPreviousRegistrationQuotes(t *testing.T) {

@@ -82,6 +82,15 @@ A runner stop gives in-flight HTTP, SSE, and WebSocket requests up to one second
 to finish; all other releases cancel them immediately. This applies to both
 persistent and single-shot sessions.
 
+When a runner heartbeat omits an app, the orchestrator removes it from discovery
+and stops new sessions while existing sessions drain. The first omission sets the
+deadline; repeated omissions do not extend it. A newer snapshot listing the app
+cancels the drain. `DrainTimeout` / `--drain-timeout` sets the limit for all apps
+on the orchestrator (default and maximum: 12 hours; zero ends sessions immediately).
+Set it in TOML or with `LIVEPEER_ORCHESTRATOR_DRAIN_TIMEOUT`. Unregistering a runner
+or letting its heartbeat expire ends its sessions. An orchestrator restart ends
+all sessions. See the [heartbeat contract](http-api.md#live-runner-http) for removal confirmation.
+
 Enabling an app's proxy creates an automatic proxy belonging to that app; use its
 returned proxy ID and URL. Without a URL template, generated URLs use
 `ServiceURL/run/{proxy}`. The earlier

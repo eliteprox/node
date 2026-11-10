@@ -49,14 +49,25 @@ func TestDirectTrickleDeleteAllowsNamedChannelRecreation(t *testing.T) {
 }
 
 func TestTrickleActiveStreamAndCancellation(t *testing.T) {
-	for _, action := range []string{"delete", "reset", "release"} {
+	for _, action := range []string{"delete", "reset", "release", "drain"} {
 		t.Run(action, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				reg, s := reviewServer(t, "http://127.0.0.1:1")
-				require.NoError(t, reg.AddStatic(StaticRunner{ID: "r", RunnerURL: "http://127.0.0.1:1", App: "test"}))
+				defer s.Close()
+				var owner heartbeatResponse
+				if action == "drain" {
+					a := registeredApp("r")
+					owner = appHeartbeat(t, reg, "owner", "bootstrap", a)
+					appHeartbeat(t, reg, owner.RunnerID, owner.HeartbeatSecret, a)
+					reg.ttl = 2 * time.Minute
+					reg.drainTimeout = time.Second
+				} else {
+					require.NoError(t, reg.AddStatic(StaticRunner{ID: "r", RunnerURL: "http://127.0.0.1:1", App: "test"}))
+				}
 				sid, _, _, _, err := reg.Reserve("r")
 				require.NoError(t, err)
-				s.newChannel("test", "events", "application/octet-stream", "r", "r", sid).identity = reg.identity("r", sid)
+				identity := reg.identity("r", sid)
+				s.newChannel("test", "events", "application/octet-stream", identity.Runner, "r", sid).identity = identity
 				input, writer := io.Pipe()
 				defer writer.Close()
 				pubDone, subDone := make(chan struct{}), make(chan struct{})
@@ -93,6 +104,10 @@ func TestTrickleActiveStreamAndCancellation(t *testing.T) {
 					s.ServeHTTP(httptest.NewRecorder(), req)
 				case "release":
 					reg.ReleaseBySession(sid)
+				case "drain":
+					appHeartbeat(t, reg, owner.RunnerID, owner.HeartbeatSecret)
+					time.Sleep(time.Second)
+					reg.Expire()
 				}
 				synctest.Wait()
 				select {
@@ -105,7 +120,7 @@ func TestTrickleActiveStreamAndCancellation(t *testing.T) {
 				default:
 					t.Error("subscriber was not interrupted")
 				}
-				require.GreaterOrEqual(t, test.MetricSum(t, reg.metrics.Registry, "stream_transfer_bytes_total", map[string]string{"app": "test", "runner_id": "r", "protocol": "trickle", "direction": "out"}), float64(len("firststill streaming")))
+				require.GreaterOrEqual(t, test.MetricSum(t, reg.metrics.Registry, "stream_transfer_bytes_total", map[string]string{"app": identity.App, "runner_id": identity.Runner, "protocol": "trickle", "direction": "out"}), float64(len("firststill streaming")))
 				require.Zero(t, test.MetricSum(t, reg.metrics.Registry, "http_requests_in_flight", nil))
 			})
 		})

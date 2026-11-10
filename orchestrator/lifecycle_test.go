@@ -89,7 +89,7 @@ func TestRunnerStopDrainsProxy(t *testing.T) {
 func TestReleaseCancelsActiveProxy(t *testing.T) {
 	for _, mode := range []string{"persistent", "single-shot"} {
 		for _, protocol := range []string{"http", "sse", "websocket"} {
-			for _, issuer := range []string{"client", "shutdown", "expired", "health", "unregistered"} {
+			for _, issuer := range []string{"client", "shutdown", "expired", "health", "unregistered", "drain"} {
 				t.Run(mode+"/"+protocol+"/"+issuer, func(t *testing.T) {
 					started := make(chan http.Header, 1)
 					ended := make(chan struct{})
@@ -119,8 +119,8 @@ func TestReleaseCancelsActiveProxy(t *testing.T) {
 					require.NoError(t, err)
 					registry := NewRegistry("bootstrap", "http://orchestrator.example", time.Second, time.Minute)
 					var credential string
-					if issuer == "expired" || issuer == "unregistered" {
-						registration := heartbeatRequest{RunnerID: "runner", RunnerURL: upstream.URL, App: "test", Mode: mode, Capacity: 1}
+					if issuer == "expired" || issuer == "unregistered" || issuer == "drain" {
+						registration := heartbeatRequest{RunnerID: "runner", RunnerURL: upstream.URL, App: "test", Mode: mode, Capacity: 1, Proxy: issuer == "drain"}
 						registered, _, err := registry.Heartbeat(registration, "bootstrap")
 						require.NoError(t, err)
 						registration.RunnerID = registered.RunnerID
@@ -136,9 +136,11 @@ func TestReleaseCancelsActiveProxy(t *testing.T) {
 					defer app.Close()
 					path := "/apps/runner/app"
 					if mode == "persistent" {
-						sid, _, _, _, err := registry.Reserve("runner")
+						_, appURL, _, _, err := registry.Reserve("runner")
 						require.NoError(t, err)
-						path = "/apps/runner/session/" + sid + "/app"
+						path = strings.TrimPrefix(appURL, registry.service)
+					} else if issuer == "drain" {
+						path = "/run/runner"
 					}
 					clientDone, headersReady := make(chan struct{}), make(chan struct{})
 					if protocol == "websocket" {
@@ -184,6 +186,17 @@ func TestReleaseCancelsActiveProxy(t *testing.T) {
 						registry.mu.Unlock()
 						registry.Expire()
 						reason, outcome = "runner_expired", "transport_error"
+					case "drain":
+						_, _, err := registry.Heartbeat(heartbeatRequest{RunnerID: "runner", Apps: []appRequest{}}, credential)
+						require.NoError(t, err)
+						ctx, ok := registry.sessionContext("runner", sid)
+						require.True(t, ok)
+						require.NoError(t, ctx.Err(), "withdrawal preserves the existing proxy stream")
+						registry.mu.Lock()
+						registry.apps["runner"].drainDeadline = time.Now()
+						registry.mu.Unlock()
+						registry.Expire()
+						reason, outcome = "app_drain_expired", "transport_error"
 					case "health":
 						registry.mu.Lock()
 						registry.apps["runner"].HealthURL = upstream.URL + "/healthz"
