@@ -47,6 +47,20 @@ func TestRunnerProxyRoutingMatrix(t *testing.T) {
 							require.NoError(t, err)
 							runnerID, req.RunnerID = registered.RunnerID, registered.RunnerID
 							require.Regexp(t, `^app-[a-z2-7]{8}$`, runnerID)
+							require.Empty(t, registry.Discovery()[0].Runners)
+							for _, path := range []string{
+								registry.appURL(runnerID, "persistent", ""),
+								registry.appURL(runnerID, "single-shot", ""),
+								registry.appURL(runnerID, "persistent", "unknown"),
+								registry.service + "/run/" + runnerID,
+								registry.service + "/proxy/" + runnerID,
+								registry.proxyURL(runnerID),
+							} {
+								w := httptest.NewRecorder()
+								s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+								require.Equal(t, http.StatusNotFound, w.Code, path+": "+w.Body.String())
+							}
+							require.Empty(t, registry.sessions)
 							_, code, err := registry.Heartbeat(req, registered.HeartbeatSecret)
 							require.NoError(t, err)
 							require.Equal(t, http.StatusOK, code)

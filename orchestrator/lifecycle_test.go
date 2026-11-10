@@ -120,7 +120,11 @@ func TestReleaseCancelsActiveProxy(t *testing.T) {
 					registry := NewRegistry("bootstrap", "http://orchestrator.example", time.Second, time.Minute)
 					var credential string
 					if issuer == "expired" || issuer == "unregistered" {
-						registered, _, err := registry.Heartbeat(heartbeatRequest{RunnerID: "runner", RunnerURL: upstream.URL, App: "test", Mode: mode, Capacity: 1}, "bootstrap")
+						registration := heartbeatRequest{RunnerID: "runner", RunnerURL: upstream.URL, App: "test", Mode: mode, Capacity: 1}
+						registered, _, err := registry.Heartbeat(registration, "bootstrap")
+						require.NoError(t, err)
+						registration.RunnerID = registered.RunnerID
+						_, _, err = registry.Heartbeat(registration, registered.HeartbeatSecret)
 						require.NoError(t, err)
 						credential = registered.HeartbeatSecret
 					} else {
@@ -234,7 +238,11 @@ func TestRegistryTeardownCancelsSessions(t *testing.T) {
 		t.Run(reason, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				registry := NewRegistry("bootstrap", "http://orch.example", time.Second, 3*time.Second)
-				registered, _, err := registry.Heartbeat(heartbeatRequest{RunnerURL: "https://runner.example", App: "test", Capacity: 1}, "bootstrap")
+				registration := heartbeatRequest{RunnerURL: "https://runner.example", App: "test", Capacity: 1}
+				registered, _, err := registry.Heartbeat(registration, "bootstrap")
+				require.NoError(t, err)
+				registration.RunnerID = registered.RunnerID
+				_, _, err = registry.Heartbeat(registration, registered.HeartbeatSecret)
 				require.NoError(t, err)
 				sid, _, _, _, err := registry.Reserve(registered.RunnerID)
 				require.NoError(t, err)
@@ -347,6 +355,7 @@ func TestMultiAppRemovalKeepsStreams(t *testing.T) {
 				a, b := registeredApp("a"), registeredApp("b")
 				a.RunnerURL, a.Mode = upstream.URL, mode
 				owner := appHeartbeat(t, registry, "owner", "bootstrap", a, b)
+				appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, a, b)
 				path := "/apps/a/app"
 				if mode == "persistent" {
 					sid, _, _, _, err := registry.Reserve("a")

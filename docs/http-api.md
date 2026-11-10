@@ -34,6 +34,8 @@ has `id`, `app`, `version`, and `runner_url`, plus `mode`, `proxy`, `capacity`,
 `version` is the runner SDK version; `apps[].version` is the application version.
 Capacity defaults to one; price units and currencies are trimmed and lowercased.
 
+Dynamic runners are marked as ready in the heartbeat after registration.
+
 App IDs are unique per node; names may repeat. Omit `id` to generate one, then
 retain the returned ID in later snapshots. Omitted apps finish existing work
 before removal. O2R events use `app_id`.

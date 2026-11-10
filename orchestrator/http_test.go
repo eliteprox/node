@@ -189,7 +189,11 @@ func TestSessionProxyStreamsSSEAndWebSocket(t *testing.T) {
 	policy, err := destination.New("runner", []string{grant})
 	require.NoError(t, err)
 	registry := NewRegistry("bootstrap", "http://orchestrator.example", time.Second, time.Minute)
-	registered, _, err := registry.Heartbeat(heartbeatRequest{RunnerURL: upstream.URL, App: "stream", Mode: "persistent", Capacity: 1}, "bootstrap")
+	registration := heartbeatRequest{RunnerURL: upstream.URL, App: "stream", Mode: "persistent", Capacity: 1}
+	registered, _, err := registry.Heartbeat(registration, "bootstrap")
+	require.NoError(t, err)
+	registration.RunnerID = registered.RunnerID
+	_, _, err = registry.Heartbeat(registration, registered.HeartbeatSecret)
 	require.NoError(t, err)
 	server := httptest.NewServer(NewServer(registry, policy, policy, slog.New(slog.NewTextHandler(io.Discard, nil))))
 	defer server.Close()
@@ -241,6 +245,8 @@ func TestRunnerDestinationDeniedWithoutGrant(t *testing.T) {
 	var heartbeat heartbeatResponse
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&heartbeat))
 	require.NoError(t, response.Body.Close())
+	_, _, err = registry.Heartbeat(heartbeatRequest{RunnerID: heartbeat.RunnerID, RunnerURL: upstream.URL, App: "test", Mode: "single-shot", Capacity: 1}, heartbeat.HeartbeatSecret)
+	require.NoError(t, err)
 	response, err = http.Get(server.URL + "/apps/" + heartbeat.RunnerID + "/app")
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadGateway, response.StatusCode)
@@ -256,7 +262,11 @@ func TestGeneratedProxyHasSeparateDestinationGrant(t *testing.T) {
 	proxyPolicy, err := destination.New("session-proxy", nil)
 	require.NoError(t, err)
 	registry := NewRegistry("bootstrap", "http://orchestrator.example", time.Second, time.Minute)
-	registered, status, err := registry.Heartbeat(heartbeatRequest{RunnerURL: upstream.URL, App: "test", Mode: "persistent", Capacity: 1}, "bootstrap")
+	registration := heartbeatRequest{RunnerURL: upstream.URL, App: "test", Mode: "persistent", Capacity: 1}
+	registered, status, err := registry.Heartbeat(registration, "bootstrap")
+	require.NoError(t, err)
+	registration.RunnerID = registered.RunnerID
+	_, _, err = registry.Heartbeat(registration, registered.HeartbeatSecret)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, status)
 	sid, _, _, status, err := registry.Reserve(registered.RunnerID)
@@ -326,7 +336,11 @@ func TestTrickleChannelsScopedToSession(t *testing.T) {
 	policy, err := destination.New("runner", nil)
 	require.NoError(t, err)
 	registry := NewRegistry("bootstrap", "http://orchestrator.example", time.Second, time.Minute)
-	registered, _, err := registry.Heartbeat(heartbeatRequest{RunnerURL: "https://runner.example", App: "test", Mode: "persistent", Capacity: 2}, "bootstrap")
+	registration := heartbeatRequest{RunnerURL: "https://runner.example", App: "test", Mode: "persistent", Capacity: 2}
+	registered, _, err := registry.Heartbeat(registration, "bootstrap")
+	require.NoError(t, err)
+	registration.RunnerID = registered.RunnerID
+	_, _, err = registry.Heartbeat(registration, registered.HeartbeatSecret)
 	require.NoError(t, err)
 	srv := NewServer(registry, policy, policy, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	sid1, _, _, _, err := registry.Reserve(registered.RunnerID)
@@ -380,7 +394,10 @@ func TestRunnerGPUIsPreservedForPythonDiscovery(t *testing.T) {
 	var request heartbeatRequest
 	require.NoError(t, json.Unmarshal([]byte(`{"runner_id":"gpu-runner","runner_url":"https://runner.example","app":"retained","mode":"single-shot","status":"ready","capacity":1,"gpu":{"id":"0","name":"H100","vram_mb":80000}}`), &request))
 	registry := NewRegistry("bootstrap", "https://orchestrator.example", time.Second, 30*time.Second)
-	_, status, err := registry.Heartbeat(request, "bootstrap")
+	registered, status, err := registry.Heartbeat(request, "bootstrap")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status)
+	_, status, err = registry.Heartbeat(request, registered.HeartbeatSecret)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, status)
 	entries := registry.Discovery()
@@ -438,6 +455,8 @@ func TestMultiAppHeartbeatRoutingAndVersions(t *testing.T) {
 	require.Regexp(t, `^app-[a-z2-7]{8}$`, shot.ID)
 	require.Equal(t, "runner-v9", registry.runners["owner"].Version)
 	require.JSONEq(t, `[]`, string(mustJSON(t, response.Apps[0].SessionIDs)))
+	payload["apps"] = []appRequest{persistent, shot}
+	require.Equal(t, 200, heartbeatHTTP(t, server, payload, response.HeartbeatSecret).Code)
 	inventory := registry.Discovery()[0].Runners
 	require.Len(t, inventory, 2)
 	versions := map[string]string{}
@@ -529,6 +548,7 @@ func TestMultiAppSnapshotValidationIsAtomic(t *testing.T) {
 	first := registeredApp("first")
 	first.PriceInfo = priceInfo{Price: "1", Currency: "usd", Unit: "hour"}
 	initial := appHeartbeat(t, registry, "owner", "bootstrap", first)
+	appHeartbeat(t, registry, initial.RunnerID, initial.HeartbeatSecret, first)
 	before := registry.runners["owner"].Last
 	invalids := []appRequest{
 		{ID: "bad", App: "x", RunnerURL: "file:///bad"},
@@ -579,6 +599,7 @@ func TestMultiAppOwnershipDrainAndIDReuse(t *testing.T) {
 	defer server.Close()
 	a, b := registeredApp("a"), registeredApp("b")
 	owner := appHeartbeat(t, registry, "owner", "bootstrap", a, b)
+	appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, a, b)
 	other := appHeartbeat(t, registry, "other", "bootstrap")
 	sid, _, _, _, err := registry.Reserve("a")
 	require.NoError(t, err)
@@ -637,6 +658,8 @@ func TestMultiAppOwnershipDrainAndIDReuse(t *testing.T) {
 	scalar := heartbeatRequest{RunnerID: "scalar", App: "compat", RunnerURL: a.RunnerURL}
 	registered, _, err := registry.Heartbeat(scalar, "bootstrap")
 	require.NoError(t, err)
+	_, _, err = registry.Heartbeat(scalar, registered.HeartbeatSecret)
+	require.NoError(t, err)
 	active, _, _, _, err := registry.Reserve("scalar")
 	require.NoError(t, err)
 	response := appHeartbeat(t, registry, "scalar", registered.HeartbeatSecret, scalar.scalarApp())
@@ -665,6 +688,7 @@ func TestMultiAppPinningAndPendingAdmission(t *testing.T) {
 	a.PriceInfo, b.PriceInfo = priceInfo{Price: "1", Unit: "hour"}, priceInfo{Price: "2", Unit: "fixed"}
 	a.Proxy = true
 	owner := appHeartbeat(t, registry, "owner", "bootstrap", a, b)
+	appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, a, b)
 	quote, _, err := registry.quoteForApp("a")
 	require.NoError(t, err)
 	sid, proxy, _, _, err := registry.reserveWithPrice("a", "pending", &quote, "persistent")
@@ -706,6 +730,7 @@ func TestMultiAppExpiryAndRestart(t *testing.T) {
 		defer server.Close()
 		a, b := registeredApp("a"), registeredApp("b")
 		old := appHeartbeat(t, registry, "old", "bootstrap", a, b)
+		appHeartbeat(t, registry, old.RunnerID, old.HeartbeatSecret, a, b)
 		sid, _, _, _, err := registry.Reserve("a")
 		require.NoError(t, err)
 		ctx, _ := registry.sessionContext("a", sid)
@@ -738,6 +763,7 @@ func TestMultiAppLimitsAndConcurrentCapacity(t *testing.T) {
 		return result
 	}
 	owner := appHeartbeat(t, registry, "owner", "bootstrap", apps("first", maxAppsPerRunner)...)
+	appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, apps("first", maxAppsPerRunner)...)
 	_, status, err := registry.Heartbeat(heartbeatRequest{RunnerID: "owner", Apps: apps("over", maxAppsPerRunner+1)}, owner.HeartbeatSecret)
 	require.Error(t, err)
 	require.Equal(t, 400, status)
@@ -786,6 +812,7 @@ func TestGeneratedAppIDCollisions(t *testing.T) {
 	defer registry.Close()
 	existing := registeredApp("app-aaaaaaaa")
 	owner := appHeartbeat(t, registry, "", "bootstrap", existing)
+	appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, existing)
 	require.Regexp(t, `^app-[a-z2-7]{8}$`, owner.RunnerID)
 	sid, _, _, _, err := registry.Reserve(existing.ID)
 	require.NoError(t, err)
@@ -820,7 +847,8 @@ func TestAppIDsCannotShadowGeneratedProxies(t *testing.T) {
 			defer server.Close()
 			victim := registeredApp("victim")
 			victim.Proxy, victim.RunnerURL = automatic, upstream.URL+"/victim"
-			appHeartbeat(t, registry, "owner-a", "bootstrap", victim)
+			owner := appHeartbeat(t, registry, "owner-a", "bootstrap", victim)
+			appHeartbeat(t, registry, "owner-a", owner.HeartbeatSecret, victim)
 			other := appHeartbeat(t, registry, "owner-b", "bootstrap")
 			sid, proxyURL, _, _, err := registry.Reserve("victim")
 			require.NoError(t, err)

@@ -96,7 +96,7 @@ async def main():
             capacity=int(sys.argv[6]),
             metadata=sys.argv[7],
             auto_detect_gpu=False,
-            heartbeat_interval_s=60,
+            heartbeat_interval_s=0.1,
         )
         print(
             json.dumps(

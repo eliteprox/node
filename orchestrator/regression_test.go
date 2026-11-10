@@ -153,6 +153,8 @@ func TestRegressionSessionPricePinnedAcrossHeartbeat(t *testing.T) {
 	request := heartbeatRequest{RunnerID: "r", RunnerURL: "http://127.0.0.1:1", App: "a", Capacity: 1, PriceInfo: priceInfo{Price: "1", Currency: "usd", Unit: "hour"}}
 	first, _, err := reg.Heartbeat(request, "bootstrap")
 	require.NoError(t, err)
+	_, _, err = reg.Heartbeat(request, first.HeartbeatSecret)
+	require.NoError(t, err)
 	sid, _, _, _, err := reg.Reserve("r")
 	require.NoError(t, err)
 	request.PriceInfo.Price = "2"

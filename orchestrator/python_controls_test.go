@@ -67,6 +67,9 @@ func TestPinnedPythonRequestSessionControls(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(startup.Bytes(), &registered), startup.Text())
 	require.NotEmpty(t, registered.RunnerID)
+	require.Eventually(t, func() bool {
+		return len(registry.Discovery()[0].Runners) == 1
+	}, 5*time.Second, 10*time.Millisecond, "Python SDK must become ready before admission")
 	client := &http.Client{Timeout: 5 * time.Second}
 	response, err := client.Post(orch.URL+"/apps/"+registered.RunnerID+"/session", "application/json", nil)
 	require.NoError(t, err)

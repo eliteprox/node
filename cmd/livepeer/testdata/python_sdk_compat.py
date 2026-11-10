@@ -36,10 +36,16 @@ async def check(orchestrator: str, runner_url: str, bootstrap: str, mode: str, p
         assert registration.runner_id
         assert registration.o2r_channel
         async with aiohttp.ClientSession() as client:
+            async with asyncio.timeout(5):
+                while True:
+                    async with client.get(f"{orchestrator}/discovery") as response:
+                        entries = await response.json()
+                    entry = next((item for group in entries for item in group.get("runners", [])
+                                  if item["app"] == "python-sdk-compat"), None)
+                    if entry is not None:
+                        break
+                    await asyncio.sleep(0.02)
             if mode == "single-shot":
-                async with client.get(f"{orchestrator}/discovery") as response:
-                    entries = await response.json()
-                entry = next(item for entry in entries for item in entry["runners"] if item["app"] == "python-sdk-compat")
                 async with client.get(entry["url"] + "/hello") as response:
                     assert response.status == 200, await response.text()
                     assert await response.text() == "from-runner"

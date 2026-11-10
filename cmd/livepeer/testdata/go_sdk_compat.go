@@ -38,6 +38,9 @@ func check(mode string, proxy bool) {
 		panic(err)
 	}
 	defer func() { _ = r.Close(context.Background()) }()
+	if err := r.Start(ctx); err != nil {
+		panic(err)
+	}
 	if mode == liverunner.ModeSingleShot {
 		response, err := http.Get(os.Args[1] + "/discovery")
 		if err != nil {

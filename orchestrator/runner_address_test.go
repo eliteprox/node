@@ -44,6 +44,11 @@ func TestRunnerFacingAddressKeepsPublicAndInternalURLsSeparate(t *testing.T) {
 	require.Equal(t, "http://runner.internal/internal", registration.Orchestrator)
 	require.Equal(t, "http://runner.internal/internal/ai/trickle/"+registration.O2R.ChannelName, registration.O2R.URL)
 	require.Empty(t, registration.O2R.InternalURL)
+	heartbeat = httptest.NewRequest(http.MethodPost, registration.Orchestrator+"/runners/heartbeat", strings.NewReader(`{"runner_id":"r","runner_url":"`+upstream.URL+`","app":"test","capacity":1}`))
+	heartbeat.Header.Set("Authorization", registration.HeartbeatSecret)
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, heartbeat)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "https://public.example/external/discovery", nil))

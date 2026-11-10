@@ -152,7 +152,7 @@ type trickleChannel struct {
 type runner struct {
 	ID, Version, Credential string
 	Last                    time.Time
-	Static                  bool
+	Static, Confirmed       bool
 	Apps                    map[string]*app
 }
 
@@ -424,6 +424,7 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 	}
 	resp := heartbeatResponse{Orchestrator: r.runnerServiceURL(), HeartbeatInterval: r.interval.String(), HeartbeatTTL: r.ttl.String()}
 	current := r.runners[req.RunnerID]
+	confirm := current != nil
 	if current == nil {
 		if !equalSecret(auth, r.secret) {
 			return heartbeatResponse{}, http.StatusUnauthorized, errors.New("invalid runner credential")
@@ -484,6 +485,7 @@ func (r *Registry) Heartbeat(req heartbeatRequest, auth string) (heartbeatRespon
 	}
 	// Nothing above this point mutates the registry, including existing prices.
 	current.Version, current.Last = req.Version, time.Now()
+	current.Confirmed = confirm
 	r.runners[current.ID] = current
 	resp.RunnerID, resp.Apps = current.ID, make([]appResponse, 0, retained)
 	for i, entry := range requests {
@@ -596,7 +598,7 @@ func (r *Registry) Discovery() []discoveryEntry {
 
 // Admission depends on readiness; admitted sessions depend only on liveness.
 func (r *Registry) usable(item *app) bool {
-	return r.serving(item) && !item.Removing && item.Status == "ready"
+	return (item.owner.Static || item.owner.Confirmed) && r.serving(item) && !item.Removing && item.Status == "ready"
 }
 
 func (r *Registry) serving(item *app) bool {

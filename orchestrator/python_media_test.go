@@ -36,7 +36,10 @@ func TestPinnedPythonMultiTrackTrickle(t *testing.T) {
 	runner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) }))
 	defer runner.Close()
 	registry := NewRegistry("bootstrap", "http://127.0.0.1:0", time.Second, 30*time.Second)
-	_, status, err := registry.Heartbeat(heartbeatRequest{RunnerID: "media-runner", RunnerURL: runner.URL, App: "media", Mode: "persistent", Capacity: 1}, "bootstrap")
+	registration := heartbeatRequest{RunnerID: "media-runner", RunnerURL: runner.URL, App: "media", Mode: "persistent", Capacity: 1}
+	registered, status, err := registry.Heartbeat(registration, "bootstrap")
+	require.NoError(t, err)
+	_, _, err = registry.Heartbeat(registration, registered.HeartbeatSecret)
 	require.NoError(t, err)
 	require.Equal(t, 200, status)
 	policy, err := destination.New("runner", []string{strings.TrimPrefix(runner.URL, "http://")})

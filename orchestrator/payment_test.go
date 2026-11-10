@@ -66,7 +66,11 @@ func TestPaidFixedSessionWithRemoteSigner(t *testing.T) {
 	require.NoError(t, err)
 	registry := NewRegistry("bootstrap", "http://127.0.0.1:8935", time.Second, 30*time.Second)
 	registry.SetWeiPerUSD(big.NewRat(10, 1))
-	resp, status, err := registry.Heartbeat(heartbeatRequest{RunnerID: "runner1", RunnerURL: "http://127.0.0.1:9000", App: "demo", Mode: "persistent", Capacity: 1, PriceInfo: priceInfo{Price: "1", Currency: "usd", Unit: "fixed"}}, "bootstrap")
+	registration := heartbeatRequest{RunnerID: "runner1", RunnerURL: "http://127.0.0.1:9000", App: "demo", Mode: "persistent", Capacity: 1, PriceInfo: priceInfo{Price: "1", Currency: "usd", Unit: "fixed"}}
+	resp, status, err := registry.Heartbeat(registration, "bootstrap")
+	require.NoError(t, err)
+	registration.RunnerID = resp.RunnerID
+	_, _, err = registry.Heartbeat(registration, resp.HeartbeatSecret)
 	require.NoError(t, err)
 	require.Equal(t, 200, status)
 	require.Equal(t, "runner1", resp.RunnerID)
@@ -341,6 +345,13 @@ func TestMultiAppPaidIsolationAndDrain(t *testing.T) {
 	a.PriceInfo = priceInfo{Price: "3600", Currency: "usd", Unit: "hour"}
 	b.Mode, b.PriceInfo = "single-shot", priceInfo{Price: "2", Currency: "usd", Unit: "fixed"}
 	owner := appHeartbeat(t, registry, "owner", "bootstrap", a, b)
+	for _, path := range []string{"/apps/live/session", "/apps/fixed/app"} {
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+	}
+	require.Empty(t, registry.sessions)
+	appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, a, b)
 	payer := crypto.PubkeyToAddress(payerKey.PublicKey)
 	request := func(method, path, payment, segment string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, nil)
@@ -439,6 +450,7 @@ func TestAppIDReuseRejectsPreviousRegistrationQuotes(t *testing.T) {
 			a := registeredApp("reused")
 			a.PriceInfo = priceInfo{Price: "3600", Currency: "usd", Unit: "hour"}
 			owner := appHeartbeat(t, registry, "old-owner", "bootstrap", a)
+			appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, a)
 			request := func(payment, segment string) *httptest.ResponseRecorder {
 				req := httptest.NewRequest(http.MethodPost, "/apps/reused/session", nil)
 				req.Header.Set("Livepeer-Payer-Address", crypto.PubkeyToAddress(key.PublicKey).Hex())
@@ -467,7 +479,8 @@ func TestAppIDReuseRejectsPreviousRegistrationQuotes(t *testing.T) {
 			if sameOwner {
 				appHeartbeat(t, registry, "old-owner", owner.HeartbeatSecret, a)
 			} else {
-				appHeartbeat(t, registry, "new-owner", "bootstrap", a)
+				fresh := appHeartbeat(t, registry, "new-owner", "bootstrap", a)
+				appHeartbeat(t, registry, "new-owner", fresh.HeartbeatSecret, a)
 			}
 			// A quote already fetched by a request must be checked again under the admission lock.
 			_, _, _, status, err := registry.reserveWithPrice("reused", old.ManifestID, &quote, "persistent")
