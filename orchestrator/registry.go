@@ -238,8 +238,8 @@ type Registry struct {
 
 const (
 	maxRunners       = 256
-	maxAppsPerRunner = 128
-	maxApps          = 512
+	maxAppsPerRunner = 512
+	maxApps          = 1024
 	maxDrainTimeout  = 12 * time.Hour
 )
 
