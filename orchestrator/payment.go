@@ -21,6 +21,10 @@ func paymentPrice(price priceInfo) (int64, bool) {
 }
 
 func (s *Server) challenge(w http.ResponseWriter, r *http.Request, appID string, quote appQuote) {
+	if status, err := s.registry.checkCapacity(appID); err != nil {
+		failReservation(w, r, status, err)
+		return
+	}
 	if s.payment == nil {
 		fail(w, http.StatusServiceUnavailable, "on-chain payment is unavailable")
 		return

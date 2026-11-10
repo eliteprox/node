@@ -623,6 +623,23 @@ func (r *Registry) ReserveWithID(id, requestedID string) (string, string, string
 	return r.reserveWithPrice(id, requestedID, nil, "")
 }
 
+// checkCapacity checks current availability without reserving a session.
+func (r *Registry) checkCapacity(id string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	item := r.apps[id]
+	if item == nil || !r.usable(item) {
+		return http.StatusNotFound, errRunnerUnavailable
+	}
+	if len(r.sessions) >= 10000 {
+		return http.StatusServiceUnavailable, errSessionCapacity
+	}
+	if len(item.Sessions) >= item.Capacity {
+		return http.StatusServiceUnavailable, errRunnerCapacity
+	}
+	return http.StatusOK, nil
+}
+
 func (r *Registry) reserveWithPrice(id, requestedID string, agreed *appQuote, mode string) (sid, app, control string, status int, result error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -344,14 +344,17 @@ func TestMultiAppPaidIsolationAndDrain(t *testing.T) {
 	a.RunnerURL, b.RunnerURL = upstream.URL, upstream.URL
 	a.PriceInfo = priceInfo{Price: "3600", Currency: "usd", Unit: "hour"}
 	b.Mode, b.PriceInfo = "single-shot", priceInfo{Price: "2", Currency: "usd", Unit: "fixed"}
-	owner := appHeartbeat(t, registry, "owner", "bootstrap", a, b)
+	a.Capacity, b.Capacity = 1, 1
+	busy := a
+	busy.ID, busy.Capacity = "busy", 10000
+	owner := appHeartbeat(t, registry, "owner", "bootstrap", a, b, busy)
 	for _, path := range []string{"/apps/live/session", "/apps/fixed/app"} {
 		w := httptest.NewRecorder()
 		server.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
 		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
 	}
 	require.Empty(t, registry.sessions)
-	appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, a, b)
+	appHeartbeat(t, registry, owner.RunnerID, owner.HeartbeatSecret, a, b, busy)
 	payer := crypto.PubkeyToAddress(payerKey.PublicKey)
 	request := func(method, path, payment, segment string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, nil)
@@ -363,10 +366,42 @@ func TestMultiAppPaidIsolationAndDrain(t *testing.T) {
 		return w
 	}
 	challenge := func(method, path string) Challenge {
-		w := request(method, path, "", "")
-		require.Equal(t, 402, w.Code, w.Body.String())
 		var challenge Challenge
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &challenge))
+		for _, busy := range []string{strings.Split(path, "/")[2], "busy"} {
+			count, capacityErr := registry.apps[busy].Capacity, errRunnerCapacity
+			if busy == "busy" {
+				capacityErr = errSessionCapacity
+			}
+			for i := range count {
+				_, _, _, _, err := registry.ReserveWithID(busy, fmt.Sprintf("held-%d", i))
+				require.NoError(t, err)
+			}
+			sessions := len(engine.sessions)
+			operations := test.MetricSum(t, registry.metrics.Registry, "payment_operations_total", nil)
+			for _, address := range []string{payer.Hex(), ""} {
+				r := httptest.NewRequest(method, path, nil)
+				r.Header.Set("Livepeer-Payer-Address", address)
+				w := httptest.NewRecorder()
+				server.ServeHTTP(w, r)
+				require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+				require.JSONEq(t, fmt.Sprintf(`{"error":%q}`, capacityErr.Error()), w.Body.String())
+			}
+			require.Len(t, engine.sessions, sessions)
+			require.Len(t, registry.sessions, count)
+			require.Equal(t, operations, test.MetricSum(t, registry.metrics.Registry, "payment_operations_total", nil))
+			require.Zero(t, test.MetricSum(t, registry.metrics.Registry, "upstream_requests_total", nil))
+			registry.ReleaseBySession("held-0")
+			w := request(method, path, "", "")
+			require.Equal(t, http.StatusPaymentRequired, w.Code, w.Body.String())
+			challenge = Challenge{}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &challenge))
+			require.NotEmpty(t, challenge.PaymentParams)
+			require.Contains(t, engine.sessions, challenge.ManifestID)
+			require.Len(t, registry.sessions, count-1, "challenges must not reserve capacity")
+			for i := 1; i < count; i++ {
+				registry.ReleaseBySession(fmt.Sprintf("held-%d", i))
+			}
+		}
 		return challenge
 	}
 	signed := func(challenge Challenge, nonces ...uint32) (string, string) {
