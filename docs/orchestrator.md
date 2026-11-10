@@ -156,3 +156,11 @@ The session channel quota is 1,024 entries, with 256 reserved for runner control
 Trickle retains five segments per channel, each capped at 10 MB (10,000,000 bytes).
 There is no global byte cap; size memory for active channels and segments. See
 the [protocol reference](../trickle/README.md) for streaming behavior.
+
+## Use a remote redeemer
+
+Set `RedeemerURL`, `OrchestratorAddress`, and any private `RedeemerGrants` to
+forward durable winning tickets without unlocking an orchestrator wallet. Keep
+the payment database and chain/pricing settings; remove local wallet and
+transaction settings. Local redemption remains the default. See the
+[standalone redeemer guide](redeemer.md) for setup, capacity, and recovery.

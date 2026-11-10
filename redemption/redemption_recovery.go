@@ -22,7 +22,9 @@ type RedemptionOptions struct {
 	MaxReplacements int
 }
 
-var defaultRedemptionOptions = RedemptionOptions{Timeout: 5 * time.Minute, MaxReplacements: 1}
+// A pre-persistence veto leaves the original transaction pending, not retryable
+// at a new nonce. Recovery must continue observing that existing identity.
+var errReplacementDeferred = errors.New("redemption replacement deferred")
 
 type redemptionRecovery struct {
 	store         *RedeemerDB
@@ -38,18 +40,6 @@ type redemptionRecovery struct {
 	stopParent    func() bool
 }
 
-// StartRedemptionRecovery binds long inclusion waits to the service lifetime,
-// independently of the bounded heartbeat contexts used to schedule tickets.
-func StartRedemptionRecovery(ctx context.Context, store *RedeemerDB, chain eth.PaymentChain, key *eth.Key, options RedemptionOptions) error {
-	if store == nil || key == nil || chain.Contracts == nil || chain.Contracts.RPC == nil {
-		return errors.New("redemption is not configured")
-	}
-	if options.Timeout <= 0 || options.MaxReplacements < 0 {
-		return errors.New("invalid redemption recovery options")
-	}
-	_, err := store.recoveryFor(ctx, chain, key, options)
-	return err
-}
 func (s *RedeemerDB) recoveryFor(ctx context.Context, chain eth.PaymentChain, key *eth.Key, options RedemptionOptions) (*redemptionRecovery, error) {
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
@@ -137,7 +127,7 @@ func (r *redemptionRecovery) prepareReplacement(ctx context.Context, previous, n
 	}
 	if r.chain.Contracts.BeforeBroadcast != nil {
 		if err := r.chain.Contracts.BeforeBroadcast(ctx, next); err != nil {
-			return err
+			return errors.Join(errReplacementDeferred, err)
 		}
 	}
 	if r.chain.Contracts.CheckRedemptionCost {
@@ -147,7 +137,7 @@ func (r *redemptionRecovery) prepareReplacement(ctx context.Context, previous, n
 		}
 		cost := new(big.Int).Mul(new(big.Int).SetUint64(next.Gas()), next.GasFeeCap())
 		if ticket.FaceValue.Cmp(cost) <= 0 {
-			return eth.ErrUneconomicalRedemption
+			return errors.Join(errReplacementDeferred, eth.ErrUneconomicalRedemption)
 		}
 	}
 	return r.store.recordTransaction(ctx, sig, identity, previous.Hash().Hex())
@@ -207,7 +197,7 @@ func (r *redemptionRecovery) completed(ctx context.Context, result *eth.Transact
 }
 func (r *redemptionRecovery) recordResult(ctx context.Context, result *eth.TransactionReceipt) error {
 	root := result.OriginHash().Hex()
-	if errors.Is(result.Error(), context.Canceled) || errors.Is(result.Error(), eth.ErrReceiptUnavailable) {
+	if errors.Is(result.Error(), context.Canceled) || errors.Is(result.Error(), eth.ErrReceiptUnavailable) || errors.Is(result.Error(), errReplacementDeferred) {
 		return nil
 	}
 	phase := "mined"
@@ -260,9 +250,6 @@ func terminalRedemption(phase string) bool {
 // uncertain sends, not permanent blockers. Failed groups remain receipt-visible.
 func (r *redemptionRecovery) resume(ctx context.Context) []error {
 	var failures []error
-	if r.store.binding == nil {
-		failures = r.reconcileUsed(ctx)
-	}
 	// Repair old reservations even when no eligible ticket triggers Next. Never
 	// reset the upstream cursor on an ambiguous pending-nonce observation.
 	floor, err := r.store.SavedNonceFloor(ctx, r.key.Address())
@@ -279,16 +266,12 @@ func (r *redemptionRecovery) resume(ctx context.Context) []error {
 	r.pendingErrors = nil
 	r.mu.Unlock()
 	query := `SELECT t.rowid,t.root_hash,t.raw_transaction,t.phase FROM winning_tickets w JOIN redemption_attempts a ON a.sig=w.sig JOIN redemption_transactions t ON t.hash=w.tx_hash WHERE a.phase IN ('prepared','broadcast','submitted','mined')`
-	var args []any
-	if r.store.binding != nil {
-		query += " AND t.rowid>?"
-		args = append(args, r.store.recoveryCursor.Load())
+	after, end, err := r.store.recoveryCursor.bounds(ctx, r.store.db)
+	if err != nil {
+		return append(failures, err)
 	}
-	query += " ORDER BY t.rowid"
-	if r.store.binding != nil {
-		query += " LIMIT 128"
-	}
-	rows, err := r.store.db.QueryContext(ctx, query, args...)
+	query += " AND t.rowid>? AND t.rowid<=? ORDER BY t.rowid LIMIT 128"
+	rows, err := r.store.db.QueryContext(ctx, query, after, end)
 
 	if err != nil {
 		return []error{err}
@@ -315,13 +298,14 @@ func (r *redemptionRecovery) resume(ctx context.Context) []error {
 	if err != nil {
 		return []error{err}
 	}
-	if r.store.binding != nil && len(jobs) == 0 {
-		r.store.recoveryCursor.Store(0)
-	}
+	visited := 0
 	for _, j := range jobs {
-		if r.store.binding != nil {
-			r.store.recoveryCursor.Store(j.id)
+		if ctx.Err() != nil {
+			failures = append(failures, ctx.Err())
+			break
 		}
+		visited++
+		r.store.recoveryCursor.after.Store(j.id)
 
 		r.mu.Lock()
 		active := r.tracking[j.root]
@@ -334,7 +318,7 @@ func (r *redemptionRecovery) resume(ctx context.Context) []error {
 		}
 		tx := new(types.Transaction)
 		err := tx.UnmarshalBinary(j.raw)
-		if err == nil && r.store.binding != nil && j.phase == "mined" {
+		if err == nil && j.phase == "mined" {
 			receipt, e := r.chain.InclusionReceipt(ctx, tx.Hash())
 			if e == nil && receipt != nil {
 				r.mu.Lock()
@@ -376,69 +360,9 @@ func (r *redemptionRecovery) resume(ctx context.Context) []error {
 			r.mu.Unlock()
 		}
 	}
+	r.store.recoveryCursor.finish(visited == len(jobs) && len(jobs) < 128)
 	return failures
 }
 
 // Keep this adapter's interface narrow despite geth's broader embedded readers.
 var _ ethereum.TransactionSender = (*redemptionRecovery)(nil)
-
-// A latest-state used ticket pauses the upstream queue. Settlement remains pinned
-// to finalized state; a reorg that removes that use makes the ticket retryable.
-func (r *redemptionRecovery) reconcileUsed(ctx context.Context) []error {
-	rows, err := r.store.db.QueryContext(ctx, `SELECT sig,phase FROM redemption_attempts a WHERE phase IN ('awaiting_finality','mined') OR (phase='reverted' AND EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=a.sig AND t.phase NOT IN ('confirmed','reverted','superseded')))`)
-	if err != nil {
-		return []error{err}
-	}
-	type waiting struct {
-		sig   []byte
-		phase string
-	}
-	var signatures []waiting
-	for rows.Next() {
-		var item waiting
-		if err := rows.Scan(&item.sig, &item.phase); err != nil {
-			rows.Close()
-			return []error{err}
-		}
-		signatures = append(signatures, item)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return []error{err}
-	}
-	var failures []error
-	for _, item := range signatures {
-		sig := item.sig
-		ticket, err := r.store.winningTicket(ctx, sig)
-		if err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		used, _, err := r.chain.TicketUse(ctx, ticket.Hash(), "latest")
-		if err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		phase := "retryable"
-		var observation eth.ChainSnapshot
-		if !used && item.phase != "awaiting_finality" {
-			continue
-		}
-		if used {
-			finalized, evidence, err := r.chain.TicketUse(ctx, ticket.Hash(), "finalized")
-			if err != nil {
-				failures = append(failures, err)
-				continue
-			}
-			if !finalized {
-				continue
-			}
-			phase, observation = "used", evidence
-		}
-		if err := r.store.setTicketPhase(ctx, sig, phase, observation); err != nil {
-			failures = append(failures, err)
-		}
-	}
-	return failures
-}

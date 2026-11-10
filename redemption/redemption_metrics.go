@@ -5,11 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/livepeer/node/eth"
 	"math/big"
 	"os"
 	"time"
 
+	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/observability"
 )
 
@@ -62,7 +62,7 @@ type redemptionStats struct {
 }
 
 func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats, err error) {
-	stats = redemptionStats{tickets: map[string]int{"waiting": 0, "eligible": 0, "in_flight": 0, "awaiting_finality": 0, "unknown": 0}, transactions: map[string]int{}, oldestTickets: map[string]float64{}, oldestTransactions: map[string]float64{}}
+	stats = redemptionStats{tickets: map[string]int{"waiting": 0, "eligible": 0, "in_flight": 0, "awaiting_finality": 0, "rejected": 0, "blocked": 0, "unknown": 0}, transactions: map[string]int{}, oldestTickets: map[string]float64{}, oldestTransactions: map[string]float64{}}
 	for state := range stats.tickets {
 		stats.oldestTickets[state] = 0
 	}
@@ -86,10 +86,7 @@ func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats
 		}
 	}
 
-	query := `SELECT COALESCE(w.enqueued_at,''),w.params_expiration_block,w.creation_round,COALESCE(a.phase,'') FROM winning_tickets w LEFT JOIN redemption_attempts a ON a.sig=w.sig WHERE w.redeemed_at IS NULL AND COALESCE(a.phase,'') NOT IN ('confirmed','used','expired','invalid','reverted')`
-	if s.binding != nil {
-		query = `SELECT COALESCE(w.enqueued_at,''),w.params_expiration_block,w.creation_round,CASE WHEN a.phase IN ('prepared','broadcast','submitted','mined') THEN a.phase ELSE t.delivery END FROM ticket_state t JOIN winning_tickets w ON w.sig=t.sig LEFT JOIN redemption_attempts a ON a.sig=w.sig WHERE t.settled=0`
-	}
+	query := `SELECT COALESCE(w.enqueued_at,''),w.params_expiration_block,w.creation_round,COALESCE(a.phase,t.delivery) FROM ticket_state t JOIN winning_tickets w ON w.sig=t.sig LEFT JOIN redemption_attempts a ON a.sig=w.sig WHERE t.settled=0`
 	rows, err := tx.QueryContext(ctx, query)
 
 	if err != nil {
@@ -107,6 +104,10 @@ func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats
 			state = "in_flight"
 		case "awaiting_finality", "acknowledged":
 			state = "awaiting_finality"
+		case "rejected":
+			state = "rejected"
+		case "reverted", "invalid":
+			state = "blocked"
 		default:
 			if block != nil && round != nil {
 				end, ok := new(big.Int).SetString(expiry, 10)
@@ -114,12 +115,9 @@ func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats
 					rows.Close()
 					return stats, fmt.Errorf("invalid ticket expiry")
 				}
-				if s.binding != nil && clock.TicketExpired(creation) {
+				if clock.TicketExpired(creation) {
 					state = "awaiting_finality"
 					break
-				}
-				if s.binding == nil && creation < round.Int64()-2 {
-					continue
 				}
 				state = "eligible"
 				if end.Cmp(block) > 0 {

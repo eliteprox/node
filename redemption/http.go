@@ -94,7 +94,7 @@ func Handler(s *RedeemerDB) http.Handler {
 		case slots <- struct{}{}:
 			defer func() { <-slots }()
 		default:
-			http.Error(w, "ticket admission busy", 503)
+			http.Error(w, "ticket admission busy", http.StatusServiceUnavailable)
 			return
 		}
 		var req TicketRequest
@@ -189,7 +189,7 @@ func (d *HTTPDestination) Submit(ctx context.Context, t *pm.SignedTicket) error 
 		return errors.New("redeemer request unavailable")
 	}
 	defer res.Body.Close()
-	if res.StatusCode >= 400 && res.StatusCode < 500 && res.StatusCode != 408 && res.StatusCode != 429 {
+	if res.StatusCode == http.StatusConflict {
 		return &Rejection{res.StatusCode}
 	}
 	if res.StatusCode != 202 {

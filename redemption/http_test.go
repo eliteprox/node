@@ -5,12 +5,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,7 +48,7 @@ func boundStore(t *testing.T, role, target string, limits Limits) (*RedeemerDB, 
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	b := Binding{ChainID: "1", Controller: common.HexToAddress("0x1000"), Role: role, Destination: target}
-	require.NoError(t, s.Bind(t.Context(), b, limits))
+	require.NoError(t, s.Bind(t.Context(), b, limits, nil))
 	return s, b
 }
 
@@ -94,19 +96,14 @@ func TestHTTPAdmissionIdentityCapacityAndScope(t *testing.T) {
 	require.Equal(t, 400, bad.Code)
 	changed := b
 	changed.Controller = common.HexToAddress("0x999")
-	require.ErrorContains(t, s.Bind(t.Context(), changed, DefaultLimits), "mismatch")
+	require.ErrorContains(t, s.Bind(t.Context(), changed, DefaultLimits, nil), "mismatch")
 	changed = b
 	changed.Destination = "http://elsewhere.example"
-	require.ErrorContains(t, s.Bind(t.Context(), changed, DefaultLimits), "drain")
+	require.ErrorContains(t, s.Bind(t.Context(), changed, DefaultLimits, nil), "drain")
 }
 
-func TestHashBackfillPreservesAlternativeSignature(t *testing.T) {
-	s, err := OpenRedeemerDB(filepath.Join(t.TempDir(), "legacy.sqlite"))
-	require.NoError(t, err)
-	defer s.Close()
-	ticket, key := winningTicket(t, 1)
-	require.NoError(t, s.StoreWinningTicket(ticket))
-	original := bytes.Clone(ticket.Sig)
+func signAlternativeTicket(t *testing.T, ticket *pm.SignedTicket, key *ecdsa.PrivateKey) {
+	t.Helper()
 	r, ss, err := ecdsa.Sign(rand.Reader, key, accounts.TextHash(ticket.Hash().Bytes()))
 	require.NoError(t, err)
 	half := new(big.Int).Rsh(new(big.Int).Set(crypto.S256().Params().N), 1)
@@ -124,7 +121,17 @@ func TestHashBackfillPreservesAlternativeSignature(t *testing.T) {
 	}
 	ticket.Sig = sig
 	require.NoError(t, ValidateTicket(ticket))
-	require.NotEqual(t, original, sig)
+}
+
+func TestHashBackfillPreservesAlternativeSignature(t *testing.T) {
+	s, err := OpenRedeemerDB(filepath.Join(t.TempDir(), "legacy.sqlite"))
+	require.NoError(t, err)
+	defer s.Close()
+	ticket, key := winningTicket(t, 1)
+	require.NoError(t, s.StoreWinningTicket(ticket))
+	original := bytes.Clone(ticket.Sig)
+	signAlternativeTicket(t, ticket, key)
+	require.NotEqual(t, original, ticket.Sig)
 	require.NoError(t, s.StoreWinningTicket(ticket))
 	_, err = s.db.Exec("UPDATE winning_tickets SET ticket_hash=NULL")
 	require.NoError(t, err)
@@ -137,104 +144,117 @@ func TestHashBackfillPreservesAlternativeSignature(t *testing.T) {
 	require.NoError(t, s.db.QueryRow("SELECT count(*) FROM ticket_state").Scan(&identities))
 	require.Equal(t, 2, rows)
 	require.Equal(t, 1, identities)
-	require.NoError(t, s.Bind(t.Context(), Binding{"1", common.HexToAddress("0x1000"), "orchestrator", "chain"}, DefaultLimits))
+	require.NoError(t, s.Bind(t.Context(), Binding{"1", common.HexToAddress("0x1000"), "orchestrator", "chain"}, DefaultLimits, nil))
 	require.NoError(t, s.Admit(t.Context(), ticket))
 }
 
 func TestRemoteDeliveryLostAcknowledgmentAndKeylessSettlement(t *testing.T) {
-	f := newRecoveryRPC(t)
-	chain := f.Chain(t)
-	serverStore, _ := boundStore(t, "redeemer", "chain", DefaultLimits)
-	first := true
-	handler := Handler(serverStore)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if first {
-			first = false
-			record := httptest.NewRecorder()
-			handler.ServeHTTP(record, r)
-			require.Equal(t, 202, record.Code)
-			http.Error(w, "lost acknowledgment", 503)
-			return
-		}
-		handler.ServeHTTP(w, r)
-	}))
-	defer server.Close()
-	s, b := boundStore(t, "orchestrator", server.URL, DefaultLimits)
-	u, err := url.Parse(server.URL)
-	require.NoError(t, err)
-	policy, err := destination.New("redeemer", []string{"127.0.0.1", "::1"})
-	require.NoError(t, err)
-	remote, err := NewHTTPDestination(u, policy, b)
-	require.NoError(t, err)
-	defer remote.Close()
-	ticket, _ := winningTicket(t, 1)
-	require.NoError(t, s.Admit(t.Context(), ticket))
-	worker, err := NewWorker(s, chain, remote)
-	require.NoError(t, err)
-	require.NotEmpty(t, worker.Process(t.Context()))
-	var exposed int
-	var delivery string
-	require.NoError(t, s.db.QueryRow("SELECT exposed,delivery FROM ticket_state").Scan(&exposed, &delivery))
-	require.Equal(t, 1, exposed)
-	require.Equal(t, "retryable", delivery)
-	var seq int
-	var name, path string
-	require.NoError(t, s.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path))
-	require.NoError(t, s.Close())
-	s, err = OpenRedeemerDB(path)
-	require.NoError(t, err)
-	defer s.Close()
-	require.NoError(t, s.Bind(t.Context(), b, DefaultLimits))
-	_, err = s.db.Exec("UPDATE ticket_state SET next_attempt=0")
-	require.NoError(t, err)
-	worker, err = NewWorker(s, chain, remote)
-	require.NoError(t, err)
-	require.Empty(t, worker.Process(t.Context()))
-	require.Nil(t, s.recovery, "remote mode does not create a wallet recovery manager")
-	var count int
-	require.NoError(t, serverStore.db.QueryRow("SELECT count(*) FROM winning_tickets").Scan(&count))
-	require.Equal(t, 1, count)
-	key := recoveryKey(t)
-	f.Mu.Lock()
-	f.Wallet = key.Address()
-	f.Tickets = append(f.Tickets, ticket)
-	f.Finalized = false
-	f.Mu.Unlock()
-	serverChain := f.Chain(t)
-	serverChain.Contracts.CheckRedemptionCost = true
-	serverChain.Contracts.BeforeBroadcast = StandalonePolicy(serverChain, big.NewInt(1))
-	chainDest, err := NewChainDestination(t.Context(), serverStore, serverChain, key, big.NewInt(1), RedemptionOptions{Timeout: time.Hour})
-	require.NoError(t, err)
-	serverWorker, err := NewWorker(serverStore, serverChain, chainDest)
-	require.NoError(t, err)
-	require.Empty(t, serverWorker.Process(t.Context()))
-	require.Len(t, f.Transactions(), 1)
-	f.Mine(f.Transactions()[0], true)
-	_, err = s.db.Exec("UPDATE ticket_state SET next_attempt=0")
-	require.NoError(t, err)
-	require.Empty(t, worker.Process(t.Context()))
-	var settled int
-	require.NoError(t, s.db.QueryRow("SELECT settled FROM ticket_state").Scan(&settled))
-	require.Zero(t, settled, "unfinalized use retains liability")
-	f.Mu.Lock()
-	f.Finalized = true
-	f.Mu.Unlock()
-	_, err = s.db.Exec("UPDATE ticket_state SET next_attempt=0")
-	require.NoError(t, err)
-	require.Empty(t, worker.Process(t.Context()))
-	require.NoError(t, s.db.QueryRow("SELECT settled FROM ticket_state").Scan(&settled))
-	require.Equal(t, 1, settled)
-	var floor int64
-	require.NoError(t, s.db.QueryRow("SELECT number FROM collateral_watermark").Scan(&floor))
-	require.EqualValues(t, 100, floor)
+	for _, status := range []int{503, 401} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			f := newRecoveryRPC(t)
+			chain := f.Chain(t)
+			serverStore, _ := boundStore(t, "redeemer", "chain", DefaultLimits)
+			first := true
+			handler := Handler(serverStore)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if first {
+					first = false
+					if status == 503 {
+						record := httptest.NewRecorder()
+						handler.ServeHTTP(record, r)
+						require.Equal(t, 202, record.Code)
+					}
+					http.Error(w, "temporary delivery failure", status)
+					return
+				}
+				handler.ServeHTTP(w, r)
+			}))
+			defer server.Close()
+			s, b := boundStore(t, "orchestrator", server.URL, DefaultLimits)
+			u, err := url.Parse(server.URL)
+			require.NoError(t, err)
+			policy, err := destination.New("redeemer", []string{"127.0.0.1", "::1"})
+			require.NoError(t, err)
+			remote, err := NewHTTPDestination(u, policy, b)
+			require.NoError(t, err)
+			defer remote.Close()
+			ticket, _ := winningTicket(t, 1)
+			require.NoError(t, s.Admit(t.Context(), ticket))
+			worker, err := NewWorker(s, chain, remote)
+			require.NoError(t, err)
+			require.NotEmpty(t, worker.Process(t.Context()))
+			var exposed int
+			var delivery string
+			require.NoError(t, s.db.QueryRow("SELECT exposed,delivery FROM ticket_state").Scan(&exposed, &delivery))
+			require.Equal(t, 1, exposed)
+			require.Equal(t, "retryable", delivery)
+			var seq int
+			var name, path string
+			require.NoError(t, s.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path))
+			require.NoError(t, s.Close())
+			s, err = OpenRedeemerDB(path)
+			require.NoError(t, err)
+			defer s.Close()
+			require.NoError(t, s.Bind(t.Context(), b, DefaultLimits, nil))
+			_, err = s.db.Exec("UPDATE ticket_state SET next_attempt=0")
+			require.NoError(t, err)
+			worker, err = NewWorker(s, chain, remote)
+			require.NoError(t, err)
+			require.Empty(t, worker.Process(t.Context()))
+			require.Nil(t, s.recovery, "remote mode does not create a wallet recovery manager")
+			var count int
+			require.NoError(t, serverStore.db.QueryRow("SELECT count(*) FROM winning_tickets").Scan(&count))
+			require.Equal(t, 1, count)
+			key := recoveryKey(t)
+			f.Mu.Lock()
+			f.Wallet = key.Address()
+			f.Tickets[ticket.Hash()] = ticket.RecipientRandHash
+			f.Finalized = false
+			f.Mu.Unlock()
+			serverChain := f.Chain(t)
+			serverChain.Contracts.CheckRedemptionCost = true
+			serverChain.Contracts.BeforeBroadcast = StandalonePolicy(serverChain, big.NewInt(1))
+			chainDest, err := NewChainDestination(t.Context(), serverStore, serverChain, key, big.NewInt(1), RedemptionOptions{Timeout: time.Hour})
+			require.NoError(t, err)
+			serverWorker, err := NewWorker(serverStore, serverChain, chainDest)
+			require.NoError(t, err)
+			require.Empty(t, serverWorker.Process(t.Context()))
+			require.Len(t, f.Transactions(), 1)
+			f.Mine(f.Transactions()[0], true)
+			_, err = s.db.Exec("UPDATE ticket_state SET next_attempt=0")
+			require.NoError(t, err)
+			require.Empty(t, worker.Process(t.Context()))
+			var settled int
+			require.NoError(t, s.db.QueryRow("SELECT settled FROM ticket_state").Scan(&settled))
+			require.Zero(t, settled, "unfinalized use retains liability")
+			f.Mu.Lock()
+			f.Finalized = true
+			f.Mu.Unlock()
+			_, err = s.db.Exec("UPDATE ticket_state SET next_attempt=0")
+			require.NoError(t, err)
+			require.Empty(t, worker.Process(t.Context()))
+			require.NoError(t, s.db.QueryRow("SELECT settled FROM ticket_state").Scan(&settled))
+			require.Equal(t, 1, settled)
+			var floor int64
+			require.NoError(t, s.db.QueryRow("SELECT number FROM collateral_watermark").Scan(&floor))
+			require.EqualValues(t, 100, floor)
+		})
+	}
 }
 
 func TestHTTPDestinationRejectsRedirectsAndBadAcknowledgments(t *testing.T) {
 	ticket, _ := winningTicket(t, 1)
-	for _, status := range []int{202, 302, 400, 409, 503} {
+	var redirected atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(TicketResponse{ticket.Hash()})
+	}))
+	defer target.Close()
+	for _, status := range []int{202, 302, 307, 308, 400, 401, 403, 404, 405, 408, 409, 429, 503} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Location", "http://127.0.0.1:1/secret")
+				w.Header().Set("Location", target.URL+"/ticket")
 				w.WriteHeader(status)
 				_, _ = io.WriteString(w, `{"ticket_hash":"0x`+string(bytes.Repeat([]byte("0"), 64))+`"}`)
 			}))
@@ -248,9 +268,12 @@ func TestHTTPDestinationRejectsRedirectsAndBadAcknowledgments(t *testing.T) {
 			defer d.Close()
 			err = d.Submit(t.Context(), ticket)
 			require.Error(t, err)
-			if status == 400 || status == 409 {
-				var rejection *Rejection
+			require.Zero(t, redirected.Load(), "the second server must never receive a redirect")
+			var rejection *Rejection
+			if status == 409 {
 				require.ErrorAs(t, err, &rejection)
+			} else {
+				require.False(t, errors.As(err, &rejection))
 			}
 		})
 	}

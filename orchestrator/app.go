@@ -211,8 +211,8 @@ func Root(out, errOut io.Writer) *cobra.Command {
 		RedeemerDB string `persistent:"true" file:"optional" default:"payments.sqlite"`
 	}
 	storage := new(storageParams)
-	migrate := migrations.Command(nodeconfig.Command("orchestrator", nodeconfig.Mainnet, boa.Cmd[storageParams]{Params: storage}, &storage.ConfigFile), &storage.RedeemerDB, redeemerMigrationFiles, openRedeemerDB)
-	cmd.AddCommand(redemptionCommand(), migrate)
+	migrate := migrations.Command(nodeconfig.Command("orchestrator", nodeconfig.Mainnet, boa.Cmd[storageParams]{Params: storage}, &storage.ConfigFile), &storage.RedeemerDB, redemption.MigrationFiles, redemption.OpenDatabase)
+	cmd.AddCommand(redemption.Command("orchestrator", "payments.sqlite"), migrate)
 	cmd.InitDefaultCompletionCmd()
 	return cmd
 }
@@ -287,6 +287,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	registry.runnerService = strings.TrimRight(p.RunnerServiceURL.String(), "/")
 	var engine *PaymentEngine
 	var redeemerDB *RedeemerDB
+	var redemptionWorker *redemption.Worker
 	var paymentChain eth.PaymentChain
 	var observedChain eth.PaymentChain
 	var redeemerKey *eth.Key
@@ -321,6 +322,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		if p.RedeemerMaxFeePerGas != nil {
 			contracts.MaxFeePerGas = p.RedeemerMaxFeePerGas.ToBig()
 		}
+		contracts.CheckRedemptionCost = true
 		paymentChain = eth.PaymentChain{Contracts: contracts}
 		observedChain = paymentChain
 		if p.ETHUSDFeed != nil {
@@ -347,7 +349,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 			}
 			target = u.String()
 		}
-		if err := redeemerDB.Bind(parent, redemption.Binding{ChainID: paymentChainID.String(), Controller: *p.Controller, Role: "orchestrator", Destination: target}, redemption.Limits{Pending: p.MaxPendingTickets, PerRecipient: p.MaxTicketsPerRecipient}); err != nil {
+		if err := redeemerDB.Bind(parent, redemption.Binding{ChainID: paymentChainID.String(), Controller: *p.Controller, Role: "orchestrator", Destination: target}, redemption.Limits{Pending: p.MaxPendingTickets, PerRecipient: p.MaxTicketsPerRecipient}, paymentChain); err != nil {
 			return err
 		}
 		observedChain.Observer = eth.NewPaymentObserver(paymentChain, p.Network == nodeconfig.Mainnet, recipient)
@@ -429,8 +431,9 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 			}
 			target = local
 		}
-		if _, e := redemption.NewWorker(redeemerDB.RedeemerDB, paymentChain, target); e != nil {
-			return e
+		redemptionWorker, err = redemption.NewWorker(redeemerDB.RedeemerDB, paymentChain, target)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -485,7 +488,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 			}
 		})
 		startWorker(p.HeartbeatInterval, 30*time.Second, func(ctx context.Context) {
-			failures := ProcessRedemptions(ctx, redeemerDB, paymentChain, redeemerKey, paymentChainID)
+			failures := redemptionWorker.Process(ctx)
 			for _, err := range failures {
 				registry.metrics.Add("redemption_errors_total", 1, observability.Labels{"error_kind": observability.ErrorKind(err)})
 				logger.Error("redemption failed", "event", "redemption_pass", "operation", "redeem", "outcome", "error", "error_kind", observability.ErrorKind(err))

@@ -24,12 +24,6 @@ type RedeemerDB struct {
 	readiness *paidReadiness
 }
 
-var redeemerMigrationFiles = redemption.MigrationFiles
-var openRedeemerDB = redemption.OpenDatabase
-
-type RedemptionOptions = redemption.RedemptionOptions
-type RedemptionStatus = redemption.RedemptionStatus
-
 func OpenRedeemerDB(path string) (*RedeemerDB, error) {
 	db, err := redemption.OpenDatabase(context.Background(), path, true)
 	if err != nil {
@@ -56,44 +50,16 @@ func (s *RedeemerDB) configure() {
 	})
 }
 
-func (s *RedeemerDB) collectMetrics(emit observability.Emit) { s.RedeemerDB.CollectMetrics(emit) }
-func (s *RedeemerDB) checkStorage(ctx context.Context) error { return s.CheckStorage(ctx) }
-func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer common.Address, randHash common.Hash, minRound int64, collateral *big.Int, tickets []*pm.SignedTicket, snapshot pm.ChainSnapshot) error {
-	err := s.StoreWinningTickets(ctx, payer, randHash, minRound, collateral, tickets, snapshot)
+func (s *RedeemerDB) storeWinningTickets(ctx context.Context, payer common.Address, randHash common.Hash, collateral *big.Int, tickets []*pm.SignedTicket, snapshot pm.ChainSnapshot) error {
+	err := s.StoreWinningTickets(ctx, payer, randHash, collateral, tickets, snapshot)
 	if errors.Is(err, redemption.ErrExposedRandomness) {
 		return ErrInvalidPayment
+	}
+	if errors.Is(err, redemption.ErrCapacity) {
+		return errPaymentTicketCapacity
 	}
 	if errors.Is(err, eth.ErrObservationUnavailable) {
 		return paymentObservation{err, "error"}
 	}
 	return err
-}
-
-func (s *RedeemerDB) shared() *redemption.RedeemerDB {
-	if s == nil {
-		return nil
-	}
-	return s.RedeemerDB
-}
-
-func StartRedemptionRecovery(ctx context.Context, s *RedeemerDB, c eth.PaymentChain, k *eth.Key, o RedemptionOptions) error {
-	return redemption.StartRedemptionRecovery(ctx, s.shared(), c, k, o)
-}
-func ProcessRedemptions(ctx context.Context, s *RedeemerDB, c eth.PaymentChain, k *eth.Key, id *big.Int) []error {
-	return redemption.ProcessRedemptions(ctx, s.shared(), c, k, id)
-}
-func RetryRedemption(ctx context.Context, s *RedeemerDB, c *eth.Contracts, h common.Hash) error {
-	return redemption.RetryRedemption(ctx, s.shared(), c, h)
-}
-
-// Retain the orchestrator's exported queue entry points for callers upgrading
-// alongside the shared implementation.
-type ReceiptReader = redemption.ReceiptReader
-type SubmittedRedemption = redemption.SubmittedRedemption
-
-func ReconcileSubmitted(ctx context.Context, s *RedeemerDB, c ReceiptReader) []error {
-	return redemption.ReconcileSubmitted(ctx, s.shared(), c)
-}
-func RedeemPending(ctx context.Context, s *RedeemerDB, c eth.PaymentChain, k *eth.Key, id *big.Int, snapshot eth.ChainSnapshot) []error {
-	return redemption.RedeemPending(ctx, s.shared(), c, k, id, snapshot)
 }

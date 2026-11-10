@@ -334,7 +334,7 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 		}
 	}
 	balance := new(big.Rat).Add(session.balance, batchCredit)
-	if err := e.store.storeWinningTickets(ctx, payer, params.RecipientRandHash, snapshot.Round.Int64()-2, new(big.Int).Add(funds.Deposit, funds.Reserve), winners, snapshot); err != nil {
+	if err := e.store.storeWinningTickets(ctx, payer, params.RecipientRandHash, new(big.Int).Add(funds.Deposit, funds.Reserve), winners, snapshot); err != nil {
 		return ethcommon.Address{}, nil, err
 	}
 	if previous == nil {

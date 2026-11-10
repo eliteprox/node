@@ -87,16 +87,12 @@ func Command(component, defaultDB string) *cobra.Command {
 			}
 			defer store.Close()
 			if p.Retry != nil {
-				contracts := &eth.Contracts{RPC: rpc}
+				if store.binding == nil || store.binding.Role != component || store.binding.ChainID != new(big.Int).SetUint64(*p.ChainID).String() {
+					return errors.New("redemption database deployment or role mismatch")
+				}
+				contracts := &eth.Contracts{RPC: rpc, Controller: store.binding.Controller}
 				if component == "redeemer" {
-					binding, err := store.Binding(cmd.Context())
-					if err != nil {
-						return err
-					}
-					if binding.Role != "redeemer" || binding.ChainID != new(big.Int).SetUint64(*p.ChainID).String() {
-						return errors.New("redemption database deployment or role mismatch")
-					}
-					contracts, err = eth.NewContracts(rpc, binding.Controller)
+					contracts, err = eth.NewContracts(rpc, store.binding.Controller)
 					if err != nil {
 						return err
 					}

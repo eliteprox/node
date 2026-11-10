@@ -184,7 +184,7 @@ func (s *Server) SetPayment(engine *PaymentEngine) {
 		if engine.store.metrics == nil {
 			engine.store.metrics = s.registry.metrics
 			engine.store.configure()
-			engine.store.metrics.Snapshot(engine.store.collectMetrics)
+			engine.store.metrics.Snapshot(engine.store.CollectMetrics)
 		}
 	}
 }

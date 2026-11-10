@@ -15,5 +15,7 @@
 !nodeconfig/
 !orchestrator/
 !pm/
+!redeemer/
+!redemption/
 !signer/
 !trickle/

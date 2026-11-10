@@ -1,4 +1,4 @@
-package redemptiontest
+package test
 
 import (
 	"encoding/hex"
@@ -14,13 +14,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/livepeer/node/eth"
-	"github.com/livepeer/node/internal/test"
-	"github.com/livepeer/node/pm"
-	"github.com/stretchr/testify/require"
 )
 
-// recoveryRPC models independent clients against one account's pending Pool.
+// RedemptionRPC models independent clients against one account's pending pool.
 // All mutable RPC state is synchronized so the same scenarios run under -race.
 type RedemptionRPC struct {
 	StaleNonceValue                         uint64
@@ -35,7 +31,7 @@ type RedemptionRPC struct {
 	ActiveRecipient                         common.Address
 	OnSend                                  func(*types.Transaction)
 	Mu                                      sync.Mutex
-	Tickets                                 []*pm.SignedTicket
+	Tickets                                 map[common.Hash]common.Hash // ticket hash -> randomness hash
 	Sent                                    []*types.Transaction
 	Pool                                    map[uint64]*types.Transaction
 	Receipts                                map[common.Hash]*types.Receipt
@@ -50,23 +46,23 @@ type RedemptionRPC struct {
 	MineAfter                               int
 	NonceReads                              int
 	ContractCalls                           int
+	GasEstimates                            int
 	RejectSend                              int
 	NonceBarrier                            chan struct{}
 	ReceiptHeader                           *types.Header
 	Server                                  *httptest.Server
 }
 
-// CollateralSnapshot is the same canonical execution identity served by the fixture.
-func (f *RedemptionRPC) CollateralSnapshot() eth.ChainSnapshot {
+// Header returns the same latest execution header served by the fixture.
+func (f *RedemptionRPC) Header() *types.Header {
 	f.Mu.Lock()
 	defer f.Mu.Unlock()
-	header := &types.Header{Number: big.NewInt(f.Block), Difficulty: new(big.Int), BaseFee: big.NewInt(100)}
-	return eth.ChainSnapshot{Number: header.Number, BlockHash: header.Hash()}
+	return &types.Header{Number: big.NewInt(f.Block), Difficulty: new(big.Int), BaseFee: big.NewInt(100)}
 }
 
 func NewRedemptionRPC(t *testing.T) *RedemptionRPC {
 	t.Helper()
-	f := &RedemptionRPC{Pool: map[uint64]*types.Transaction{}, Receipts: map[common.Hash]*types.Receipt{}, Used: map[common.Hash]bool{}, Finalized: true, Block: 100, Round: 1, Validity: 3, FinalizedRound: 1, ReceiptHeader: &types.Header{Number: big.NewInt(10), Difficulty: new(big.Int), BaseFee: big.NewInt(100)}}
+	f := &RedemptionRPC{Tickets: map[common.Hash]common.Hash{}, Pool: map[uint64]*types.Transaction{}, Receipts: map[common.Hash]*types.Receipt{}, Used: map[common.Hash]bool{}, Finalized: true, Block: 100, Round: 1, Validity: 3, FinalizedRound: 1, ReceiptHeader: &types.Header{Number: big.NewInt(10), Difficulty: new(big.Int), BaseFee: big.NewInt(100)}}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.Serve))
 	t.Cleanup(f.Server.Close)
 	return f
@@ -151,6 +147,7 @@ func (f *RedemptionRPC) Serve(w http.ResponseWriter, r *http.Request) {
 		}
 		result = header
 	case "eth_estimateGas":
+		f.GasEstimates++
 		failure = f.PrepareError
 		result = "0x5208"
 	case "eth_maxPriorityFeePerGas":
@@ -284,9 +281,9 @@ func (f *RedemptionRPC) MineLocked(tx *types.Transaction, success bool) {
 	}
 	f.Receipts[tx.Hash()] = &types.Receipt{TxHash: tx.Hash(), Status: status, BlockNumber: big.NewInt(10), BlockHash: f.ReceiptHeader.Hash(), Logs: []*types.Log{}}
 	if success {
-		for _, ticket := range f.Tickets {
-			if strings.Contains(hex.EncodeToString(tx.Data()), hex.EncodeToString(ticket.RecipientRandHash[:])) {
-				f.Used[ticket.Hash()] = true
+		for hash, randomness := range f.Tickets {
+			if strings.Contains(hex.EncodeToString(tx.Data()), hex.EncodeToString(randomness[:])) {
+				f.Used[hash] = true
 			}
 		}
 	}
@@ -300,20 +297,4 @@ func (f *RedemptionRPC) Mine(tx *types.Transaction, success bool) {
 	f.Mu.Lock()
 	defer f.Mu.Unlock()
 	f.MineLocked(tx, success)
-}
-func (f *RedemptionRPC) Chain(t *testing.T) eth.PaymentChain {
-	t.Helper()
-	rpc, err := eth.OpenRPC(f.Server.URL)
-	require.NoError(t, err)
-	t.Cleanup(rpc.Close)
-	c, err := eth.NewContracts(rpc, common.HexToAddress("0x1000"))
-	require.NoError(t, err)
-	return eth.PaymentChain{Contracts: c}
-}
-func RedemptionKey(t *testing.T) *eth.Key {
-	t.Helper()
-	path, password := test.WriteFixedKeystore(t)
-	key, err := eth.OpenKeystoreFile(path, password)
-	require.NoError(t, err)
-	return key
 }

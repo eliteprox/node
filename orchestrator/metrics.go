@@ -146,7 +146,7 @@ func (p *paidReadiness) ready(registry *Registry) bool {
 
 func (p *paidReadiness) check(ctx context.Context, store *RedeemerDB, chain eth.PaymentChain, engine *PaymentEngine, metrics *observability.Metrics, logger *slog.Logger) {
 	dbCtx, cancel := context.WithTimeout(ctx, time.Second)
-	storageErr := store.checkStorage(dbCtx)
+	storageErr := store.CheckStorage(dbCtx)
 	if storageErr == nil {
 		available, err := store.CapacityAvailable(dbCtx, engine.recipient)
 		if err != nil {

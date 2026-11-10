@@ -8,7 +8,6 @@ import (
 	"math"
 	"math/big"
 	"strconv"
-	"strings"
 	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
@@ -102,13 +101,15 @@ type RedemptionStatus struct {
 }
 
 func (s *RedeemerDB) Redemptions() ([]RedemptionStatus, error) {
-	query := `SELECT hash,phase,error FROM (
+	// Legacy redeemed_at backfills have no label; their settled outcome is use.
+	query := `WITH represented AS (
+ SELECT * FROM ticket_state s WHERE (delivery!='queued' OR settled=1) AND NOT EXISTS(SELECT 1 FROM redemption_transactions t JOIN winning_tickets w ON w.sig=t.sig WHERE w.ticket_hash=s.hash)
+) SELECT hash,phase,error FROM (
  SELECT hash,CASE WHEN phase='sending' THEN 'broadcast' ELSE phase END AS phase,COALESCE(error,'') AS error,rowid AS sequence FROM redemption_transactions
- UNION ALL SELECT '',phase,COALESCE(error,''),9223372036854775807 FROM redemption_attempts a WHERE a.phase IN ('used','awaiting_finality') OR NOT EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=a.sig)) ORDER BY sequence`
-	if s.binding != nil {
-		query = strings.Replace(query, " UNION ALL SELECT '',phase", ` UNION ALL SELECT '0x'||lower(hex(hash)),CASE WHEN settled=1 THEN settlement ELSE delivery END,'',9223372036854775806 FROM ticket_state s WHERE delivery!='queued' AND NOT EXISTS(SELECT 1 FROM redemption_transactions t JOIN winning_tickets w ON w.sig=t.sig WHERE w.ticket_hash=s.hash)
- UNION ALL SELECT '',phase`, 1)
-	}
+ UNION ALL SELECT '0x'||lower(hex(hash)),CASE WHEN settled=1 THEN COALESCE(NULLIF(settlement,''),'used') ELSE delivery END,'',9223372036854775806 FROM represented
+ UNION ALL SELECT '',phase,COALESCE(error,''),9223372036854775807 FROM redemption_attempts a
+ WHERE (a.phase IN ('used','awaiting_finality') OR NOT EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=a.sig))
+ AND NOT EXISTS(SELECT 1 FROM represented s JOIN winning_tickets w ON w.ticket_hash=s.hash WHERE w.sig=a.sig)) ORDER BY sequence`
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
@@ -128,6 +129,9 @@ func (s *RedeemerDB) Redemptions() ([]RedemptionStatus, error) {
 // RetryRedemption preserves the existing explicit identical-byte retry command.
 // Historical identities are inspectable, but cannot replace a newer active job.
 func RetryRedemption(ctx context.Context, store *RedeemerDB, contracts *eth.Contracts, hash ethcommon.Hash) error {
+	if store == nil || store.binding == nil || contracts == nil || contracts.Controller != store.binding.Controller {
+		return errors.New("bound redemption store and matching chain required")
+	}
 	var sig, raw []byte
 	err := store.db.QueryRowContext(ctx, `SELECT t.sig,t.raw_transaction FROM redemption_transactions t JOIN redemption_attempts a ON a.sig=t.sig JOIN winning_tickets w ON w.sig=t.sig WHERE t.hash=? AND w.tx_hash=t.hash AND a.phase IN ('prepared','broadcast','submitted','retryable') AND t.phase IN ('prepared','broadcast','submitted','retryable')`, hash.Hex()).Scan(&sig, &raw)
 	if err != nil {

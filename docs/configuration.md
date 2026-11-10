@@ -4,7 +4,8 @@ Services accept TOML or JSON and reject unknown keys. Migration and recovery
 commands read only their relevant settings. Use the
 [orchestrator](../configs/orchestrator/config.example.toml),
 [signer](../configs/signer/config.example.toml),
-[discovery](../configs/discovery/config.example.toml), and
+[discovery](../configs/discovery/config.example.toml),
+[redeemer](../configs/redeemer/config.example.toml), and
 [chain](../configs/chain/config.example.toml) examples as starting points.
 
 ## Select configuration and storage
@@ -14,22 +15,23 @@ are ignored. Select a file with `--config FILE` or the component's `CONFIG`
 environment variable. An explicit config can set `Network` and `DataDir`.
 `--config=""` disables config discovery.
 
-`Network` defaults to `arbitrum-one-mainnet` for chain, signer, and the
+`Network` defaults to `arbitrum-one-mainnet` for chain, signer, redeemer, and the
 orchestrator's `redemptions` and `migrate` commands. The orchestrator service
 defaults to `offchain`. Arbitrum supplies chain, Controller, and ETH/USD feed
 defaults. Custom networks require explicit chain and Controller settings.
-Signers and paid orchestrators also need a feed or fixed conversion rate.
-Paid orchestrators must select an on-chain network. RPC chain IDs are checked.
+Signers and onchain orchestrators also need a feed or fixed conversion rate.
+Onchain orchestrators must select an onchain network. RPC chain IDs are checked.
 
 Config and storage default to `~/.lpData/<network>/<component>`; accounts use
 `~/.lpData/<network>/keystore`. Explicit `DataDir` values are used directly and
 move accounts to `<DataDir>/keystore`, even if the value matches the default.
-Database filenames default to `payments.sqlite` (orchestrator) and `events.sqlite`
+Database filenames default to `payments.sqlite` (orchestrator), `tickets.sqlite`
+(redeemer), and `events.sqlite`
 (signer). Network names must be nonempty directory names other than `.` or `..`.
 
 Without `--config`, commands load `<DataDir>/config.toml` if present. That file
 cannot set `DataDir`; its `Network` must match the flag/environment/default.
-A paid orchestrator using config discovery therefore needs
+An onchain orchestrator using config discovery therefore needs
 `--network arbitrum-one-mainnet`. Explicit configs must exist and determine the
 network before default directories are calculated.
 
@@ -49,10 +51,11 @@ the component prefix and underscores:
 | Orchestrator | `LIVEPEER_ORCHESTRATOR_` | `LIVEPEER_ORCHESTRATOR_BOOTSTRAP_SECRET` |
 | Discovery | `LIVEPEER_DISCOVERY_` | `LIVEPEER_DISCOVERY_NODES` |
 | Signer | `LIVEPEER_SIGNER_` | `LIVEPEER_SIGNER_RPC_URL` |
+| Redeemer | `LIVEPEER_REDEEMER_` | `LIVEPEER_REDEEMER_RPC_URL` |
 | Chain | `LIVEPEER_CHAIN_` | `LIVEPEER_CHAIN_RPC_URL` |
 
 Run `livepeer COMPONENT --help` for flags and defaults. Orchestrator, discovery,
-and chain support `--print-config`:
+redeemer, and chain support `--print-config`:
 
 ```sh
 livepeer orchestrator --config /etc/livepeer/orchestrator.toml --print-config
@@ -92,8 +95,8 @@ URL files require a valid URL without a trailing newline.
 
 ## Ethereum keystores
 
-Chain, signer, and paid orchestrators discover encrypted geth accounts in the
-keystore directory described above. A sole account is selected automatically;
+Chain, signer, redeemer, and orchestrators redeeming locally discover geth
+accounts in the keystore directory described above. A sole account is selected automatically;
 use `Account` / `--account` to select among accounts or `KeystoreFile` /
 `--keystore-file` to bypass discovery.
 
@@ -106,16 +109,24 @@ Keystore and password files must be regular files readable only by their owner;
 target files meet these requirements. Password files follow the exact-byte
 rules above; supply an empty file for a keystore without a password.
 
-Signer and paid orchestrators require these credentials at startup; chain needs
-them for submissions and local signing. Credential changes require a restart
-or a new chain invocation.
+Signer, redeemer, and orchestrators redeeming locally require these credentials
+at startup; chain needs them for submissions and local signing. Credential
+changes require a restart or a new chain invocation.
 
 The signer account is the payer, supplying the TicketBroker deposit and reserve.
-The orchestrator's keystore account signs redemptions and pays gas. Ticket payments
-credit `OrchestratorAddress`, which defaults to that account. The chain account
-must match the keystore account when signing. Multiple orchestrator processes
-may share a redemption key. Failed submissions are retried automatically.
+For local redemption, the orchestrator's keystore account signs transactions and
+pays gas. Ticket payments credit `OrchestratorAddress`, which defaults to that
+account. The chain account must match the keystore account when signing.
+Multiple orchestrator processes may share a redemption key. Failed submissions
+are retried automatically.
 See [transaction recovery](payment-recovery.md).
+
+For remote redemption, configure wallet credentials and transaction options on
+the redeemer. In the orchestrator configuration, omit `Account`, `KeystoreFile`,
+`KeystorePasswordFile`, `RedeemerTxTimeout`, `RedeemerMaxTxReplacements`, and
+`RedeemerMaxFeePerGas`, and unset `LIVEPEER_ORCHESTRATOR_KEYSTORE_PASSWORD` if set.
+The orchestrator still needs its RPC, ticket, pricing, and database settings;
+see [redeemer setup](redeemer.md#connect-an-orchestrator).
 
 ### Prepare a keystore
 
@@ -149,6 +160,7 @@ Health and metrics endpoints use separate listeners that default to loopback:
 | Orchestrator | `127.0.0.1:8935` | `127.0.0.1:8936` |
 | Signer | `127.0.0.1:8937` | `127.0.0.1:8938` |
 | Discovery | `127.0.0.1:8939` | `127.0.0.1:8940` |
+| Redeemer | `127.0.0.1:8941` | `127.0.0.1:8942` |
 
 ```sh
 curl -fsS http://127.0.0.1:8936/readyz

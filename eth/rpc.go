@@ -163,7 +163,7 @@ var contractCallLabels = sync.OnceValue(func() map[[4]byte][2]string {
 	labels := map[[4]byte][2]string{}
 	for binding, functions := range map[string][]string{
 		"controller": {"getContract"}, "roundsManager": {"lastInitializedRound", "currentRound", "blockHashForRound"},
-		"bondingManager": {"isActiveTranscoder"}, "ticketBroker": {"getSenderInfo", "claimableReserve", "usedTickets", "redeemWinningTicket"},
+		"bondingManager": {"isActiveTranscoder", "isRegisteredTranscoder"}, "ticketBroker": {"getSenderInfo", "claimableReserve", "usedTickets", "redeemWinningTicket", "ticketValidityPeriod"},
 		"priceFeed": {"description", "decimals", "latestRoundData"},
 	} {
 		parsed, err := bindingMetadata[binding].GetAbi()

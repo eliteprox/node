@@ -72,7 +72,7 @@ func forbiddenImport(file, dep string) string {
 	if local == "discovery/shared" {
 		return ""
 	}
-	for _, component := range []string{"orchestrator", "signer", "chain", "discovery"} {
+	for _, component := range []string{"orchestrator", "signer", "chain", "discovery", "redeemer"} {
 		if local == component || strings.HasPrefix(local, component+"/") {
 			if strings.HasPrefix(file, "cmd/livepeer-"+component+"/") || strings.HasPrefix(file, component+"/") {
 				continue

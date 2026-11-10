@@ -7,6 +7,7 @@ protocol commands for the Livepeer network.
 | --- | --- |
 | `livepeer` | Runs the bundled component commands. |
 | `livepeer-orchestrator` | Registers runners, reserves sessions, proxies traffic, and redeems payment tickets. |
+| `livepeer-redeemer` | Accepts winning tickets from orchestrators and redeems them using a dedicated wallet. |
 | `livepeer-discovery` | Collects and caches orchestrator runner inventories without running an orchestrator. |
 | `livepeer-signer` | Signs identities and payments, discovers orchestrators, and optionally publishes accounting events. |
 | `livepeer-chain` | Inspects accounts and contracts, manages wallets, staking, earnings, funds, and governance, and signs files locally. |

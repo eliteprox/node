@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/livepeer/node/pm"
 	"github.com/stretchr/testify/require"
@@ -15,7 +16,7 @@ func TestDroppedRedemptionRefillsNonceAfterRestart(t *testing.T) {
 	for _, phase := range []string{"retryable", "expired", "invalid", "used"} {
 		t.Run(phase, func(t *testing.T) {
 			f, s, ticket, c, key := newRecoveryTest(t, 230)
-			require.NoError(t, StartRedemptionRecovery(t.Context(), s, c, key, RedemptionOptions{Timeout: 30 * time.Millisecond, MaxReplacements: 0}))
+			recoveryWorker(t, s, c, key, RedemptionOptions{Timeout: 30 * time.Millisecond, MaxReplacements: 0})
 			tickRecovery(t, s, c, key)
 			original := f.Transactions()[0]
 			f.Mu.Lock()
@@ -30,7 +31,7 @@ func TestDroppedRedemptionRefillsNonceAfterRestart(t *testing.T) {
 			// higher nonce. Restart retains the original timestamp and identity.
 			_, err := s.db.Exec(`CREATE TRIGGER reject_gap_send BEFORE UPDATE OF phase ON redemption_transactions BEGIN SELECT RAISE(ABORT,'injected persistence failure'); END`)
 			require.NoError(t, err)
-			require.NotEmpty(t, ProcessRedemptions(t.Context(), s, c, key, big.NewInt(1)))
+			require.NotEmpty(t, processRecovery(t, s, c, key))
 			require.Len(t, f.Transactions(), 1)
 			_, err = s.db.Exec("DROP TRIGGER reject_gap_send")
 			require.NoError(t, err)
@@ -46,7 +47,7 @@ func TestDroppedRedemptionRefillsNonceAfterRestart(t *testing.T) {
 			next := nextRecoveryTicket(ticket, 231)
 			require.NoError(t, s.StoreWinningTicket(next))
 			f.Mu.Lock()
-			f.Tickets = append(f.Tickets, next)
+			f.Tickets[next.Hash()] = next.RecipientRandHash
 			f.Mu.Unlock()
 			tickRecovery(t, s, c, key)
 			sent = f.Transactions()
@@ -64,7 +65,7 @@ func TestClosedTicketRepairsSupersededHigherNonce(t *testing.T) {
 	// The original send lost its response; a fresh attempt uses nonce one, as
 	// required by the retry policy. Either attempt can later win.
 	f.LoseNextResponse = true
-	require.NotEmpty(t, ProcessRedemptions(t.Context(), s, c, key, big.NewInt(1)))
+	require.NotEmpty(t, processRecovery(t, s, c, key))
 	tickRecovery(t, s, c, key)
 	s = reopenRecoveryStore(t, s)
 	sent := f.Transactions()
@@ -77,10 +78,12 @@ func TestClosedTicketRepairsSupersededHigherNonce(t *testing.T) {
 	delete(f.Pool, 1)
 	f.FinalizedNonce = 1
 	f.Mu.Unlock()
+	remote := Binding{ChainID: "1", Controller: c.Contracts.Controller, Role: "orchestrator", Destination: "http://redeemer.example"}
+	require.ErrorContains(t, s.Bind(t.Context(), remote, DefaultLimits, c), "drain local signed", "settlement did not consume the superseded higher nonce")
 	// Crash after replay submission but before recording its acknowledgment.
 	_, err := s.db.Exec(`CREATE TRIGGER reject_gap_ack BEFORE UPDATE OF acknowledged ON redemption_transactions BEGIN SELECT RAISE(ABORT,'injected acknowledgment failure'); END`)
 	require.NoError(t, err)
-	require.NotEmpty(t, ProcessRedemptions(t.Context(), s, c, key, big.NewInt(1)))
+	require.NotEmpty(t, processRecovery(t, s, c, key))
 	s = reopenRecoveryStore(t, s)
 	var interrupted string
 	require.NoError(t, s.db.QueryRow("SELECT phase FROM redemption_transactions WHERE hash=?", sent[1].Hash().Hex()).Scan(&interrupted))
@@ -108,7 +111,7 @@ func TestClosedTicketRepairsSupersededHigherNonce(t *testing.T) {
 	next := nextRecoveryTicket(ticket, 233)
 	require.NoError(t, s.StoreWinningTicket(next))
 	f.Mu.Lock()
-	f.Tickets = append(f.Tickets, next)
+	f.Tickets[next.Hash()] = next.RecipientRandHash
 	f.Mu.Unlock()
 	tickRecovery(t, s, c, key)
 	sent = f.Transactions()
@@ -116,6 +119,43 @@ func TestClosedTicketRepairsSupersededHigherNonce(t *testing.T) {
 	f.Mine(sent[len(sent)-1], true)
 	tickRecovery(t, s, c, key)
 	require.Equal(t, "confirmed", ticketPhase(t, s, next.Sig))
+	require.NoError(t, s.Bind(t.Context(), remote, DefaultLimits, c), "finalized account state proves the remaining nonce drained")
+}
+
+func TestDestinationChangeWaitsForNonceDrain(t *testing.T) {
+	for _, bound := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bound=%t", bound), func(t *testing.T) {
+			f := newRecoveryRPC(t)
+			s, ticket := f.store(t, 235)
+			chain, key := f.Chain(t), recoveryKey(t)
+			binding := Binding{ChainID: "1", Controller: chain.Contracts.Controller, Role: "orchestrator", Destination: "chain"}
+			if bound {
+				require.NoError(t, s.Bind(t.Context(), binding, DefaultLimits, chain))
+			}
+			prepared, err := chain.PrepareRedemption(t.Context(), key, big.NewInt(1), redeemTicket(ticket))
+			require.NoError(t, err)
+			require.NoError(t, s.RecordPrepared(t.Context(), ticket, prepared))
+
+			f.Mu.Lock()
+			f.Round = 4
+			f.Mu.Unlock()
+			finalized, err := chain.RedemptionSnapshot(t.Context(), "finalized")
+			require.NoError(t, err)
+			require.True(t, finalized.TicketExpired(ticket.CreationRound))
+			require.NoError(t, s.settle(t.Context(), ticket, "expired", finalized))
+			binding.Destination = "http://redeemer.example"
+			require.ErrorContains(t, s.Bind(t.Context(), binding, DefaultLimits, nil), "drain local signed", "missing chain evidence cannot prove drainage")
+			require.ErrorContains(t, s.Bind(t.Context(), binding, DefaultLimits, chain), "drain local signed")
+			if !bound {
+				bindRecoveryStore(t, s, chain)
+			}
+			transaction := new(types.Transaction)
+			require.NoError(t, transaction.UnmarshalBinary(prepared.Raw))
+			f.Mine(transaction, false)
+			require.NotEmpty(t, ReconcileSubmitted(t.Context(), s, chain), "the finalized reverted transaction consumed its nonce")
+			require.NoError(t, s.Bind(t.Context(), binding, DefaultLimits, nil), "a stored finalized receipt proves drainage without another RPC")
+		})
+	}
 }
 
 func TestFinalizedExternalNonceRetiresOnlyMissingTransactions(t *testing.T) {
@@ -134,7 +174,7 @@ func TestFinalizedExternalNonceRetiresOnlyMissingTransactions(t *testing.T) {
 			require.Empty(t, ReconcileSubmitted(t.Context(), s, c))
 			next := nextRecoveryTicket(ticket, 235)
 			next.CreationRound = 5
-			require.ErrorIs(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}, f.CollateralSnapshot()), pm.ErrPayerUnavailable)
+			require.ErrorIs(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, big.NewInt(1000), []*pm.SignedTicket{next}, f.CollateralSnapshot()), pm.ErrPayerUnavailable)
 			f.Mu.Lock()
 			f.FinalizedNonce = 1
 			f.FinalizedNonceReads = 0
@@ -148,22 +188,28 @@ func TestFinalizedExternalNonceRetiresOnlyMissingTransactions(t *testing.T) {
 			f.Mu.Unlock()
 			failures := ReconcileSubmitted(t.Context(), s, c)
 			require.Equal(t, observation == "receipt-error" || observation == "nonce-error" || observation == "nonce-null", len(failures) > 0)
+			f.Mu.Lock()
+			reads := f.FinalizedNonceReads
+			f.Mu.Unlock()
+			require.LessOrEqual(t, reads, 1, "read finalized account state once per wallet")
 			items, err := s.SubmittedRedemptions()
 			require.NoError(t, err)
 			if observation == "missing" {
 				require.Empty(t, items)
 				require.Equal(t, "expired", ticketPhase(t, s, ticket.Sig))
-				require.NoError(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}, f.CollateralSnapshot()))
+				require.ErrorIs(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, big.NewInt(1000), []*pm.SignedTicket{next}, f.CollateralSnapshot()), pm.ErrPayerUnavailable, "consuming a nonce does not finalize heuristic ticket expiry")
+				f.Mu.Lock()
+				f.Round = 5
+				f.Mu.Unlock()
+				tickRecovery(t, s, c, key)
+				require.NoError(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, big.NewInt(1000), []*pm.SignedTicket{next}, f.CollateralSnapshot()))
 				oldEpoch := nextRecoveryTicket(ticket, 236)
 				oldEpoch.RecipientRandHash = ticket.RecipientRandHash
-				require.ErrorIs(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{oldEpoch}, f.CollateralSnapshot()), ErrExposedRandomness)
+				require.ErrorIs(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, big.NewInt(10000), []*pm.SignedTicket{oldEpoch}, f.CollateralSnapshot()), ErrExposedRandomness)
 			} else {
 				require.Len(t, items, 1, "uncertain or unfinalized receipts retain liability")
 			}
-			f.Mu.Lock()
-			reads := f.FinalizedNonceReads
-			f.Mu.Unlock()
-			require.LessOrEqual(t, reads, 1, "read finalized account state once per sender")
+
 		})
 	}
 }
@@ -171,7 +217,7 @@ func TestFinalizedExternalNonceRetiresOnlyMissingTransactions(t *testing.T) {
 func TestFinalizedExternalNoncePreservesHigherAttempt(t *testing.T) {
 	f, s, ticket, c, key := newRecoveryTest(t, 237)
 	f.LoseNextResponse = true
-	require.NotEmpty(t, ProcessRedemptions(t.Context(), s, c, key, big.NewInt(1)))
+	require.NotEmpty(t, processRecovery(t, s, c, key))
 	tickRecovery(t, s, c, key)
 	s = reopenRecoveryStore(t, s)
 	f.Mu.Lock()
@@ -191,7 +237,7 @@ func TestFinalizedExternalNoncePreservesHigherAttempt(t *testing.T) {
 	require.Equal(t, 1, reads)
 	next := nextRecoveryTicket(ticket, 238)
 	next.CreationRound = 5
-	require.ErrorIs(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, 5, big.NewInt(1000), []*pm.SignedTicket{next}, f.CollateralSnapshot()), pm.ErrPayerUnavailable)
+	require.ErrorIs(t, s.StoreWinningTickets(t.Context(), ticket.PayerAddress, next.RecipientRandHash, big.NewInt(1000), []*pm.SignedTicket{next}, f.CollateralSnapshot()), pm.ErrPayerUnavailable)
 	// Finalized state advances beyond both attempts while the pending endpoint
 	// stays stale. New signing must use that observed count, not the saved floor.
 	f.Mu.Lock()
@@ -216,7 +262,7 @@ func TestFinalizedNonceAdvancesPastResolvedHistory(t *testing.T) {
 		t.Run(fmt.Sprintf("acknowledged=%t/pending=%d", tc.acknowledged, tc.pending), func(t *testing.T) {
 			f, s, ticket, c, key := newRecoveryTest(t, 239)
 			f.LoseNextResponse = !tc.acknowledged
-			require.Equal(t, !tc.acknowledged, len(ProcessRedemptions(t.Context(), s, c, key, big.NewInt(1))) > 0)
+			require.Equal(t, !tc.acknowledged, len(processRecovery(t, s, c, key)) > 0)
 			s = reopenRecoveryStore(t, s)
 			if tc.acknowledged {
 				f.Mine(f.Transactions()[0], true)

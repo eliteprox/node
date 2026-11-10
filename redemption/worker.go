@@ -5,6 +5,7 @@ package redemption
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"math/big"
 	"sync"
@@ -28,10 +29,13 @@ type ChainDestination struct {
 }
 
 func NewChainDestination(ctx context.Context, s *RedeemerDB, c eth.PaymentChain, k *eth.Key, id *big.Int, options RedemptionOptions) (*ChainDestination, error) {
-	if id == nil || id.Sign() <= 0 || (s != nil && s.binding != nil && s.binding.ChainID != id.String()) {
-		return nil, errors.New("invalid redemption chain ID")
+	if s == nil || s.binding == nil || c.Contracts == nil || c.Contracts.RPC == nil || k == nil || id == nil || id.Sign() <= 0 || s.binding.ChainID != id.String() || s.binding.Controller != c.Contracts.Controller || s.binding.Destination != "chain" {
+		return nil, errors.New("bound redemption store, matching chain and signing key required")
 	}
-	if err := StartRedemptionRecovery(ctx, s, c, k, options); err != nil {
+	if options.Timeout <= 0 || options.MaxReplacements < 0 {
+		return nil, errors.New("invalid redemption recovery options")
+	}
+	if _, err := s.recoveryFor(ctx, c, k, options); err != nil {
 		return nil, err
 	}
 	return &ChainDestination{s, c, k, new(big.Int).Set(id)}, nil
@@ -54,7 +58,6 @@ func NewWorker(s *RedeemerDB, c eth.PaymentChain, d Destination) (*Worker, error
 		return nil, errors.New("bound redemption store, chain and destination required")
 	}
 	w := &Worker{store: s, chain: c, destination: d}
-	s.worker = w
 	return w, nil
 }
 
@@ -95,6 +98,12 @@ func (w *Worker) Process(ctx context.Context) []error {
 			return append(failures, ctx.Err())
 		}
 		t := item.ticket
+		// Persist progress before work can exhaust the pass deadline. Tickets
+		// fetched but not reached must keep their place ahead of visited work.
+		if _, e := s.db.ExecContext(ctx, "UPDATE ticket_state SET visited=? WHERE hash=? AND settled=0", time.Now().UnixMilli(), t.Hash().Bytes()); e != nil {
+			failures = append(failures, e)
+			continue
+		}
 		if finalErr == nil {
 			used, e := w.chain.TicketUseAt(ctx, t.Hash(), finalized)
 			if e != nil {
@@ -169,6 +178,10 @@ func (w *Worker) Process(ctx context.Context) []error {
 			}
 			var phase string
 			e = s.db.QueryRowContext(ctx, "SELECT phase FROM redemption_attempts WHERE sig=?", t.Sig).Scan(&phase)
+			if e != nil && !errors.Is(e, sql.ErrNoRows) {
+				failures = append(failures, e)
+				continue
+			}
 			if e == nil && phase != "retryable" {
 				w.hold(ctx, item)
 				continue
@@ -187,6 +200,9 @@ func (w *Worker) Process(ctx context.Context) []error {
 		if e != nil {
 			phase = "retryable"
 			count = item.failures + 1
+			if local && errors.Is(e, eth.ErrTicketCreationRound) {
+				e = errors.Join(e, s.setTicketPhase(ctx, t.Sig, "invalid"))
+			}
 			var rejected *Rejection
 			if errors.As(e, &rejected) {
 				phase = "rejected"
@@ -195,9 +211,11 @@ func (w *Worker) Process(ctx context.Context) []error {
 				failures = append(failures, e)
 			}
 		}
-		if err := s.delivery(ctx, t, phase, count); err != nil {
+		persist, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		if err := s.delivery(persist, t, phase, count); err != nil {
 			failures = append(failures, err)
 		}
+		cancel()
 	}
 	return failures
 }

@@ -110,19 +110,17 @@ func (s *RedeemerDB) reconcileFinalizedNonces(ctx context.Context, chain finaliz
 	}
 	query := `SELECT t.hash,t.redeemer_address,t.nonce FROM redemption_transactions t JOIN redemption_attempts a ON a.sig=t.sig WHERE a.phase NOT IN ('confirmed','used') AND t.phase NOT IN ('confirmed','reverted','superseded')`
 	var args []any
-	if s.binding != nil {
-		query += " AND t.hash IN ("
-		first := true
-		for hash := range pending {
-			if !first {
-				query += ","
-			}
-			query += "?"
-			args = append(args, hash.Hex())
-			first = false
+	query += " AND t.hash IN ("
+	first := true
+	for hash := range pending {
+		if !first {
+			query += ","
 		}
-		query += ")"
+		query += "?"
+		args = append(args, hash.Hex())
+		first = false
 	}
+	query += ")"
 	rows, err := s.db.QueryContext(ctx, query, args...)
 
 	if err != nil {
@@ -137,9 +135,6 @@ func (s *RedeemerDB) reconcileFinalizedNonces(ctx context.Context, chain finaliz
 		var hash, sender, nonce string
 		if err = rows.Scan(&hash, &sender, &nonce); err != nil {
 			break
-		}
-		if !pending[common.HexToHash(hash)] {
-			continue
 		}
 		var n uint64
 		n, err = strconv.ParseUint(nonce, 10, 64)

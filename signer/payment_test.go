@@ -155,7 +155,7 @@ func TestRecipientReservesWinningLiabilityAcrossConcurrentSessions(t *testing.T)
 	}
 	require.Equal(t, 2, accepted)
 	require.Equal(t, 1, rejected)
-	count, err := store.WinningTicketCount(key.Address(), 0)
+	count, err := store.WinningTicketCount(key.Address())
 	require.NoError(t, err)
 	require.Equal(t, 2, count, "rejected batches must roll back tickets and credit")
 }

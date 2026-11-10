@@ -6,7 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"math/big"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -28,10 +28,14 @@ type Binding struct {
 	Role, Destination string
 }
 
+type NonceReader interface {
+	FinalizedNonce(context.Context, common.Address) (uint64, error)
+}
+
 // Bind prevents retained tickets from being reinterpreted on another deployment.
 // An unbound Node database is adopted only by the orchestrator and only after
 // checking every retained signed transaction's chain identity.
-func (s *RedeemerDB) Bind(ctx context.Context, b Binding, limits Limits) error {
+func (s *RedeemerDB) Bind(ctx context.Context, b Binding, limits Limits, chain NonceReader) error {
 	chainID, ok := new(big.Int).SetString(b.ChainID, 10)
 	if !ok || chainID.Sign() <= 0 || b.Controller == (common.Address{}) || (b.Role != "orchestrator" && b.Role != "redeemer") || b.Destination == "" || limits.Pending <= 0 || limits.PerRecipient <= 0 {
 		return errors.New("invalid redemption binding or capacity")
@@ -57,6 +61,9 @@ func (s *RedeemerDB) Bind(ctx context.Context, b Binding, limits Limits) error {
 			if count != 0 {
 				return errors.New("drain outstanding tickets before changing redemption destination")
 			}
+			if err := checkNonceDrain(ctx, tx, chain); err != nil {
+				return err
+			}
 		}
 	} else if errors.Is(err, sql.ErrNoRows) {
 		var count int
@@ -67,12 +74,8 @@ func (s *RedeemerDB) Bind(ctx context.Context, b Binding, limits Limits) error {
 			return errors.New("standalone redeemer requires its own database")
 		}
 		if b.Destination != "chain" {
-			var signed int
-			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM redemption_transactions t JOIN winning_tickets w ON w.sig=t.sig JOIN ticket_state s ON s.hash=w.ticket_hash WHERE s.settled=0`).Scan(&signed); err != nil {
+			if err := checkNonceDrain(ctx, tx, chain); err != nil {
 				return err
-			}
-			if signed > 0 {
-				return errors.New("drain local signed transactions before enabling remote redemption")
 			}
 		}
 		rows, err := tx.QueryContext(ctx, "SELECT raw_transaction FROM redemption_transactions")
@@ -107,6 +110,46 @@ func (s *RedeemerDB) Bind(ctx context.Context, b Binding, limits Limits) error {
 		return err
 	}
 	s.binding, s.limits = &b, limits
+	return nil
+}
+
+// Ticket settlement does not consume every signed nonce. Only finalized
+// same-nonce inclusion or a finalized account count proves drainage.
+func checkNonceDrain(ctx context.Context, tx *sql.Tx, chain NonceReader) error {
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT t.redeemer_address,t.nonce FROM redemption_transactions t WHERE NOT EXISTS(SELECT 1 FROM redemption_transactions proof WHERE proof.redeemer_address=t.redeemer_address AND proof.nonce=t.nonce AND proof.phase IN ('confirmed','reverted'))`)
+	if err != nil {
+		return err
+	}
+	needed := map[common.Address]uint64{}
+	for rows.Next() {
+		var sender, raw string
+		if err = rows.Scan(&sender, &raw); err != nil {
+			break
+		}
+		nonce, parseErr := strconv.ParseUint(raw, 10, 64)
+		if parseErr != nil || !common.IsHexAddress(sender) {
+			err = errors.New("invalid stored redemption account or nonce")
+			break
+		}
+		address := common.HexToAddress(sender)
+		needed[address] = max(needed[address], nonce)
+	}
+	err = errors.Join(err, rows.Err(), rows.Close())
+	if err != nil {
+		return err
+	}
+	for address, nonce := range needed {
+		if chain == nil {
+			return errors.New("drain local signed transactions before changing redemption destination")
+		}
+		count, err := chain.FinalizedNonce(ctx, address)
+		if err != nil {
+			return err
+		}
+		if count <= nonce {
+			return errors.New("drain local signed transactions before changing redemption destination")
+		}
+	}
 	return nil
 }
 
@@ -178,9 +221,6 @@ func insertTicket(ctx context.Context, tx *sql.Tx, t *pm.SignedTicket) error {
 }
 
 func (s *RedeemerDB) capacity(ctx context.Context, tx *sql.Tx, recipient common.Address, additional int) error {
-	if s.binding == nil || additional == 0 {
-		return nil
-	}
 	var total, local int
 	err := tx.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(w.recipient=?),0) FROM ticket_state t JOIN winning_tickets w ON w.sig=t.sig WHERE t.settled=0`, recipient.Hex()).Scan(&total, &local)
 	if err != nil {
@@ -284,13 +324,6 @@ func (s *RedeemerDB) page(ctx context.Context, limit int) ([]queuedTicket, error
 	if err != nil {
 		return nil, err
 	}
-	if len(out) > 0 {
-		args := []any{time.Now().UnixMilli()}
-		for _, item := range out {
-			args = append(args, item.ticket.Hash().Bytes())
-		}
-		_, err = s.db.ExecContext(ctx, "UPDATE ticket_state SET visited=? WHERE hash IN ("+strings.TrimRight(strings.Repeat("?,", len(out)), ",")+")", args...)
-	}
 	return out, err
 }
 
@@ -350,9 +383,6 @@ func (f *ticketFields) ticket() (*pm.SignedTicket, error) {
 
 // CapacityAvailable reports admission backpressure without evicting retained work.
 func (s *RedeemerDB) CapacityAvailable(ctx context.Context, recipient common.Address) (bool, error) {
-	if s.binding == nil {
-		return true, nil
-	}
 	var total, local int
 	err := s.db.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(w.recipient=?),0) FROM ticket_state t JOIN winning_tickets w ON w.sig=t.sig WHERE t.settled=0`, recipient.Hex()).Scan(&total, &local)
 	return err == nil && total < s.limits.Pending && (recipient == (common.Address{}) || local < s.limits.PerRecipient), err

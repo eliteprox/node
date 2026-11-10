@@ -1,10 +1,10 @@
 # HTTP API
 
 Routes are unversioned. Orchestrator routes support a deployment base path;
-signer and discovery routes are served at the listener root. A proxy exposing
-either under a base path must strip that prefix before forwarding requests.
-See [orchestrator setup](orchestrator.md), [signer setup](signer.md), and
-[discovery setup](discovery.md) for configuration.
+signer, discovery, and redeemer routes are served at the listener root. A proxy
+exposing these services under a base path must strip it before forwarding requests.
+See [orchestrator setup](orchestrator.md), [signer setup](signer.md),
+[discovery setup](discovery.md), and [redeemer setup](redeemer.md) for configuration.
 
 ## Live Runner HTTP
 
@@ -16,7 +16,7 @@ See [orchestrator setup](orchestrator.md), [signer setup](signer.md), and
 | `POST /apps/{app_id}/session` | Reserve persistent session | JSON `session_id`, `app_url`, `control_url`; paid mode may first return a payment challenge. |
 | `POST /apps/{app_id}/session/{session_id}/stop` | Stop client session | Session authorization and callback reconciliation. |
 | `POST /apps/{app_id}/session/{session_id}/payment` | Submit a ticket payment | On-chain only. |
-| `POST /refresh-payment` | Refresh ticket parameters for the same payer and manifest | On-chain only; JSON `sender` and `manifest_id`. |
+| `POST /refresh-payment` | Refresh ticket parameters for the same payer and manifest | On-chain only; JSON request with a payer address and `manifest_id`. |
 | `* /apps/{app_id}/session/{session_id}/app/{app_path...}` | Persistent proxy | Preserve HTTP method, streaming, SSE and WebSocket semantics and Livepeer session headers. |
 | `* /apps/{app_id}/app/{app_path...}` | Single-shot proxy | Transient capacity-limited reservation; identical session/control headers and cancellation ownership. |
 | `POST /runner/{app_id}/session/{session_id}/channels` | Create generic trickle channels | Scoped session callback token; JSON `channels`. |
@@ -241,6 +241,38 @@ example `"X-List: a,b",Authorization: Bearer credential`.
 | 500 | Payment generation or signing failed. |
 | 502 | Restore the authorization webhook or correct its response. |
 | 503 | Retry after payment dependencies, discovery sources, or accounting storage recover. |
+
+## Redeemer HTTP
+
+`POST /tickets` submits one winning ticket to a standalone redeemer. Send a JSON
+object with `chain_id` (a decimal string), `controller` (an Ethereum address),
+and `ticket`. The chain and Controller must match the redeemer's configuration.
+The `ticket` object contains:
+
+| Fields | Encoding |
+| --- | --- |
+| `payer_address`, `recipient` | Ethereum addresses: `0x` plus 40 hex digits |
+| `face_value`, `win_prob`, `recipient_rand`, `params_expiration_block` | Unsigned uint256 decimal strings |
+| `ticket_nonce` | Unsigned 32-bit JSON integer |
+| `creation_round` | Nonnegative int64 decimal string |
+| `recipient_rand_hash`, `creation_round_block_hash` | `0x` plus 64 hex digits |
+| `sig` | `0x` plus 130 hex digits; low-S Ethereum message signature with recovery byte 27 or 28 |
+
+The redeemer accepts only valid winning tickets. After storing a ticket it
+returns `202` with `{"ticket_hash":"0x..."}`. Resubmitting the same ticket returns
+the same response, including when the redeemer's queue is full. JSON field
+order, address case, and another valid winning signature do not change identity.
+This response confirms storage, not onchain redemption.
+
+Invalid input or a mismatched chain/Controller returns `400`; a different
+`params_expiration_block` for an already stored ticket returns `409`. A full
+redeemer queue, too many concurrent submissions, or a storage failure returns
+`503`. Requests are limited to 16 KiB.
+
+`params_expiration_block` is the L1 expiration block of the orchestrator's payment
+parameters. This field is not covered by the payer's signature; submitters must
+preserve the value issued by the orchestrator. Protect ticket submissions with
+TLS and endpoint authentication in your deployment; see [redeemer setup](redeemer.md).
 
 ## Accounting events
 

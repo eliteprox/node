@@ -78,15 +78,15 @@ func TestPaidReadinessUsesCurrentPublication(t *testing.T) {
 	_, store, ticket, direct, _ := newRecoveryTest(t, 15)
 	store.readiness = p
 	var unknown float64
-	store.collectMetrics(func(name string, value float64, labels observability.Labels) {
+	store.CollectMetrics(func(name string, value float64, labels observability.Labels) {
 		if name == "redemption_queue_tickets" && labels["state"] == "unknown" {
 			unknown = value
 		}
 	})
 	require.EqualValues(t, 1, unknown, "a healthy current observer cannot authorize a saved orphaned queue clock")
 	ticket.Sig = []byte{99, 2, 3}
-	require.ErrorIs(t, store.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{ticket}, snapshot), eth.ErrObservationUnavailable)
-	count, err := store.WinningTicketCount(ticket.PayerAddress, 0)
+	require.ErrorIs(t, store.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, big.NewInt(10000), []*pm.SignedTicket{ticket}, snapshot), eth.ErrObservationUnavailable)
+	count, err := store.WinningTicketCount(ticket.PayerAddress)
 	require.NoError(t, err)
 	require.Equal(t, 1, count, "invalidated admission must roll back its ticket insert")
 	captured := make(chan struct{})

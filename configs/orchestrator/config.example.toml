@@ -42,3 +42,10 @@ HealthGrants = []
 # default 2e13 wei cap. Fund sufficient deposit and recipient-claimable reserve.
 # TicketFaceValue = "400000000000"
 # TicketWinProb = "57896044618658097711785492504343953926634992332820282019728792003956564819967"
+
+# Remote redemption: set a public recipient address and omit local wallet/tx settings.
+# OrchestratorAddress = "0xYOUR_REGISTERED_ORCHESTRATOR"
+# RedeemerURL = "http://127.0.0.1:8941"
+# RedeemerGrants = ["127.0.0.1:8941"]
+# MaxPendingTickets = 100000
+# MaxTicketsPerRecipient = 10000

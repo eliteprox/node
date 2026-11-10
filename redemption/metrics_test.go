@@ -1,13 +1,42 @@
 package redemption
 
 import (
+	"math/big"
+	"testing"
+
 	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/internal/test"
 	"github.com/stretchr/testify/require"
-	"math/big"
-	"testing"
 )
+
+func TestBoundQueueMetricStates(t *testing.T) {
+	for _, tc := range []struct{ phase, state string }{
+		{"rejected", "rejected"}, {"retryable", "eligible"}, {"awaiting_finality", "awaiting_finality"}, {"reverted", "blocked"}, {"invalid", "blocked"},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			s, _ := boundStore(t, "orchestrator", "http://redeemer.example", DefaultLimits)
+			ticket, _ := winningTicket(t, 1)
+			require.NoError(t, s.Admit(t.Context(), ticket))
+			s.snapshot = func() (eth.ChainSnapshot, bool) {
+				return eth.ChainSnapshot{Block: big.NewInt(100), Round: big.NewInt(1), CurrentRound: big.NewInt(1), TicketValidityPeriod: big.NewInt(3)}, true
+			}
+			require.NoError(t, s.delivery(t.Context(), ticket, "submitted", 0))
+			if tc.phase == "rejected" {
+				require.NoError(t, s.delivery(t.Context(), ticket, tc.phase, 1))
+			} else {
+				require.NoError(t, s.setTicketPhase(t.Context(), ticket.Sig, tc.phase))
+			}
+			stats, err := s.redemptionStats(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, 1, stats.tickets[tc.state])
+			require.Positive(t, stats.oldestTickets[tc.state])
+			if tc.state != "eligible" {
+				require.Zero(t, stats.tickets["eligible"])
+			}
+		})
+	}
+}
 
 func TestRedemptionMetricsDurableAndIdempotent(t *testing.T) {
 	f, store, ticket, _, _ := newRecoveryTest(t, 14)
