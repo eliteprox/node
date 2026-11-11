@@ -2,16 +2,14 @@ name: SonarQube
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
+    branches: [forked-scans]
 
 permissions:
   contents: read
 
 jobs:
   analyze:
-    name: Analyze main
-    if: github.ref == 'refs/heads/main'
+    name: Analyze forked-scans
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout repository
