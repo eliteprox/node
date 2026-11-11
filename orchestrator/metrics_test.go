@@ -77,12 +77,16 @@ func TestPaidReadinessUsesCurrentPublication(t *testing.T) {
 	require.True(t, p.ready(registry), "an older heartbeat must not conceal a healthy completed backfill")
 	_, store, ticket, direct, _ := newRecoveryTest(t, 15)
 	store.readiness = p
-	stats, err := store.redemptionStats(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, 1, stats.tickets["unknown"], "a healthy current observer cannot authorize a saved orphaned queue clock")
+	var unknown float64
+	store.CollectMetrics(func(name string, value float64, labels observability.Labels) {
+		if name == "redemption_queue_tickets" && labels["state"] == "unknown" {
+			unknown = value
+		}
+	})
+	require.EqualValues(t, 1, unknown, "a healthy current observer cannot authorize a saved orphaned queue clock")
 	ticket.Sig = []byte{99, 2, 3}
-	require.ErrorIs(t, store.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, 0, big.NewInt(10000), []*pm.SignedTicket{ticket}, snapshot), eth.ErrObservationUnavailable)
-	count, err := store.WinningTicketCount(ticket.PayerAddress, 0)
+	require.ErrorIs(t, store.storeWinningTickets(t.Context(), ticket.PayerAddress, ticket.RecipientRandHash, big.NewInt(10000), []*pm.SignedTicket{ticket}, snapshot), eth.ErrObservationUnavailable)
+	count, err := store.WinningTicketCount(ticket.PayerAddress)
 	require.NoError(t, err)
 	require.Equal(t, 1, count, "invalidated admission must roll back its ticket insert")
 	captured := make(chan struct{})
@@ -286,9 +290,9 @@ func TestPaidDependencyObservationsRecover(t *testing.T) {
 	check := func() {
 		p.check(t.Context(), store, chain, &PaymentEngine{recipient: ticket.Recipient}, metrics, logger)
 	}
-	f.mu.Lock()
-	f.snapshotError = true
-	f.mu.Unlock()
+	f.Mu.Lock()
+	f.SnapshotError = true
+	f.Mu.Unlock()
 	_, err := store.db.Exec("PRAGMA query_only=ON")
 	require.NoError(t, err)
 	check()
@@ -300,9 +304,9 @@ func TestPaidDependencyObservationsRecover(t *testing.T) {
 	first := events.String()
 	check()
 	require.Equal(t, first, events.String(), "unchanged dependencies do not repeat the event")
-	f.mu.Lock()
-	f.snapshotError = false
-	f.mu.Unlock()
+	f.Mu.Lock()
+	f.SnapshotError = false
+	f.Mu.Unlock()
 	_, err = store.db.Exec("PRAGMA query_only=OFF")
 	require.NoError(t, err)
 	check()
@@ -325,9 +329,9 @@ func TestPaidDependencyObservationsRecover(t *testing.T) {
 	require.Equal(t, enqueued, after, "health observations must not change accounting state")
 	for _, failure := range []string{"snapshot", "active", "worker", "observation", "price"} {
 		t.Run(failure, func(t *testing.T) {
-			f.mu.Lock()
-			f.snapshotError, f.activeError = failure == "snapshot", failure == "active"
-			f.mu.Unlock()
+			f.Mu.Lock()
+			f.SnapshotError, f.ActiveError = failure == "snapshot", failure == "active"
+			f.Mu.Unlock()
 			if failure == "worker" {
 				p.workerCompleted = time.Now().Add(-time.Hour)
 			}
@@ -339,9 +343,9 @@ func TestPaidDependencyObservationsRecover(t *testing.T) {
 				registry.rateUntil = time.Now().Add(-time.Second)
 			}
 			require.False(t, p.ready(registry))
-			f.mu.Lock()
-			f.snapshotError, f.activeError = false, false
-			f.mu.Unlock()
+			f.Mu.Lock()
+			f.SnapshotError, f.ActiveError = false, false
+			f.Mu.Unlock()
 			p.workerCompleted, registry.rateUntil = time.Now(), time.Time{}
 			check()
 			require.True(t, p.ready(registry))
@@ -364,49 +368,4 @@ func TestUpstreamFailureAfterHeaders(t *testing.T) {
 	require.EqualValues(t, 1, test.MetricSum(t, registry.metrics.Registry, "app_calls_total", map[string]string{"outcome": "stream_error"}))
 	require.EqualValues(t, 1, test.MetricSum(t, registry.metrics.Registry, "stream_errors_total", nil))
 	require.Zero(t, test.MetricSum(t, registry.metrics.Registry, "app_calls_in_flight", nil))
-}
-
-func TestRedemptionMetricsDurableAndIdempotent(t *testing.T) {
-	f, store, ticket, _, _ := newRecoveryTest(t, 14)
-	store.metrics = observability.New("orchestrator")
-	store.metrics.Snapshot(store.collectMetrics)
-	store.readiness = &paidReadiness{completed: time.Now(), chain: true, interval: time.Second, snapshot: eth.ChainSnapshot{Block: new(big.Int).Sub(ticket.ParamsExpirationBlock, big.NewInt(1)), Round: big.NewInt(ticket.CreationRound)}}
-	require.EqualValues(t, 1, test.MetricSum(t, store.metrics.Registry, "redemption_queue_tickets", map[string]string{"state": "waiting"}))
-	var enqueued string
-	require.NoError(t, store.db.QueryRow("SELECT enqueued_at FROM winning_tickets WHERE sig=?", ticket.Sig).Scan(&enqueued))
-	store.readiness.snapshot.Block = new(big.Int).Set(ticket.ParamsExpirationBlock)
-	require.EqualValues(t, 1, test.MetricSum(t, store.metrics.Registry, "redemption_queue_tickets", map[string]string{"state": "eligible"}))
-	_, err := store.db.Exec("UPDATE winning_tickets SET params_expiration_block='broken' WHERE sig=?", ticket.Sig)
-	require.NoError(t, err)
-	values := map[string]float64{}
-	store.collectMetrics(func(name string, value float64, _ observability.Labels) { values[name] = value })
-	require.Equal(t, map[string]float64{"collector_healthy": 0}, values, "collection failure must expose health and omit unavailable statistics")
-	_, err = store.db.Exec("UPDATE winning_tickets SET params_expiration_block=? WHERE sig=?", ticket.ParamsExpirationBlock.String(), ticket.Sig)
-	require.NoError(t, err)
-	require.NoError(t, store.setTicketPhase(t.Context(), ticket.Sig, "awaiting_finality"))
-	require.NoError(t, store.setTicketPhase(t.Context(), ticket.Sig, "awaiting_finality"))
-	require.EqualValues(t, 1, test.MetricSum(t, store.metrics.Registry, "redemption_transitions_total", map[string]string{"event": "awaiting_finality"}))
-	require.NoError(t, store.setTicketPhase(t.Context(), ticket.Sig, "retryable"))
-	require.NoError(t, store.setTicketPhase(t.Context(), ticket.Sig, "retryable"))
-	require.EqualValues(t, 1, test.MetricSum(t, store.metrics.Registry, "redemption_transitions_total", map[string]string{"event": "retryable"}))
-	_, err = store.db.Exec(`CREATE TRIGGER fail_transition BEFORE UPDATE OF phase ON redemption_attempts WHEN NEW.phase='awaiting_finality' BEGIN SELECT RAISE(ABORT,'storage failure'); END`)
-	require.NoError(t, err)
-	require.Error(t, store.setTicketPhase(t.Context(), ticket.Sig, "awaiting_finality"))
-	require.EqualValues(t, 1, test.MetricSum(t, store.metrics.Registry, "redemption_transitions_total", map[string]string{"event": "awaiting_finality"}))
-	_, err = store.db.Exec(`DROP TRIGGER fail_transition`)
-	require.NoError(t, err)
-	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "used", "", f.collateralSnapshot()))
-	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "used", "", f.collateralSnapshot()))
-	require.NoError(t, store.finishTicket(t.Context(), ticket.Sig, "confirmed", "", f.collateralSnapshot()))
-	require.EqualValues(t, 1, test.MetricSum(t, store.metrics.Registry, "redemption_settlements_total", nil))
-	require.Zero(t, test.MetricSum(t, store.metrics.Registry, "redemption_queue_tickets", nil))
-	store = reopenRecoveryStore(t, store)
-	var restored string
-	require.NoError(t, store.db.QueryRow("SELECT enqueued_at FROM winning_tickets WHERE sig=?", ticket.Sig).Scan(&restored))
-	require.Equal(t, enqueued, restored)
-	require.NoError(t, store.Close())
-	store.metrics = observability.New("orchestrator")
-	store.metrics.Snapshot(store.collectMetrics)
-	require.Zero(t, test.MetricSum(t, store.metrics.Registry, "collector_healthy", nil))
-	require.Zero(t, test.MetricSum(t, store.metrics.Registry, "redemption_queue_tickets", nil))
 }

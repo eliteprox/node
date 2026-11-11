@@ -24,6 +24,7 @@ import (
 	"github.com/livepeer/node/internal/test"
 	"github.com/livepeer/node/pm"
 	"github.com/livepeer/node/pm/wire"
+	"github.com/livepeer/node/redemption"
 	"github.com/stretchr/testify/require"
 )
 
@@ -75,7 +76,7 @@ type recipientTestChain struct {
 }
 
 func (c *recipientTestChain) Snapshot(context.Context) (pm.ChainSnapshot, error) {
-	return pm.ChainSnapshot{Block: big.NewInt(c.block), Round: big.NewInt(5), RoundHash: ethcommon.HexToHash("0x1234")}, c.snapshotErr
+	return pm.ChainSnapshot{Block: big.NewInt(c.block), Round: big.NewInt(5), CurrentRound: big.NewInt(5), TicketValidityPeriod: big.NewInt(3), RoundHash: ethcommon.HexToHash("0x1234")}, c.snapshotErr
 }
 func (c *recipientTestChain) IsActiveAt(context.Context, ethcommon.Address, pm.ChainSnapshot) (bool, error) {
 	return c.active, c.activeErr
@@ -237,7 +238,7 @@ func TestRecipientBatchReplayAndExpiry(t *testing.T) {
 	balance, err := e.Balance("session")
 	require.NoError(t, err)
 	require.Zero(t, balance.Sign())
-	count, err := e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey), 0)
+	count, err := e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey))
 	require.NoError(t, err)
 	require.Zero(t, count)
 	require.NoError(t, receiveRecipientPayment(t, e, key, info, 1), "a failed batch must not consume nonces")
@@ -333,7 +334,7 @@ func TestRecipientConcurrentReplay(t *testing.T) {
 	require.EqualValues(t, 2, test.MetricSum(t, e.metrics.Registry, "payment_tickets_total", map[string]string{"kind": "winning"}))
 	require.Positive(t, test.MetricSum(t, e.metrics.Registry, "payment_credit_eth_total", nil))
 	require.Equal(t, 2, e.nonceCount)
-	count, err := e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey), 0)
+	count, err := e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey))
 	require.NoError(t, err)
 	require.Equal(t, 2, count)
 	balance, err := e.Balance("session")
@@ -361,7 +362,7 @@ func TestRecipientRejectsParametersOnceRedemptionPrepared(t *testing.T) {
 	require.NotNil(t, ticket)
 	// A redemption may reveal the randomness even when this recipient's chain
 	// observation still precedes parameter expiry.
-	require.NoError(t, e.store.recordPrepared(t.Context(), ticket, eth.SignedTransaction{Hash: ethcommon.HexToHash("0x1234"), Raw: []byte{1}, From: e.recipient, Nonce: 1}))
+	require.NoError(t, e.store.RecordPrepared(t.Context(), ticket, eth.SignedTransaction{Hash: ethcommon.HexToHash("0x1234"), Raw: []byte{1}, From: e.recipient, Nonce: 1}))
 	require.ErrorIs(t, receiveRecipientPayment(t, e, key, info, 2), ErrInvalidPayment)
 	after, err := e.Balance("session")
 	require.NoError(t, err)
@@ -378,7 +379,7 @@ func TestRecipientStorageFailureDoesNotPublishCreditOrConsumeNonces(t *testing.T
 	require.ErrorContains(t, receiveRecipientPayment(t, e, key, info, 1, 2), "storage failure")
 	require.EqualValues(t, 1, test.MetricSum(t, e.metrics.Registry, "payment_operations_total", map[string]string{"operation": "receive", "outcome": "error"}))
 	require.Zero(t, test.MetricSum(t, e.metrics.Registry, "payment_operations_total", map[string]string{"operation": "receive", "outcome": "success"}))
-	count, err := e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey), 0)
+	count, err := e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey))
 	require.NoError(t, err)
 	require.Zero(t, count, "partial inserts must roll back")
 	balance, err := e.Balance("session")
@@ -390,14 +391,14 @@ func TestRecipientStorageFailureDoesNotPublishCreditOrConsumeNonces(t *testing.T
 	_, err = e.store.db.Exec(`DROP TRIGGER reject_second_ticket`)
 	require.NoError(t, err)
 	require.NoError(t, receiveRecipientPayment(t, e, key, info, 1, 2), "storage failure must leave both nonces retryable")
-	count, err = e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey), 0)
+	count, err = e.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey))
 	require.NoError(t, err)
 	require.Equal(t, 2, count)
 }
 
 func TestPaidFailureOutcomes(t *testing.T) {
 	for _, cause := range []string{
-		"funding", "withdrawal", "face_value", "liability", "capacity", "rpc", "storage",
+		"funding", "withdrawal", "face_value", "liability", "capacity", "queue capacity", "rpc", "storage",
 		"cancelled", "unhashed segment", "tampered hash", "challenge snapshot",
 		"challenge active", "challenge cancelled", "challenge timeout", "challenge capacity",
 	} {
@@ -414,6 +415,10 @@ func TestPaidFailureOutcomes(t *testing.T) {
 			switch cause {
 			case "capacity":
 				e.nonceCount = 1000000
+				outcome, appOutcome = "capacity", "capacity"
+			case "queue capacity":
+				require.NoError(t, e.store.Bind(t.Context(), redemption.Binding{ChainID: "1", Controller: ethcommon.HexToAddress("0x1000"), Role: "orchestrator", Destination: "chain"}, redemption.Limits{Pending: 1, PerRecipient: 1}, nil))
+				nonces = []uint32{1, 2}
 				outcome, appOutcome = "capacity", "capacity"
 			case "rpc", "storage":
 				outcome, appOutcome = "error", "error"
@@ -463,6 +468,9 @@ func TestPaidFailureOutcomes(t *testing.T) {
 				require.NoError(t, err)
 			}
 			status := 400
+			if cause == "capacity" || cause == "queue capacity" {
+				status = 503
+			}
 			request := httptest.NewRequest("POST", "/apps/runner/app", nil)
 			if operation == "receive" {
 				payment, segment := recipientPayment(t, key, info, nonces...)
@@ -495,6 +503,13 @@ func TestPaidFailureOutcomes(t *testing.T) {
 			require.Equal(t, beforeDuration+1, test.MetricSum(t, e.metrics.Registry, "payment_operation_duration_seconds", map[string]string{"operation": operation}))
 			require.EqualValues(t, 1, test.MetricSum(t, e.metrics.Registry, "app_calls_total", map[string]string{"outcome": appOutcome}))
 			require.Zero(t, test.MetricSum(t, e.metrics.Registry, "upstream_requests_total", nil))
+			if cause == "queue capacity" {
+				require.Zero(t, e.nonceCount)
+				binding, err := e.store.Binding(t.Context())
+				require.NoError(t, err)
+				require.NoError(t, e.store.Bind(t.Context(), binding, redemption.Limits{Pending: 2, PerRecipient: 2}, nil))
+				require.NoError(t, receiveRecipientPayment(t, e, key, info, nonces...), "overload leaves the receipt retryable")
+			}
 		})
 	}
 

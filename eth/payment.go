@@ -45,6 +45,12 @@ func (c PaymentChain) IsActiveAt(ctx context.Context, recipient ethcommon.Addres
 	if snapshot.blockReference == nil {
 		return false, errors.New("canonical snapshot required")
 	}
+	if snapshot.source != nil && snapshot.source.Controller != c.Contracts.Controller {
+		return false, ErrObservationUnavailable
+	}
+	if snapshot.addresses.bonding != (ethcommon.Address{}) {
+		return c.activeAt(ctx, snapshot.addresses.bonding, recipient, snapshot)
+	}
 	address, err := c.Contracts.ResolveAt(ctx, snapshot.blockReference, "bondingManager")
 	if err != nil {
 		return false, err
@@ -98,20 +104,22 @@ func (c PaymentChain) FinalizedReceipt(ctx context.Context, hash ethcommon.Hash)
 type paymentContracts struct{ rounds, broker, bonding ethcommon.Address }
 
 type ChainSnapshot struct {
-	Block           *big.Int // Protocol L1 block, including on Arbitrum.
-	Number          *big.Int // Execution-chain height, distinct from the L1 clock.
-	BlockHash       ethcommon.Hash
-	Round           *big.Int // Last initialized round.
-	RoundHash       ethcommon.Hash
-	CurrentRound    *big.Int // Protocol round; may exceed the initialized Round.
-	blockReference  map[string]any
-	addresses       paymentContracts
-	observer        *PaymentObserver
-	generation      uint64
-	observedAt      time.Time
-	blockTime       time.Time
-	recipientActive bool
-	recipientErr    error
+	Block                *big.Int // Protocol L1 block, including on Arbitrum.
+	Number               *big.Int // Execution-chain height, distinct from the L1 clock.
+	BlockHash            ethcommon.Hash
+	Round                *big.Int // Last initialized round.
+	RoundHash            ethcommon.Hash
+	TicketValidityPeriod *big.Int // TicketBroker validity period at this block.
+	CurrentRound         *big.Int // Protocol round; may exceed the initialized Round.
+	source               *Contracts
+	blockReference       map[string]any
+	addresses            paymentContracts
+	observer             *PaymentObserver
+	generation           uint64
+	observedAt           time.Time
+	blockTime            time.Time
+	recipientActive      bool
+	recipientErr         error
 }
 
 func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
@@ -123,14 +131,17 @@ func (c PaymentChain) Snapshot(ctx context.Context) (ChainSnapshot, error) {
 	if err != nil {
 		return ChainSnapshot{}, err
 	}
-	snapshot, err := c.snapshotAt(ctx, header, false)
+	snapshot, err := c.snapshotAt(ctx, header)
 	snapshot.observedAt = at
 	return snapshot, err
 }
 
-func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader, currentRound bool) (ChainSnapshot, error) {
+func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader) (ChainSnapshot, error) {
 	if header.Hash == (ethcommon.Hash{}) || header.Number == nil {
 		return ChainSnapshot{}, errors.New("invalid chain header")
+	}
+	if c.Contracts.RPC.requireL1 && header.L1BlockNumber == nil {
+		return ChainSnapshot{}, ErrObservationUnavailable
 	}
 	clock := header.Number
 	if header.L1BlockNumber != nil {
@@ -144,9 +155,6 @@ func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader, curren
 		name string
 		to   *ethcommon.Address
 	}{{"roundsManager", &addresses.rounds}, {"ticketBroker", &addresses.broker}, {"bondingManager", &addresses.bonding}}
-	if !currentRound {
-		registry = registry[:1]
-	}
 	for _, entry := range registry { // Confirm the complete scope before dependent reads.
 		address, err := c.Contracts.ResolveAt(ctx, ref, entry.name)
 		if err != nil {
@@ -173,16 +181,26 @@ func (c PaymentChain) snapshotAt(ctx context.Context, header *miniHeader, curren
 	if hash == ([32]byte{}) {
 		return ChainSnapshot{}, errors.New("invalid round block hash")
 	}
-	snapshot := ChainSnapshot{Block: block, Number: new(big.Int).Set((*big.Int)(header.Number)), BlockHash: header.Hash, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref, addresses: addresses}
-	if currentRound {
-		snapshot.CurrentRound, err = rounds.CurrentRound(opts)
-		if err != nil {
-			return ChainSnapshot{}, err
-		}
-		if snapshot.CurrentRound.Cmp(round) < 0 {
-			return ChainSnapshot{}, errors.New("current round precedes initialized round")
-		}
+	snapshot := ChainSnapshot{source: c.Contracts, Block: block, Number: new(big.Int).Set((*big.Int)(header.Number)), BlockHash: header.Hash, Round: round, RoundHash: ethcommon.Hash(hash), blockReference: ref, addresses: addresses}
+	snapshot.CurrentRound, err = rounds.CurrentRound(opts)
+	if err != nil {
+		return ChainSnapshot{}, err
 	}
+	if snapshot.CurrentRound.Cmp(round) < 0 {
+		return ChainSnapshot{}, errors.New("current round precedes initialized round")
+	}
+	broker, err := contracts.NewTicketBrokerCaller(addresses.broker, c.Contracts.callerAt(ref))
+	if err != nil {
+		return ChainSnapshot{}, err
+	}
+	snapshot.TicketValidityPeriod, err = broker.TicketValidityPeriod(opts)
+	if err != nil {
+		return ChainSnapshot{}, err
+	}
+	if snapshot.TicketValidityPeriod == nil || snapshot.TicketValidityPeriod.Sign() <= 0 || snapshot.TicketValidityPeriod.BitLen() > 256 {
+		return ChainSnapshot{}, errors.New("invalid ticket validity period")
+	}
+
 	return snapshot, nil
 }
 
@@ -213,7 +231,7 @@ func (c PaymentChain) PayerFunds(ctx context.Context, sender, recipient ethcommo
 
 func (c PaymentChain) senderInfoAt(ctx context.Context, sender, recipient ethcommon.Address, snapshot ChainSnapshot) (SenderInfo, error) {
 	address := snapshot.addresses.broker
-	if snapshot.observer == nil {
+	if address == (ethcommon.Address{}) {
 		var err error
 		address, err = c.Contracts.ResolveAt(ctx, snapshot.blockReference, "ticketBroker")
 		if err != nil {
@@ -274,7 +292,17 @@ func (c PaymentChain) redemptionPlan(ctx context.Context, redeemer *Key, t Redee
 	if err != nil {
 		return TransactionPlan{}, err
 	}
-	return c.Contracts.PlanTransaction(ctx, redeemer.Address(), address, data, big.NewInt(0))
+	plan, err := c.Contracts.PlanTransaction(ctx, redeemer.Address(), address, data, big.NewInt(0))
+	if err == nil && c.Contracts.CheckRedemptionCost {
+		fee, ok := new(big.Int).SetString(plan.FeeCapWei, 10)
+		if !ok {
+			return TransactionPlan{}, errors.New("invalid redemption fee")
+		}
+		if t.FaceValue.Cmp(new(big.Int).Mul(new(big.Int).SetUint64(plan.GasLimit), fee)) <= 0 {
+			return TransactionPlan{}, ErrUneconomicalRedemption
+		}
+	}
+	return plan, err
 }
 
 // SubmitRedemption ports go-livepeer/eth/backend.go's Next/send/Update sequence.

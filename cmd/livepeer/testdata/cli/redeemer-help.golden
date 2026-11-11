@@ -1,0 +1,39 @@
+Standalone winning-ticket redeemer
+
+Usage:
+  livepeer-redeemer [flags]
+  livepeer-redeemer [command]
+
+Available Commands:
+  completion  Generate the autocompletion script for the specified shell
+  help        Help about any command
+  migrate     Manage embedded SQL migrations
+  redemptions Inspect recipient redemption state or explicitly retry stored transaction bytes
+
+Flags:
+  -c, --config string                      Configuration file; empty disables discovery (env: LIVEPEER_REDEEMER_CONFIG) (default "config.toml")
+  -n, --network string                     Network name (custom networks require explicit chain settings) (env: LIVEPEER_REDEEMER_NETWORK) (default "arbitrum-one-mainnet")
+  -d, --data-dir string                    Component data directory; defaults to ~/.lpData/<network>/<component> (env: LIVEPEER_REDEEMER_DATA_DIR) (default "$HOME/.lpData/arbitrum-one-mainnet/redeemer")
+  -l, --listen string                      Ticket submission listener (env: LIVEPEER_REDEEMER_LISTEN) (default "127.0.0.1:8941")
+  -m, --metrics-listen string              Metrics and probe listener (env: LIVEPEER_REDEEMER_METRICS_LISTEN) (default "127.0.0.1:8942")
+  -a, --account string                     Dedicated redemption wallet; must not be an orchestrator (env: LIVEPEER_REDEEMER_ACCOUNT)
+  -r, --redeemer-db string                 Winning-ticket SQLite database (env: LIVEPEER_REDEEMER_REDEEMER_DB, required)
+  -k, --keystore-file string               Encrypted geth redemption account JSON file (env: LIVEPEER_REDEEMER_KEYSTORE_FILE)
+      --keystore-password-file string      Owner-only file containing exact password bytes (env: LIVEPEER_REDEEMER_KEYSTORE_PASSWORD_FILE)
+      --rpc-url-file string                 (env: LIVEPEER_REDEEMER_RPC_URL_FILE)
+      --chain-id uint                       (env: LIVEPEER_REDEEMER_CHAIN_ID)
+      --controller-address string           (env: LIVEPEER_REDEEMER_CONTROLLER_ADDRESS)
+      --redeemer-tx-timeout duration       Transaction inclusion timeout (env: LIVEPEER_REDEEMER_REDEEMER_TX_TIMEOUT) (default 5m0s)
+      --redeemer-max-tx-replacements int   Maximum fee replacements per transaction (env: LIVEPEER_REDEEMER_REDEEMER_MAX_TX_REPLACEMENTS) (default 1)
+      --redeemer-max-fee-per-gas string    Optional maximum fee in wei per gas (env: LIVEPEER_REDEEMER_REDEEMER_MAX_FEE_PER_GAS)
+      --max-pending-tickets int            Maximum unsettled winning tickets (env: LIVEPEER_REDEEMER_MAX_PENDING_TICKETS) (default 100000)
+      --max-tickets-per-recipient int      Maximum unsettled tickets per recipient (env: LIVEPEER_REDEEMER_MAX_TICKETS_PER_RECIPIENT) (default 10000)
+  -p, --print-config                       Print audited redacted TOML configuration
+  -h, --help                               help for livepeer-redeemer
+  -v, --version                            version for livepeer-redeemer
+
+Use "livepeer-redeemer [command] --help" for more information about a command.
+
+Environment Variables:
+  LIVEPEER_REDEEMER_KEYSTORE_PASSWORD  Keystore decryption password
+  LIVEPEER_REDEEMER_RPC_URL

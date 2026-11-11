@@ -1,6 +1,7 @@
 # Payment state and transaction recovery
 
 SQLite preserves winning tickets and redemption transactions for
+[standalone redeemers](redeemer.md),
 [paid orchestrators](orchestrator.md#enable-payments), and accounting events for
 [Kafka-enabled signers](signer.md#kafka-accounting-and-budgets). Orchestrator
 sessions, payment parameters, balances, and replay guards are process-local;
@@ -108,11 +109,10 @@ use these states:
 | `submitted` | RPC acknowledged the hash; monitor inclusion and replace on timeout. |
 | `retryable` | Submission, waiting or replacement failed; retry the ticket automatically. Older hashes remain under receipt reconciliation. |
 | `mined` | Canonical inclusion observed; wait for finalization without fee replacement. A reorg resumes recovery. |
-| `awaiting_finality` | Latest state says the ticket is used; pause submission until finalized state confirms use or a reorg removes it. |
 | `confirmed` / `used` | Successful canonical finalized receipt or finalized ticket-use observation settles liability. |
 | `reverted` / `invalid` | Finalized transaction failure or an invalid ticket; stop submitting and reconcile unresolved hashes. |
 | `expired` | Ticket creation round is outside its validity window; reconcile unresolved hashes. |
-| `superseded` | Finalized inclusion consumed the same sender/nonce, or finalized ticket settlement made this transaction unnecessary. |
+| `superseded` | Finalized inclusion consumed the same nonce for this wallet, or finalized ticket settlement made this transaction unnecessary. |
 
 Only canonical finalized state settles a ticket. RPC failures, missing receipts,
 unfinalized inclusions and reorgs retain uncertainty and liability. Each ticket

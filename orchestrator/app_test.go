@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/ethereum/go-ethereum/accounts"
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
@@ -54,8 +55,10 @@ func freeTCPPort(t *testing.T) int {
 }
 
 func TestPaidHTTPStartup(t *testing.T) {
-	for _, separate := range []bool{false, true} {
-		t.Run(fmt.Sprintf("separate-wallet=%t", separate), func(t *testing.T) {
+	for _, mode := range []string{"wallet", "separate", "remote"} {
+		t.Run(mode, func(t *testing.T) {
+			separate := mode != "wallet"
+			remote := mode == "remote"
 			client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 			mainPort, metricsPort := freeTCPPort(t), freeTCPPort(t)
 			address := fmt.Sprintf("http://127.0.0.1:%d", mainPort)
@@ -89,6 +92,14 @@ func TestPaidHTTPStartup(t *testing.T) {
 			})
 			defer releaseDependencies()
 			p.RPCURL, p.Controller = mustURL(t, rpc.URL), &rpc.Controller
+			if remote {
+				p.RedeemerURL = mustURL(t, "http://127.0.0.1:1")
+				p.RedeemerGrants = []string{"127.0.0.1"}
+				p.KeystoreFile, p.KeystorePasswordFile = "", ""
+				p.KeystorePassword = nil
+				p.Account = nil
+			}
+
 			require.NoError(t, p.Listen.UnmarshalText(fmt.Appendf(nil, "unsafe@0.0.0.0:%d", mainPort)))
 			require.NoError(t, p.MetricsListen.UnmarshalText(fmt.Appendf(nil, "unsafe@0.0.0.0:%d", metricsPort)))
 			metricsURL := fmt.Sprintf("http://127.0.0.1:%d", metricsPort)
@@ -127,7 +138,7 @@ func TestPaidHTTPStartup(t *testing.T) {
 				store, err := OpenRedeemerDB(p.RedeemerDB)
 				require.NoError(t, err)
 				defer store.Close()
-				require.NoError(t, store.StoreWinningTicket(&pm.SignedTicket{Ticket: &pm.Ticket{PayerAddress: recipient, Recipient: recipient, FaceValue: big.NewInt(1000), WinProb: big.NewInt(100), TicketNonce: 1, RecipientRandHash: crypto.Keccak256Hash([]byte("failed ticket")), CreationRound: 1, ParamsExpirationBlock: big.NewInt(0)}, Sig: make([]byte, 65), RecipientRand: big.NewInt(1)}))
+				require.NoError(t, store.StoreWinningTicket(&pm.SignedTicket{Ticket: &pm.Ticket{PayerAddress: recipient, Recipient: recipient, FaceValue: big.NewInt(1000), WinProb: big.NewInt(100), TicketNonce: 1, RecipientRandHash: crypto.Keccak256Hash([]byte("failed ticket")), CreationRound: 1, CreationRoundBlockHash: rpc.State().RoundHash, ParamsExpirationBlock: big.NewInt(0)}, Sig: make([]byte, 65), RecipientRand: big.NewInt(1)}))
 			}
 			releaseDependencies()
 			response, err = client.Get(address + "/external/discovery")
@@ -176,10 +187,67 @@ func TestPaidHTTPStartup(t *testing.T) {
 			response.Body.Close()
 			require.NoError(t, err)
 			require.Equal(t, separate, strings.Contains(string(metrics), "livepeer_redemption_errors_total{"), "readiness must include completion of the first worker pass, including ticket failure")
-			require.Equal(t, separate, rpc.Stats().Calls["eth_estimateGas"] > 0, "the queued ticket reaches the injected estimation failure")
+			require.Equal(t, separate && !remote, rpc.Stats().Calls["eth_estimateGas"] > 0, "the queued ticket reaches the injected estimation failure")
 
 		})
 	}
+}
+
+func TestLocalOrchestratorWaitsForEconomicalRedemption(t *testing.T) {
+	f := test.NewRedemptionRPC(t)
+	p := paymentKeystoreParams(t, f.Server.URL)
+	p.Network = "test"
+	p.KeystoreFile, p.KeystorePasswordFile = test.WriteFixedKeystore(t)
+	p.HeartbeatInterval = 20 * time.Millisecond
+	port := freeTCPPort(t)
+	require.NoError(t, p.MetricsListen.UnmarshalText(fmt.Appendf(nil, "127.0.0.1:%d", port)))
+	payer, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	// The RPC fixture estimates 21000 gas with fee cap 203; equality waits.
+	ticket := &pm.SignedTicket{Ticket: &pm.Ticket{PayerAddress: crypto.PubkeyToAddress(payer.PublicKey), Recipient: ethcommon.HexToAddress("0x5678"), FaceValue: big.NewInt(21000 * 203), WinProb: new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1)), TicketNonce: 1, RecipientRandHash: crypto.Keccak256Hash(ethcommon.LeftPadBytes([]byte{1}, 32)), CreationRound: 1, CreationRoundBlockHash: ethcommon.HexToHash("0x1"), ParamsExpirationBlock: big.NewInt(10)}, RecipientRand: big.NewInt(1)}
+	ticket.Sig, err = crypto.Sign(accounts.TextHash(ticket.Hash().Bytes()), payer)
+	require.NoError(t, err)
+	ticket.Sig[64] += 27
+	store, err := OpenRedeemerDB(p.RedeemerDB)
+	require.NoError(t, err)
+	require.NoError(t, store.StoreWinningTicket(ticket))
+	require.NoError(t, store.Close())
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, p, io.Discard) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(3 * time.Second):
+			t.Error("orchestrator did not stop")
+		}
+	})
+	client := &http.Client{Timeout: time.Second}
+	require.Eventually(t, func() bool {
+		response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(body), "\n") {
+			if strings.HasPrefix(line, "livepeer_redemption_worker_last_completed_timestamp_seconds{") {
+				fields := strings.Fields(line)
+				n, _ := strconv.ParseFloat(fields[len(fields)-1], 64)
+				return n > 0
+			}
+		}
+		return false
+	}, 3*time.Second, 10*time.Millisecond)
+	f.Mu.Lock()
+	defer f.Mu.Unlock()
+	require.Positive(t, f.GasEstimates, "the queued winner reached the actual local transaction plan")
+	require.Empty(t, f.Sent, "equality must withhold the transaction")
 }
 
 func TestConfigPrecedenceAndRedaction(t *testing.T) {

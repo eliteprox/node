@@ -1,4 +1,4 @@
-package orchestrator
+package redemption
 
 import (
 	"context"
@@ -35,7 +35,7 @@ func (s *RedeemerDB) SavedNonceFloor(ctx context.Context, address ethcommon.Addr
 	return n + 1, nil
 }
 
-func (s *RedeemerDB) recordPrepared(ctx context.Context, ticket *pm.SignedTicket, prepared eth.SignedTransaction) error {
+func (s *RedeemerDB) RecordPrepared(ctx context.Context, ticket *pm.SignedTicket, prepared eth.SignedTransaction) error {
 	return s.recordTransaction(ctx, ticket.Sig, prepared, "")
 }
 
@@ -50,6 +50,9 @@ func (s *RedeemerDB) recordTransaction(ctx context.Context, sig []byte, prepared
 		if err := tx.QueryRowContext(ctx, "SELECT root_hash FROM redemption_transactions WHERE hash=? AND sig=?", previous, sig).Scan(&root); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE ticket_state SET exposed=1 WHERE hash=(SELECT ticket_hash FROM winning_tickets WHERE sig=?)", sig); err != nil {
+		return err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var result sql.Result
@@ -98,9 +101,16 @@ type RedemptionStatus struct {
 }
 
 func (s *RedeemerDB) Redemptions() ([]RedemptionStatus, error) {
-	rows, err := s.db.Query(`SELECT hash,phase,error FROM (
+	// Legacy redeemed_at backfills have no label; their settled outcome is use.
+	query := `WITH represented AS (
+ SELECT * FROM ticket_state s WHERE (delivery!='queued' OR settled=1) AND NOT EXISTS(SELECT 1 FROM redemption_transactions t JOIN winning_tickets w ON w.sig=t.sig WHERE w.ticket_hash=s.hash)
+) SELECT hash,phase,error FROM (
  SELECT hash,CASE WHEN phase='sending' THEN 'broadcast' ELSE phase END AS phase,COALESCE(error,'') AS error,rowid AS sequence FROM redemption_transactions
- UNION ALL SELECT '',phase,COALESCE(error,''),9223372036854775807 FROM redemption_attempts a WHERE a.phase IN ('used','awaiting_finality') OR NOT EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=a.sig)) ORDER BY sequence`)
+ UNION ALL SELECT '0x'||lower(hex(hash)),CASE WHEN settled=1 THEN COALESCE(NULLIF(settlement,''),'used') ELSE delivery END,'',9223372036854775806 FROM represented
+ UNION ALL SELECT '',phase,COALESCE(error,''),9223372036854775807 FROM redemption_attempts a
+ WHERE (a.phase IN ('used','awaiting_finality') OR NOT EXISTS(SELECT 1 FROM redemption_transactions t WHERE t.sig=a.sig))
+ AND NOT EXISTS(SELECT 1 FROM represented s JOIN winning_tickets w ON w.ticket_hash=s.hash WHERE w.sig=a.sig)) ORDER BY sequence`
+	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +129,9 @@ func (s *RedeemerDB) Redemptions() ([]RedemptionStatus, error) {
 // RetryRedemption preserves the existing explicit identical-byte retry command.
 // Historical identities are inspectable, but cannot replace a newer active job.
 func RetryRedemption(ctx context.Context, store *RedeemerDB, contracts *eth.Contracts, hash ethcommon.Hash) error {
+	if store == nil || store.binding == nil || contracts == nil || contracts.Controller != store.binding.Controller {
+		return errors.New("bound redemption store and matching chain required")
+	}
 	var sig, raw []byte
 	err := store.db.QueryRowContext(ctx, `SELECT t.sig,t.raw_transaction FROM redemption_transactions t JOIN redemption_attempts a ON a.sig=t.sig JOIN winning_tickets w ON w.sig=t.sig WHERE t.hash=? AND w.tx_hash=t.hash AND a.phase IN ('prepared','broadcast','submitted','retryable') AND t.phase IN ('prepared','broadcast','submitted','retryable')`, hash.Hex()).Scan(&sig, &raw)
 	if err != nil {
@@ -233,7 +246,7 @@ func (s *RedeemerDB) finishTicket(ctx context.Context, sig []byte, phase string,
 		return err
 	}
 	defer tx.Rollback()
-	if phase == "confirmed" || phase == "used" {
+	if phase == "confirmed" || phase == "used" || (phase == "expired" && len(observation) > 0) {
 		if len(observation) != 1 || observation[0].Number == nil || !observation[0].Number.IsInt64() || observation[0].Number.Sign() < 0 || observation[0].BlockHash == (ethcommon.Hash{}) {
 			return errors.New("settlement block evidence required")
 		}
@@ -317,7 +330,15 @@ func (s *RedeemerDB) finishTicket(ctx context.Context, sig []byte, phase string,
 	} else if n == 0 {
 		return commit()
 	}
+	if phase == "expired" && len(observation) > 0 {
+		if _, err := tx.ExecContext(ctx, "UPDATE ticket_state SET settled=1,settlement='expired' WHERE hash=(SELECT ticket_hash FROM winning_tickets WHERE sig=?)", sig); err != nil {
+			return err
+		}
+	}
 	if phase == "confirmed" || phase == "used" {
+		if _, err := tx.ExecContext(ctx, "UPDATE ticket_state SET settled=1,settlement='used' WHERE hash=(SELECT ticket_hash FROM winning_tickets WHERE sig=?)", sig); err != nil {
+			return err
+		}
 		_, err = tx.ExecContext(ctx, `UPDATE winning_tickets SET redeemed_at=COALESCE(redeemed_at,?),tx_hash=COALESCE(?,tx_hash) WHERE sig=?`, time.Now().UTC().Format(time.RFC3339Nano), nullString(hash), sig)
 	}
 	if err == nil && (phase == "expired" || phase == "invalid") {

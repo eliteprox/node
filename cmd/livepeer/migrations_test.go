@@ -14,6 +14,7 @@ func testBinaryMigrations(t *testing.T, install string) {
 	t.Helper()
 	for _, component := range []struct{ name, flag, config string }{
 		{"orchestrator", "--redeemer-db", "RedeemerDB = 'custom/state.sqlite'"},
+		{"redeemer", "--redeemer-db", "RedeemerDB = 'custom/state.sqlite'"},
 		{"signer", "--kafka-outbox-db", "[Kafka]\nOutboxDB = 'custom/state.sqlite'"},
 	} {
 		t.Run(component.name+" migrations", func(t *testing.T) {

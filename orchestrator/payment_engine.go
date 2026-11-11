@@ -111,6 +111,9 @@ func (e *PaymentEngine) makeChallenge(ctx context.Context, appID, manifest strin
 	if snapshot.Block == nil || snapshot.Round == nil || snapshot.Block.Sign() < 0 || snapshot.Round.Sign() <= 0 || snapshot.RoundHash == (ethcommon.Hash{}) {
 		return Challenge{}, errors.New("chain snapshot unavailable")
 	}
+	if !snapshot.ValidTicketRound(snapshot.Round.Int64()) {
+		return Challenge{}, errors.New("initialized round is outside ticket validity")
+	}
 	seed := make([]byte, 32)
 	rand.Read(seed)
 	priceInfo := wire.PriceInfo{PricePerUnit: price, UnitsPerPrice: 1}
@@ -266,7 +269,7 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 		return ethcommon.Address{}, nil, ErrInvalidPayment
 	}
 
-	if snapshot.Block == nil || snapshot.Round == nil || params.ExpirationParams.CreationRound < snapshot.Round.Int64()-2 || params.ExpirationParams.CreationRound > snapshot.Round.Int64() {
+	if snapshot.Block == nil || snapshot.Round == nil || !snapshot.ValidTicketRound(params.ExpirationParams.CreationRound) {
 		return ethcommon.Address{}, nil, ErrInvalidPayment
 	}
 	if err := pm.ValidatePayerFunds(funds); err != nil {
@@ -331,7 +334,7 @@ func (e *PaymentEngine) Receive(ctx context.Context, appID, manifest, paymentHea
 		}
 	}
 	balance := new(big.Rat).Add(session.balance, batchCredit)
-	if err := e.store.storeWinningTickets(ctx, payer, params.RecipientRandHash, snapshot.Round.Int64()-2, new(big.Int).Add(funds.Deposit, funds.Reserve), winners, snapshot); err != nil {
+	if err := e.store.storeWinningTickets(ctx, payer, params.RecipientRandHash, new(big.Int).Add(funds.Deposit, funds.Reserve), winners, snapshot); err != nil {
 		return ethcommon.Address{}, nil, err
 	}
 	if previous == nil {

@@ -84,21 +84,32 @@ func TestRPCAccountingPreservesAggregateLabels(t *testing.T) {
 	for _, tc := range []struct{ work, contract, function string }{
 		{"foreground", "ticketBroker", "usedTickets"},
 		{"background", "roundsManager", "currentRound"},
+		{"background", "ticketBroker", "ticketValidityPeriod"},
+		{"background", "bondingManager", "isRegisteredTranscoder"},
 		{"unbounded-private-value", "roundsManager", "roundLength"},
 	} {
 		ctx := eth.WithRPCWork(t.Context(), tc.work)
 		var args []any
 		if tc.function == "usedTickets" {
 			args = []any{common.Hash{}}
+		} else if tc.function == "isRegisteredTranscoder" {
+			args = []any{common.Address{}}
 		}
 		_, err := contracts.CallAt(ctx, "latest", tc.contract, common.Address{}, tc.function, args...)
 		require.Error(t, err)
 	}
-	require.EqualValues(t, 3, test.MetricSum(t, m.Registry, "rpc_requests_total", map[string]string{"method": "eth_call", "outcome": "error"}))
+	require.EqualValues(t, 5, test.MetricSum(t, m.Registry, "rpc_requests_total", map[string]string{"method": "eth_call", "outcome": "error"}))
 	for _, work := range []string{"foreground", "background", "other"} {
-		for _, kind := range []string{"transport", "contract_call"} {
-			require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "rpc_work_total", map[string]string{"work": work, "kind": kind}))
+		count := 1
+		if work == "background" {
+			count = 3
 		}
+		for _, kind := range []string{"transport", "contract_call"} {
+			require.EqualValues(t, count, test.MetricSum(t, m.Registry, "rpc_work_total", map[string]string{"work": work, "kind": kind}))
+		}
+	}
+	for _, tc := range []struct{ contract, function string }{{"ticketBroker", "ticketValidityPeriod"}, {"bondingManager", "isRegisteredTranscoder"}} {
+		require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "rpc_contract_calls_total", map[string]string{"contract": tc.contract, "function": tc.function}))
 	}
 	require.EqualValues(t, 1, test.MetricSum(t, m.Registry, "rpc_contract_calls_total", map[string]string{"contract": "unknown", "function": "unknown"}))
 	families, err := m.Registry.Gather()

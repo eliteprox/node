@@ -40,7 +40,7 @@ func TestRealBinaryOffchainFlow(t *testing.T) {
 	require.True(t, ok)
 	root := filepath.Clean(filepath.Join(filepath.Dir(file), "../.."))
 	install := t.TempDir()
-	for _, name := range []string{"livepeer", "livepeer-orchestrator", "livepeer-signer", "livepeer-chain", "livepeer-discovery"} {
+	for _, name := range []string{"livepeer", "livepeer-orchestrator", "livepeer-signer", "livepeer-chain", "livepeer-discovery", "livepeer-redeemer"} {
 		build := exec.Command("go", "build", "-o", filepath.Join(install, name), "./cmd/"+name)
 		build.Dir = root
 		output, err := build.CombinedOutput()
@@ -56,7 +56,7 @@ func TestRealBinaryOffchainFlow(t *testing.T) {
 	completion, err := exec.Command(dispatcher, "completion", "orchestrator", "bash").CombinedOutput()
 	require.NoError(t, err, string(completion))
 	require.Contains(t, string(completion), "bash completion")
-	for _, component := range []string{"orchestrator", "signer", "chain", "discovery"} {
+	for _, component := range []string{"orchestrator", "signer", "chain", "discovery", "redeemer"} {
 		direct := filepath.Join(install, "livepeer-"+component)
 		for _, arguments := range [][]string{{"--help"}, {"completion", "bash"}, {"completion", "zsh"}, {"completion", "fish"}, {"completion", "powershell"}} {
 			actual, err := exec.Command(direct, arguments...).CombinedOutput()

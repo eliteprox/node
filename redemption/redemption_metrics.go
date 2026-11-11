@@ -1,4 +1,4 @@
-package orchestrator
+package redemption
 
 import (
 	"context"
@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"time"
 
+	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/observability"
 )
 
@@ -25,7 +27,7 @@ func (s *RedeemerDB) observeTransition(phase, hash string, err error) {
 
 // collectMetrics uses a read transaction so tickets and replacement identities
 // describe one durable snapshot. The caller never probes the chain.
-func (s *RedeemerDB) collectMetrics(emit observability.Emit) {
+func (s *RedeemerDB) CollectMetrics(emit observability.Emit) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	stats, err := s.redemptionStats(ctx)
@@ -46,6 +48,11 @@ func (s *RedeemerDB) collectMetrics(emit observability.Emit) {
 		emit("redemption_oldest_transaction_timestamp_seconds", at, observability.Labels{"phase": phase})
 	}
 	emit("redemption_last_settlement_timestamp_seconds", stats.lastSettlement, nil)
+	for _, suffix := range []string{"", "-wal"} {
+		if info, err := os.Stat(s.path + suffix); err == nil {
+			emit("redemption_storage_bytes", float64(info.Size()), observability.Labels{"file": map[bool]string{true: "database", false: "wal"}[suffix == ""]})
+		}
+	}
 }
 
 type redemptionStats struct {
@@ -55,7 +62,7 @@ type redemptionStats struct {
 }
 
 func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats, err error) {
-	stats = redemptionStats{tickets: map[string]int{"waiting": 0, "eligible": 0, "in_flight": 0, "awaiting_finality": 0, "unknown": 0}, transactions: map[string]int{}, oldestTickets: map[string]float64{}, oldestTransactions: map[string]float64{}}
+	stats = redemptionStats{tickets: map[string]int{"waiting": 0, "eligible": 0, "in_flight": 0, "awaiting_finality": 0, "rejected": 0, "blocked": 0, "unknown": 0}, transactions: map[string]int{}, oldestTickets: map[string]float64{}, oldestTransactions: map[string]float64{}}
 	for state := range stats.tickets {
 		stats.oldestTickets[state] = 0
 	}
@@ -71,14 +78,17 @@ func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats
 	// A cached protocol snapshot only determines clock eligibility; unavailable
 	// or stale clocks are reported as unknown instead of fabricating zero work.
 	var block, round *big.Int
-	if s.readiness != nil {
-		s.readiness.mu.Lock()
-		if time.Since(s.readiness.completed) <= max(time.Minute, 3*s.readiness.interval) && s.readiness.chain && s.readiness.snapshot.Validate() == nil {
-			block, round = s.readiness.snapshot.Block, s.readiness.snapshot.Round
+	var clock eth.ChainSnapshot
+	if s.snapshot != nil {
+		if snapshot, ok := s.snapshot(); ok {
+			block, round = snapshot.Block, snapshot.Round
+			clock = snapshot
 		}
-		s.readiness.mu.Unlock()
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT COALESCE(w.enqueued_at,''),w.params_expiration_block,w.creation_round,COALESCE(a.phase,'') FROM winning_tickets w LEFT JOIN redemption_attempts a ON a.sig=w.sig WHERE w.redeemed_at IS NULL AND COALESCE(a.phase,'') NOT IN ('confirmed','used','expired','invalid','reverted')`)
+
+	query := `SELECT COALESCE(w.enqueued_at,''),w.params_expiration_block,w.creation_round,COALESCE(a.phase,t.delivery) FROM ticket_state t JOIN winning_tickets w ON w.sig=t.sig LEFT JOIN redemption_attempts a ON a.sig=w.sig WHERE t.settled=0`
+	rows, err := tx.QueryContext(ctx, query)
+
 	if err != nil {
 		return stats, err
 	}
@@ -92,8 +102,12 @@ func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats
 		switch phase {
 		case "prepared", "broadcast", "sending", "submitted", "mined":
 			state = "in_flight"
-		case "awaiting_finality":
+		case "awaiting_finality", "acknowledged":
 			state = "awaiting_finality"
+		case "rejected":
+			state = "rejected"
+		case "reverted", "invalid":
+			state = "blocked"
 		default:
 			if block != nil && round != nil {
 				end, ok := new(big.Int).SetString(expiry, 10)
@@ -101,8 +115,9 @@ func (s *RedeemerDB) redemptionStats(ctx context.Context) (stats redemptionStats
 					rows.Close()
 					return stats, fmt.Errorf("invalid ticket expiry")
 				}
-				if creation < round.Int64()-2 {
-					continue
+				if clock.TicketExpired(creation) {
+					state = "awaiting_finality"
+					break
 				}
 				state = "eligible"
 				if end.Cmp(block) > 0 {

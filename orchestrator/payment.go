@@ -67,6 +67,9 @@ func (s *Server) paidReceipt(w http.ResponseWriter, r *http.Request, appID strin
 		if errors.Is(err, ErrInvalidPayment) {
 			status = http.StatusForbidden
 		}
+		if errors.Is(err, errPaymentTicketCapacity) {
+			status = http.StatusServiceUnavailable
+		}
 		fail(w, status, err.Error())
 		return "", false
 	}

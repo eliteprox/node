@@ -35,7 +35,7 @@ import (
 type paymentTestChain struct{}
 
 func (paymentTestChain) Snapshot(context.Context) (pm.ChainSnapshot, error) {
-	return pm.ChainSnapshot{Block: big.NewInt(50), Round: big.NewInt(5), RoundHash: ethcommon.HexToHash("0x1234")}, nil
+	return pm.ChainSnapshot{Block: big.NewInt(50), Round: big.NewInt(5), CurrentRound: big.NewInt(5), TicketValidityPeriod: big.NewInt(3), RoundHash: ethcommon.HexToHash("0x1234")}, nil
 }
 func (c paymentTestChain) PayerFunds(ctx context.Context, _, _ ethcommon.Address) (pm.PayerFunds, error) {
 	snapshot, err := c.Snapshot(ctx)
@@ -114,7 +114,7 @@ func TestPaidFixedSessionWithRemoteSigner(t *testing.T) {
 	w = httptest.NewRecorder()
 	server.ServeHTTP(w, paid.Clone(t.Context()))
 	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
-	count, err := store.WinningTicketCount(payer.Address(), 0)
+	count, err := store.WinningTicketCount(payer.Address())
 	require.NoError(t, err)
 	require.Zero(t, count, "capacity rejection must not accept the ticket")
 	registry.ReleaseBySession(occupied)
@@ -130,7 +130,7 @@ func TestPaidFixedSessionWithRemoteSigner(t *testing.T) {
 	balance, err := engine.Balance(challenge.ManifestID)
 	require.NoError(t, err)
 	require.True(t, balance.Sign() >= 0 && balance.Cmp(big.NewRat(1, 1)) < 0)
-	count, err = store.WinningTicketCount(payer.Address(), 0)
+	count, err = store.WinningTicketCount(payer.Address())
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 	w = httptest.NewRecorder()
@@ -198,7 +198,7 @@ func TestPinnedPythonPaidSingleShot(t *testing.T) {
 	output, err := command.CombinedOutput()
 	require.NoError(t, err, string(output))
 	require.Contains(t, string(output), "Pinned Python runner paid fixed and live calls passed")
-	count, err := store.WinningTicketCount(payer.Address(), 0)
+	count, err := store.WinningTicketCount(payer.Address())
 	require.NoError(t, err)
 	require.Equal(t, 11, count)
 }
@@ -248,7 +248,7 @@ func pinnedPythonSDK(t *testing.T) (python, export, root string) {
 type advancingPaymentChain struct{ block atomic.Int64 }
 
 func (c *advancingPaymentChain) Snapshot(context.Context) (pm.ChainSnapshot, error) {
-	return pm.ChainSnapshot{Block: big.NewInt(c.block.Load()), Round: big.NewInt(5), RoundHash: ethcommon.HexToHash("0x1234")}, nil
+	return pm.ChainSnapshot{Block: big.NewInt(c.block.Load()), Round: big.NewInt(5), CurrentRound: big.NewInt(5), TicketValidityPeriod: big.NewInt(3), RoundHash: ethcommon.HexToHash("0x1234")}, nil
 }
 func (c *advancingPaymentChain) PayerFunds(ctx context.Context, _, _ ethcommon.Address) (pm.PayerFunds, error) {
 	snapshot, err := c.Snapshot(ctx)
@@ -427,7 +427,7 @@ func TestMultiAppPaidIsolationAndDrain(t *testing.T) {
 	appHeartbeat(t, registry, "owner", owner.HeartbeatSecret, a, b)
 	w = request(http.MethodPost, "/apps/live/session", lp, ls)
 	require.Equal(t, 404, w.Code, w.Body.String())
-	count, err := engine.store.WinningTicketCount(payer, 0)
+	count, err := engine.store.WinningTicketCount(payer)
 	require.NoError(t, err)
 	require.Zero(t, count, "rejected work cannot consume tickets")
 	a.Status = "ready"
@@ -534,7 +534,7 @@ func TestAppIDReuseRejectsPreviousRegistrationQuotes(t *testing.T) {
 			w = request(encodedPayment, encodedSegment)
 			require.Equal(t, 409, w.Code, w.Body.String())
 			require.Empty(t, registry.sessions)
-			count, err := engine.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey), 0)
+			count, err := engine.store.WinningTicketCount(crypto.PubkeyToAddress(key.PublicKey))
 			require.NoError(t, err)
 			require.Zero(t, count)
 			// A fresh challenge binds the replacement registration and its current quote.

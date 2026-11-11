@@ -26,6 +26,7 @@ import (
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/nodeconfig"
 	"github.com/livepeer/node/nodeconfig/migrations"
+	"github.com/livepeer/node/redemption"
 	"github.com/spf13/cobra"
 )
 
@@ -44,6 +45,10 @@ type Params struct {
 	BootstrapSecret           string             `secret:"true" optional:"true" descr:"Dynamic runner bootstrap credential"`
 	BootstrapSecretFile       string             `basepath:"source" secretfor:"BootstrapSecret" descr:"File containing runner bootstrap credential"`
 	RunnerConfig              string             `basepath:"source" optional:"true" file:"true" descr:"Static runner TOML path"`
+	RedeemerURL               *url.URL           `name:"redeemer-url" optional:"true" descr:"Remote winning-ticket redeemer base URL"`
+	RedeemerGrants            []string           `optional:"true" descr:"Private remote redeemer IP[:port] or CIDR grants"`
+	MaxPendingTickets         int                `default:"100000" min:"1" descr:"Maximum unsettled winning tickets"`
+	MaxTicketsPerRecipient    int                `default:"10000" min:"1" descr:"Maximum unsettled tickets per recipient"`
 	RedeemerDB                string             `optional:"true" file:"optional"`
 	KeystoreFile              string             `basepath:"source" optional:"true" descr:"Encrypted geth redemption account JSON file"`
 	KeystorePassword          *string            `secret:"true" optional:"true" descr:"Keystore decryption password"`
@@ -68,7 +73,7 @@ type Params struct {
 }
 
 func (p Params) paymentsRequested() bool {
-	return p.Account != nil || p.OrchestratorAddress != nil || p.KeystoreFile != "" || p.KeystorePassword != nil || p.KeystorePasswordFile != "" || p.RedeemerDB != "" || p.RPCURL != nil || p.RPCURLFile != "" || p.ChainID != nil || p.Controller != nil || p.WeiPerUSD != nil || p.ETHUSDFeed != nil || p.TicketFaceValue != nil || p.TicketWinProb != nil || p.RedeemerMaxFeePerGas != nil
+	return p.RedeemerURL != nil || p.Account != nil || p.OrchestratorAddress != nil || p.KeystoreFile != "" || p.KeystorePassword != nil || p.KeystorePasswordFile != "" || p.RedeemerDB != "" || p.RPCURL != nil || p.RPCURLFile != "" || p.ChainID != nil || p.Controller != nil || p.WeiPerUSD != nil || p.ETHUSDFeed != nil || p.TicketFaceValue != nil || p.TicketWinProb != nil || p.RedeemerMaxFeePerGas != nil
 }
 
 func (p Params) Validate() error {
@@ -82,8 +87,22 @@ func (p Params) Validate() error {
 		if p.OrchestratorAddress != nil && *p.OrchestratorAddress == (ethcommon.Address{}) {
 			return errors.New("--orchestrator-address must be a nonempty Ethereum address")
 		}
-		if p.KeystorePassword == nil && p.KeystorePasswordFile == "" || p.RedeemerDB == "" || p.RPCURL == nil || p.ChainID == nil || p.Controller == nil || (p.WeiPerUSD == nil && p.ETHUSDFeed == nil) || p.TicketFaceValue == nil || p.TicketWinProb == nil {
+		if (p.RedeemerURL == nil && p.KeystorePassword == nil && p.KeystorePasswordFile == "") || p.RedeemerDB == "" || p.RPCURL == nil || p.ChainID == nil || p.Controller == nil || (p.WeiPerUSD == nil && p.ETHUSDFeed == nil) || p.TicketFaceValue == nil || p.TicketWinProb == nil {
 			return errors.New("on-chain payment requires --redeemer-db, LIVEPEER_ORCHESTRATOR_KEYSTORE_PASSWORD or --keystore-password-file, LIVEPEER_ORCHESTRATOR_RPC_URL or --rpc-url-file, --chain-id, --controller-address, --wei-per-usd or --eth-usd-feed, --ticket-face-value and --ticket-win-prob")
+		}
+		if p.RedeemerURL != nil {
+			if _, err := redemption.RedeemerURL(p.RedeemerURL); err != nil {
+				return err
+			}
+			if p.OrchestratorAddress == nil {
+				return errors.New("remote redemption requires --orchestrator-address")
+			}
+			if _, err := destination.New("redeemer", p.RedeemerGrants); err != nil {
+				return err
+			}
+			if p.Account != nil || p.KeystoreFile != "" || p.KeystorePassword != nil || p.KeystorePasswordFile != "" || p.RedeemerMaxFeePerGas != nil {
+				return errors.New("remote redemption does not use local wallet or transaction settings")
+			}
 		}
 		if *p.Controller == (ethcommon.Address{}) {
 			return errors.New("--controller-address must be a nonempty Ethereum address")
@@ -152,6 +171,13 @@ func Root(out, errOut io.Writer) *cobra.Command {
 		Params: params, RejectUnknown: true,
 		PostConfigFuncCtx: func(ctx *boa.HookContext, p *Params, _ *cobra.Command, _ []string) error {
 			nodeconfig.Default(ctx, &p.ServiceURL, boa.Text[*url.URL]{Value: &url.URL{Scheme: "http", Host: p.Listen.String()}})
+			if p.RedeemerURL != nil {
+				for _, field := range []any{&p.RedeemerTxTimeout, &p.RedeemerMaxTxReplacements} {
+					if ctx.HasInput(field) {
+						return boa.NewUserInputError(errors.New("remote redemption does not use local transaction settings"))
+					}
+				}
+			}
 			if p.paymentsRequested() {
 				if p.Network == nodeconfig.Mainnet {
 					nodeconfig.Default(ctx, &p.ChainID, new(uint64(42161)))
@@ -185,8 +211,8 @@ func Root(out, errOut io.Writer) *cobra.Command {
 		RedeemerDB string `persistent:"true" file:"optional" default:"payments.sqlite"`
 	}
 	storage := new(storageParams)
-	migrate := migrations.Command(nodeconfig.Command("orchestrator", nodeconfig.Mainnet, boa.Cmd[storageParams]{Params: storage}, &storage.ConfigFile), &storage.RedeemerDB, redeemerMigrationFiles, openRedeemerDB)
-	cmd.AddCommand(redemptionCommand(), migrate)
+	migrate := migrations.Command(nodeconfig.Command("orchestrator", nodeconfig.Mainnet, boa.Cmd[storageParams]{Params: storage}, &storage.ConfigFile), &storage.RedeemerDB, redemption.MigrationFiles, redemption.OpenDatabase)
+	cmd.AddCommand(redemption.Command("orchestrator", "payments.sqlite"), migrate)
 	cmd.InitDefaultCompletionCmd()
 	return cmd
 }
@@ -200,7 +226,7 @@ func printConfig(ctx *boa.HookContext, p *Params, out io.Writer) error {
 		"HeartbeatInterval": &p.HeartbeatInterval, "HeartbeatTTL": &p.HeartbeatTTL,
 		"DrainTimeout":      &p.DrainTimeout,
 		"RedeemerTxTimeout": &p.RedeemerTxTimeout, "RedeemerMaxTxReplacements": &p.RedeemerMaxTxReplacements,
-		"RedeemerDB": &p.RedeemerDB, "ChainID": &p.ChainID, "RedeemerMaxFeePerGas": &p.RedeemerMaxFeePerGas,
+		"RedeemerURL": &p.RedeemerURL, "RedeemerGrants": &p.RedeemerGrants, "MaxPendingTickets": &p.MaxPendingTickets, "MaxTicketsPerRecipient": &p.MaxTicketsPerRecipient, "RedeemerDB": &p.RedeemerDB, "ChainID": &p.ChainID, "RedeemerMaxFeePerGas": &p.RedeemerMaxFeePerGas,
 		"Controller": &p.Controller, "WeiPerUSD": &p.WeiPerUSD, "ETHUSDFeed": &p.ETHUSDFeed,
 		"PriceMaxAge": &p.PriceMaxAge, "TicketFaceValue": &p.TicketFaceValue, "TicketWinProb": &p.TicketWinProb,
 	}
@@ -235,6 +261,12 @@ func loadStatic(path string, registry *Registry) error {
 }
 
 func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
+	if p.MaxPendingTickets == 0 {
+		p.MaxPendingTickets = 100000
+	}
+	if p.MaxTicketsPerRecipient == 0 {
+		p.MaxTicketsPerRecipient = 10000
+	}
 	if err := p.Validate(); err != nil {
 		return err
 	}
@@ -255,15 +287,18 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	registry.runnerService = strings.TrimRight(p.RunnerServiceURL.String(), "/")
 	var engine *PaymentEngine
 	var redeemerDB *RedeemerDB
+	var redemptionWorker *redemption.Worker
 	var paymentChain eth.PaymentChain
 	var observedChain eth.PaymentChain
 	var redeemerKey *eth.Key
 	var paymentChainID *big.Int
 	if p.paymentsRequested() {
 		registry.SetWeiPerUSD(p.WeiPerUSD)
-		redeemerKey, err = eth.OpenAccount(p.KeystoreDir(), p.KeystoreFile, p.KeystorePassword, p.KeystorePasswordFile, p.Account)
-		if err != nil {
-			return fmt.Errorf("open payment keystore (check --keystore-file or --data-dir and --account, and LIVEPEER_ORCHESTRATOR_KEYSTORE_PASSWORD or --keystore-password-file): %w", err)
+		if p.RedeemerURL == nil {
+			redeemerKey, err = eth.OpenAccount(p.KeystoreDir(), p.KeystoreFile, p.KeystorePassword, p.KeystorePasswordFile, p.Account)
+			if err != nil {
+				return fmt.Errorf("open payment keystore (check --keystore-file or --data-dir and --account, and LIVEPEER_ORCHESTRATOR_KEYSTORE_PASSWORD or --keystore-password-file): %w", err)
+			}
 		}
 		rpc, err := eth.NewRPC(p.RPCURL, nil)
 		if err != nil {
@@ -287,6 +322,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 		if p.RedeemerMaxFeePerGas != nil {
 			contracts.MaxFeePerGas = p.RedeemerMaxFeePerGas.ToBig()
 		}
+		contracts.CheckRedemptionCost = true
 		paymentChain = eth.PaymentChain{Contracts: contracts}
 		observedChain = paymentChain
 		if p.ETHUSDFeed != nil {
@@ -298,9 +334,23 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 			registry.setRate(rate, until)
 			registry.metrics.Add("price_feed_updates_total", 1, observability.Labels{"outcome": "success"})
 		}
-		recipient := redeemerKey.Address()
+		var recipient ethcommon.Address
+		if redeemerKey != nil {
+			recipient = redeemerKey.Address()
+		}
 		if p.OrchestratorAddress != nil {
 			recipient = *p.OrchestratorAddress
+		}
+		target := "chain"
+		if p.RedeemerURL != nil {
+			u, e := redemption.RedeemerURL(p.RedeemerURL)
+			if e != nil {
+				return e
+			}
+			target = u.String()
+		}
+		if err := redeemerDB.Bind(parent, redemption.Binding{ChainID: paymentChainID.String(), Controller: *p.Controller, Role: "orchestrator", Destination: target}, redemption.Limits{Pending: p.MaxPendingTickets, PerRecipient: p.MaxTicketsPerRecipient}, paymentChain); err != nil {
+			return err
 		}
 		observedChain.Observer = eth.NewPaymentObserver(paymentChain, p.Network == nodeconfig.Mainnet, recipient)
 		engine, err = NewPaymentEngine(redeemerDB, observedChain, recipient, p.TicketFaceValue.ToBig(), p.TicketWinProb.ToBig())
@@ -325,7 +375,9 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	if engine != nil {
 		registry.metrics.Gauge("redemption_last_success_timestamp_seconds", nil).Set(0)
 		registry.metrics.Gauge("redemption_worker_last_completed_timestamp_seconds", nil).Set(0)
-		readiness.account = redeemerKey.Address()
+		if redeemerKey != nil {
+			readiness.account = redeemerKey.Address()
+		}
 		readiness.observer = observedChain.Observer
 		redeemerDB.readiness = readiness
 	}
@@ -356,10 +408,35 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 	ctx, cancel := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	if engine != nil {
-		if err := StartRedemptionRecovery(eth.WithRPCWork(ctx, "background"), redeemerDB, paymentChain, redeemerKey, RedemptionOptions{Timeout: p.RedeemerTxTimeout, MaxReplacements: p.RedeemerMaxTxReplacements}); err != nil {
+		var target redemption.Destination
+		if p.RedeemerURL != nil {
+			policy, e := destination.New("redeemer", p.RedeemerGrants)
+			if e != nil {
+				return e
+			}
+			binding, e := redeemerDB.Binding(ctx)
+			if e != nil {
+				return e
+			}
+			remote, e := redemption.NewHTTPDestination(p.RedeemerURL, policy, binding)
+			if e != nil {
+				return e
+			}
+			defer remote.Close()
+			target = remote
+		} else {
+			local, e := redemption.NewChainDestination(eth.WithRPCWork(ctx, "background"), redeemerDB.RedeemerDB, paymentChain, redeemerKey, paymentChainID, redemption.RedemptionOptions{Timeout: p.RedeemerTxTimeout, MaxReplacements: p.RedeemerMaxTxReplacements})
+			if e != nil {
+				return e
+			}
+			target = local
+		}
+		redemptionWorker, err = redemption.NewWorker(redeemerDB.RedeemerDB, paymentChain, target)
+		if err != nil {
 			return err
 		}
 	}
+
 	mainServer := &http.Server{BaseContext: func(net.Listener) context.Context { return ctx }, Handler: app, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20, MaxHeaderValueCount: 128}
 	metricsServer := &http.Server{Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16, MaxHeaderValueCount: 128}
 	errs := make(chan error, 2)
@@ -411,7 +488,7 @@ func Serve(parent context.Context, p Params, logOut io.Writer) (result error) {
 			}
 		})
 		startWorker(p.HeartbeatInterval, 30*time.Second, func(ctx context.Context) {
-			failures := ProcessRedemptions(ctx, redeemerDB, paymentChain, redeemerKey, paymentChainID)
+			failures := redemptionWorker.Process(ctx)
 			for _, err := range failures {
 				registry.metrics.Add("redemption_errors_total", 1, observability.Labels{"error_kind": observability.ErrorKind(err)})
 				logger.Error("redemption failed", "event", "redemption_pass", "operation", "redeem", "outcome", "error", "error_kind", observability.ErrorKind(err))

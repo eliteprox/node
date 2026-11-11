@@ -28,7 +28,7 @@ export PATH=/tmp/install/bin:/usr/bin:/bin
 unset GOROOT GOPATH GOTOOLCHAIN GOENV GOWORK GOFLAGS
 
 test "$(livepeer version)" = "livepeer $version ($commit)"
-for component in orchestrator signer chain discovery; do
+for component in orchestrator signer chain discovery redeemer; do
   "livepeer-$component" --version | grep -F "livepeer $version ($commit)"
   livepeer "$component" --version | grep -F "livepeer $version ($commit)"
   "livepeer-$component" --help > direct-help
@@ -42,6 +42,7 @@ done
 # Exercise embedded SQLite migrations in the installed cgo-free binaries.
 livepeer orchestrator migrate --data-dir /tmp/work/orchestrator up
 livepeer signer migrate --data-dir /tmp/work/signer up
+livepeer redeemer migrate --data-dir /tmp/work/redeemer up
 
 # Check readiness and clean shutdown for each installed service.
 smoke_service() {

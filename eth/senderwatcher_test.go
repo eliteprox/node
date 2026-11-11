@@ -640,7 +640,7 @@ func TestPayerHistoryCostAndFreshness(t *testing.T) {
 					headers++
 				} // Existing retained-anchor availability check.
 				require.Equal(t, headers, stats.Calls["eth_getBlockByNumber"])
-				require.Equal(t, headers+logs+7, stats.RoundTrips)
+				require.Equal(t, headers+logs+8, stats.RoundTrips)
 				require.Equal(t, time.Duration(stats.RoundTrips)*110*time.Millisecond, now.Sub(started))
 				before := f.Stats()
 				funds, err := o.senderInfo(t.Context(), payer, o.recipient)

@@ -23,7 +23,7 @@ docker run --rm --network none --read-only --cap-drop=ALL \
     cd /tmp
     expected="livepeer $1 ($2)"
     test "$(livepeer version)" = "$expected"
-    for component in orchestrator signer chain discovery; do
+    for component in orchestrator signer chain discovery redeemer; do
       test "$("livepeer-$component" --version)" = "livepeer-$component version $expected"
       test "$(livepeer "$component" --version)" = "livepeer-$component version $expected"
       "livepeer-$component" --help > direct-help
@@ -35,6 +35,7 @@ docker run --rm --network none --read-only --cap-drop=ALL \
     done
     livepeer orchestrator migrate up
     livepeer signer migrate up
+    livepeer redeemer migrate up
   ' smoke "$version" "$commit"
 
 # Run the normal entrypoint as PID 1. Probe its loopback listener from a helper

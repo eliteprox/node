@@ -13,6 +13,7 @@ import (
 	"github.com/livepeer/node/eth"
 	"github.com/livepeer/node/internal/observability"
 	"github.com/livepeer/node/pm"
+	"github.com/livepeer/node/redemption"
 )
 
 func appIdentity(id string, item *app) observability.Identity {
@@ -145,7 +146,15 @@ func (p *paidReadiness) ready(registry *Registry) bool {
 
 func (p *paidReadiness) check(ctx context.Context, store *RedeemerDB, chain eth.PaymentChain, engine *PaymentEngine, metrics *observability.Metrics, logger *slog.Logger) {
 	dbCtx, cancel := context.WithTimeout(ctx, time.Second)
-	storageErr := store.checkStorage(dbCtx)
+	storageErr := store.CheckStorage(dbCtx)
+	if storageErr == nil {
+		available, err := store.CapacityAvailable(dbCtx, engine.recipient)
+		if err != nil {
+			storageErr = err
+		} else if !available {
+			storageErr = redemption.ErrCapacity
+		}
+	}
 	cancel()
 	snapshot, chainErr := chain.Snapshot(ctx)
 	active := false
@@ -170,26 +179,15 @@ func (p *paidReadiness) check(ctx context.Context, store *RedeemerDB, chain eth.
 		}
 		metrics.Gauge("chain_snapshot_last_success_timestamp_seconds", nil).Set(float64(snapshot.ObservedAt().Unix()))
 	}
-	if balance, err := chain.Contracts.RPC.BalanceAt(ctx, p.account, nil); err == nil {
-		metrics.Gauge("redeemer_gas_balance_eth", nil).Set(observability.ETH(new(big.Rat).SetInt(balance)))
+	if p.account != (common.Address{}) {
+		if balance, err := chain.Contracts.RPC.BalanceAt(ctx, p.account, nil); err == nil {
+			metrics.Gauge("redeemer_gas_balance_eth", nil).Set(observability.ETH(new(big.Rat).SetInt(balance)))
+		}
 	}
+
 	if changed {
 		logger.Info("payment dependency state changed", "event", "payment_dependencies", "operation", "check", "outcome", map[bool]string{true: "success", false: "unavailable"}[chainErr == nil && active && storageErr == nil])
 	}
-}
-
-// A rolled-back empty write validates the payment table and SQLite's ability to
-// enter a write transaction, without changing payment or redemption state.
-func (s *RedeemerDB) checkStorage(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE winning_tickets SET enqueued_at=enqueued_at WHERE 0`); err != nil {
-		return err
-	}
-	return tx.Rollback()
 }
 
 // paymentObservation preserves the public error while identifying its cause.
